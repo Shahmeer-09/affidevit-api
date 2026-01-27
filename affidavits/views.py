@@ -2023,17 +2023,13 @@ class AdminDocumentListView(APIView):
 class AdminGeneratePolicyView(APIView):
     """
     Use AI to generate policy from uploaded template documents.
+    Now runs asynchronously to prevent request timeouts in production.
     """
     
     permission_classes = [IsAdminUser]
     
     def post(self, request, pk):
-        from .serializers import PolicyGenerationResultSerializer
-        from .services.policy_generator_service import (
-            generate_policy_from_examples,
-            convert_detected_fields_to_intake_schema,
-            build_policy_json_from_generation
-        )
+        from .tasks import generate_policy_async
         
         affidavit_type = get_object_or_404(AffidavitType, pk=pk)
         
@@ -2060,69 +2056,122 @@ class AdminGeneratePolicyView(APIView):
         # Get existing intake_schema to merge intelligently
         existing_questions = affidavit_type.intake_schema or []
         
-        # Generate policy using AI
-        result = generate_policy_from_examples(
+        # Trigger async task
+        task = generate_policy_async.delay(
+            affidavit_type_id=affidavit_type.id,
             html_examples=html_examples,
-            affidavit_type_name=affidavit_type.name,
             additional_context=additional_context,
             existing_questions=existing_questions
         )
         
-        if not result['success']:
-            return Response(
-                {'error': result['error']},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        return Response({
+            'task_id': task.id,
+            'status': 'processing',
+            'message': 'Policy generation started. Use task_id to poll for results.'
+        }, status=status.HTTP_202_ACCEPTED)
+
+
+class AdminPolicyTaskStatusView(APIView):
+    """
+    Check status of policy generation task.
+    """
+    
+    permission_classes = [IsAdminUser]
+    
+    def get(self, request, task_id):
+        from celery.result import AsyncResult
+        from .services.policy_generator_service import (
+            convert_detected_fields_to_intake_schema,
+            build_policy_json_from_generation
+        )
         
-        # Optionally auto-save the generated policy
-        auto_save = request.data.get('auto_save', False)
+        task = AsyncResult(task_id)
         
-        if auto_save:
-            # Update the affidavit type with generated content
-            affidavit_type.template_html = result['template_html']
-            affidavit_type.disallowed_phrases = result['disallowed_phrases']
+        if task.state == 'PENDING':
+            return Response({
+                'status': 'pending',
+                'message': 'Task is waiting to be processed'
+            })
+        elif task.state == 'STARTED':
+            return Response({
+                'status': 'processing',
+                'message': 'Policy generation in progress'
+            })
+        elif task.state == 'SUCCESS':
+            result = task.result
             
-            # Merge detected fields with existing intake_schema
-            # Only add NEW fields that don't already exist
-            if result['detected_fields']:
-                new_fields = convert_detected_fields_to_intake_schema(
-                    result['detected_fields']
-                )
-                existing_ids = {q.get('id', '').lower() for q in existing_questions}
-                existing_labels = {q.get('label', '').lower() for q in existing_questions}
-                
-                # Only add fields that are truly new (not matching id or label)
-                fields_to_add = []
-                for field in new_fields:
-                    field_id = field.get('id', '').lower()
-                    field_label = field.get('label', '').lower()
-                    if field_id not in existing_ids and field_label not in existing_labels:
-                        # Assign order after existing questions
-                        field['order'] = len(existing_questions) + len(fields_to_add) + 1
-                        fields_to_add.append(field)
-                
-                if fields_to_add:
-                    affidavit_type.intake_schema = existing_questions + fields_to_add
-                    result['new_fields_added'] = len(fields_to_add)
-                else:
-                    result['new_fields_added'] = 0
+            if not result.get('success'):
+                return Response({
+                    'status': 'failed',
+                    'error': result.get('error', 'Unknown error')
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
             
-            # Build and save policy_json
-            policy_json = build_policy_json_from_generation(result)
-            if policy_json:
-                affidavit_type.policy_json = {
-                    **affidavit_type.policy_json,
-                    **policy_json
-                }
+            # Get auto_save flag from query params
+            auto_save = request.query_params.get('auto_save', 'false').lower() == 'true'
+            affidavit_type_id = request.query_params.get('affidavit_type_id')
             
-            affidavit_type.increment_policy_version()
-            affidavit_type.save()
+            if auto_save and affidavit_type_id:
+                try:
+                    affidavit_type = AffidavitType.objects.get(id=affidavit_type_id)
+                    existing_questions = affidavit_type.intake_schema or []
+                    
+                    # Update the affidavit type with generated content
+                    affidavit_type.template_html = result['template_html']
+                    affidavit_type.disallowed_phrases = result['disallowed_phrases']
+                    
+                    # Merge detected fields with existing intake_schema
+                    if result['detected_fields']:
+                        new_fields = convert_detected_fields_to_intake_schema(
+                            result['detected_fields']
+                        )
+                        existing_ids = {q.get('id', '').lower() for q in existing_questions}
+                        existing_labels = {q.get('label', '').lower() for q in existing_questions}
+                        
+                        fields_to_add = []
+                        for field in new_fields:
+                            field_id = field.get('id', '').lower()
+                            field_label = field.get('label', '').lower()
+                            if field_id not in existing_ids and field_label not in existing_labels:
+                                field['order'] = len(existing_questions) + len(fields_to_add) + 1
+                                fields_to_add.append(field)
+                        
+                        if fields_to_add:
+                            affidavit_type.intake_schema = existing_questions + fields_to_add
+                            result['new_fields_added'] = len(fields_to_add)
+                        else:
+                            result['new_fields_added'] = 0
+                    
+                    # Build and save policy_json
+                    policy_json = build_policy_json_from_generation(result)
+                    if policy_json:
+                        affidavit_type.policy_json = {
+                            **affidavit_type.policy_json,
+                            **policy_json
+                        }
+                    
+                    affidavit_type.increment_policy_version()
+                    affidavit_type.save()
+                    result['saved'] = True
+                except AffidavitType.DoesNotExist:
+                    result['saved'] = False
+                    result['save_error'] = 'Affidavit type not found'
+            else:
+                result['saved'] = False
             
-            result['saved'] = True
+            return Response({
+                'status': 'completed',
+                'result': result
+            })
+        elif task.state == 'FAILURE':
+            return Response({
+                'status': 'failed',
+                'error': str(task.info)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         else:
-            result['saved'] = False
-        
-        return Response(result)
+            return Response({
+                'status': task.state.lower(),
+                'message': f'Task state: {task.state}'
+            })
 
 
 class AdminDisallowedPhrasesView(APIView):

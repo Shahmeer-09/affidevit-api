@@ -46,7 +46,7 @@ from .views import (
     AdminAffidavitTypeDuplicateView,
     # Admin Document Upload & Policy Generation
     AdminDocumentUploadView, AdminDocumentListView,
-    AdminGeneratePolicyView, AdminDisallowedPhrasesView,
+    AdminGeneratePolicyView, AdminPolicyTaskStatusView, AdminDisallowedPhrasesView,
     AdminAIBaseInstructionView,
     # Admin Decision Tree
     AdminDecisionTreeNodeListView, AdminDecisionTreeNodeDetailView,
@@ -159,6 +159,7 @@ urlpatterns = [
     path('admin/types/<int:pk>/upload-documents/', AdminDocumentUploadView.as_view(), name='admin_upload_documents'),
     path('admin/types/<int:pk>/documents/', AdminDocumentListView.as_view(), name='admin_documents_list'),
     path('admin/types/<int:pk>/generate-policy/', AdminGeneratePolicyView.as_view(), name='admin_generate_policy'),
+    path('admin/policy-task/<str:task_id>/', AdminPolicyTaskStatusView.as_view(), name='admin_policy_task_status'),
     path('admin/types/<int:pk>/disallowed-phrases/', AdminDisallowedPhrasesView.as_view(), name='admin_disallowed_phrases'),
     path('admin/ai-instruction/', AdminAIBaseInstructionView.as_view(), name='admin_ai_instruction'),
     

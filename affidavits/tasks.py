@@ -439,3 +439,47 @@ def generate_weekly_learning_report():
     except Exception as exc:
         logger.exception(f"Error generating weekly learning report: {exc}")
         return {'success': False, 'error': str(exc)}
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=120)
+def generate_policy_async(self, affidavit_type_id, html_examples, additional_context='', existing_questions=None):
+    """
+    Generate policy configuration using AI (async to prevent request timeouts).
+    
+    Args:
+        affidavit_type_id: ID of the AffidavitType
+        html_examples: List of HTML content from parsed documents
+        additional_context: Any additional instructions from admin
+        existing_questions: Current intake_schema questions (if any)
+        
+    Returns:
+        dict: Result from generate_policy_from_examples
+    """
+    from affidavits.services.policy_generator_service import generate_policy_from_examples
+    from affidavits.models import AffidavitType
+    
+    try:
+        affidavit_type = AffidavitType.objects.get(id=affidavit_type_id)
+        logger.info(f"Starting policy generation for: {affidavit_type.name}")
+        
+        result = generate_policy_from_examples(
+            html_examples=html_examples,
+            affidavit_type_name=affidavit_type.name,
+            additional_context=additional_context,
+            existing_questions=existing_questions or []
+        )
+        
+        if result['success']:
+            logger.info(f"Policy generation completed for {affidavit_type.name}")
+        else:
+            logger.error(f"Policy generation failed for {affidavit_type.name}: {result.get('error')}")
+        
+        return result
+        
+    except AffidavitType.DoesNotExist:
+        error_msg = f"AffidavitType with id {affidavit_type_id} not found"
+        logger.error(error_msg)
+        return {'success': False, 'error': error_msg}
+    except Exception as exc:
+        logger.exception(f"Error in generate_policy_async: {exc}")
+        # Retry on failure
+        raise self.retry(exc=exc)
