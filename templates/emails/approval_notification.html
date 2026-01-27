@@ -1,0 +1,56 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Your Affidavit is Ready - Affidavit Express{% endblock %}
+
+{% block body %}
+<div class="greeting">
+    Hello {{ user_name }},
+</div>
+
+<div class="content">
+    <p><strong>Great news!</strong> Your affidavit request has been reviewed and approved. Your document is now ready for commissioning.</p>
+</div>
+
+<div class="success-box">
+    <div class="title">✓ Request Approved</div>
+    <div class="text">Your affidavit has passed our quality review and is ready to be stamped.</div>
+</div>
+
+<div class="request-code">
+    <div class="label">Your Reference Code</div>
+    <div class="code">{{ request_code }}</div>
+</div>
+
+<div class="info-box">
+    <div class="label">Affidavit Type</div>
+    <div class="value">{{ affidavit_type }}</div>
+</div>
+
+<h3 style="color: #1f2937; margin-top: 30px;">What's Next?</h3>
+
+<div class="steps">
+    <div class="step">
+        <div class="step-number">1</div>
+        <div class="step-content">Visit any affiliated commissioner location</div>
+    </div>
+    <div class="step">
+        <div class="step-number">2</div>
+        <div class="step-content">Provide your reference code: <strong>{{ request_code }}</strong></div>
+    </div>
+    <div class="step">
+        <div class="step-number">3</div>
+        <div class="step-content">Present valid identification (Driver's License, Passport, or National ID)</div>
+    </div>
+    <div class="step">
+        <div class="step-number">4</div>
+        <div class="step-content">The commissioner will verify your identity, witness your signature, and stamp the document</div>
+    </div>
+</div>
+
+<div class="warning-box">
+    <div class="title">Important Reminder</div>
+    <div class="text">Please bring valid photo identification when visiting the commissioner. The document cannot be stamped without proper ID verification.</div>
+</div>
+
+<p style="color: #4b5563;">Thank you for choosing Affidavit Express!</p>
+{% endblock %}

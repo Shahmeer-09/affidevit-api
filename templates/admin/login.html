@@ -1,0 +1,32 @@
+{% extends "admin/login.html" %}
+{% load i18n %}
+
+{% block content %}
+<div id="content-main">
+  <form action="{{ app_path }}" method="post" id="login-form">{% csrf_token %}
+    <div class="form-row">
+      {% if form.errors and not form.username.errors and not form.password.errors %}
+        <p class="errornote">{% translate "Please enter the correct email and password for a staff account. Note that both fields may be case-sensitive." %}</p>
+      {% endif %}
+      <p class="aligned wide">
+        <label for="id_username" class="required">{% translate 'Email:' %}</label>
+        {{ form.username }}
+      </p>
+      <p class="aligned wide">
+        <label for="id_password" class="required">{% translate 'Password:' %}</label>
+        {{ form.password }}
+      </p>
+      <input type="hidden" name="next" value="{{ next }}">
+    </div>
+    {% url 'admin_password_reset' as password_reset_url %}
+    {% if password_reset_url %}
+    <div class="password-reset-link">
+      <a href="{{ password_reset_url }}">{% translate 'Forgotten your password or email?' %}</a>
+    </div>
+    {% endif %}
+    <div class="submit-row">
+      <input type="submit" value="{% translate 'Log in' %}">
+    </div>
+  </form>
+</div>
+{% endblock %}

@@ -1,0 +1,213 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Affidavit Type Policy Schema",
+  "description": "Schema for policy_json field in AffidavitType model",
+  "type": "object",
+  "properties": {
+    "system_prompt": {
+      "type": "string",
+      "description": "System prompt for AI drafting. Defines the AI's role and behavior.",
+      "example": "You are an expert legal document drafter specializing in affidavits for Trinidad and Tobago..."
+    },
+    "template": {
+      "type": "string",
+      "description": "Template structure showing the expected document format",
+      "example": "AFFIDAVIT OF [TYPE]\n\nI, [NAME], of [ADDRESS], do solemnly and sincerely declare..."
+    },
+    "required_sections": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of sections that must appear in the final document",
+      "example": ["Identity Declaration", "Statement of Facts", "Attestation"]
+    },
+    "required_fields": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Fields that must be present in user answers",
+      "example": ["full_name", "address", "date_of_event"]
+    },
+    "disallowed_phrases": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Phrases that should NOT appear in the generated draft",
+      "example": ["I swear to God", "on my mother's grave", "guarantee"]
+    },
+    "validation_rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "rule_id": { "type": "string" },
+          "description": { "type": "string" },
+          "severity": { "enum": ["low", "medium", "high"] },
+          "check": { "type": "string" }
+        }
+      },
+      "description": "Custom validation rules for QA checks",
+      "example": [
+        {
+          "rule_id": "date_in_past",
+          "description": "Event date must be in the past",
+          "severity": "high",
+          "check": "date_of_event < today"
+        }
+      ]
+    },
+    "scenario_library": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique scenario identifier"
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable scenario name"
+          },
+          "keywords": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Keywords to match in user answers"
+          },
+          "patterns": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "field": { "type": "string" },
+                "values": { "type": "array", "items": { "type": "string" } }
+              }
+            },
+            "description": "Field-value patterns to match"
+          },
+          "keyword_threshold": {
+            "type": "integer",
+            "description": "Minimum keywords to match for scenario detection"
+          },
+          "pattern_threshold": {
+            "type": "integer",
+            "description": "Minimum patterns to match"
+          },
+          "drafting_instructions": {
+            "type": "string",
+            "description": "Special instructions for drafting this scenario"
+          }
+        },
+        "required": ["id", "name"]
+      },
+      "description": "Known scenario patterns for this affidavit type",
+      "example": [
+        {
+          "id": "voluntary_termination",
+          "name": "Voluntary Job Termination",
+          "keywords": ["resigned", "quit", "left voluntarily", "retirement"],
+          "patterns": [
+            { "field": "termination_type", "values": ["resignation", "voluntary", "retirement"] }
+          ],
+          "keyword_threshold": 1,
+          "drafting_instructions": "Emphasize the voluntary nature of the departure"
+        }
+      ]
+    },
+    "few_shot_examples": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "scenario": {
+            "type": "string",
+            "description": "Scenario tag this example belongs to"
+          },
+          "scenarios": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Multiple scenario tags (alternative to scenario)"
+          },
+          "input": {
+            "type": "object",
+            "description": "Example user answers (answers_json)"
+          },
+          "output": {
+            "type": "string",
+            "description": "Expected draft output for this input"
+          }
+        },
+        "required": ["input", "output"]
+      },
+      "description": "Few-shot examples for AI drafting guidance",
+      "example": [
+        {
+          "scenario": "voluntary_termination",
+          "input": {
+            "full_name": "John Smith",
+            "employer": "ABC Company Ltd.",
+            "termination_date": "2025-12-01",
+            "termination_type": "resignation",
+            "reason": "personal reasons"
+          },
+          "output": "AFFIDAVIT OF UNEMPLOYMENT\n\nI, JOHN SMITH, of [address], do solemnly and sincerely declare as follows:\n\n1. I was previously employed at ABC Company Ltd.\n2. My employment ended on the 1st day of December, 2025, when I voluntarily resigned from my position.\n3. The reason for my departure was personal in nature.\n4. I make this affidavit for the purpose of [purpose].\n\nAND I make this solemn declaration conscientiously believing the same to be true."
+        }
+      ]
+    },
+    "intake_questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "type": { "enum": ["text", "textarea", "date", "select", "checkbox", "number"] },
+          "required": { "type": "boolean" },
+          "options": { "type": "array", "items": { "type": "string" } },
+          "validation": { "type": "object" },
+          "help_text": { "type": "string" }
+        }
+      },
+      "description": "Intake form questions for this affidavit type"
+    }
+  },
+  "examples": [
+    {
+      "system_prompt": "You are an expert legal document drafter specializing in unemployment affidavits for Trinidad and Tobago. Generate formal, legally-sound affidavits that are suitable for commissioning.",
+      "template": "AFFIDAVIT OF UNEMPLOYMENT\n\nI, [FULL NAME], of [ADDRESS], do solemnly and sincerely declare as follows:\n\n1. [Employment history]\n2. [Termination details]\n3. [Current status]\n4. [Purpose of affidavit]\n\nAND I make this solemn declaration conscientiously believing the same to be true.",
+      "required_sections": ["Identity", "Employment History", "Termination", "Declaration"],
+      "required_fields": ["full_name", "address", "employer_name", "termination_date"],
+      "disallowed_phrases": ["I swear to God", "on my life", "guarantee employment"],
+      "validation_rules": [
+        {
+          "rule_id": "termination_in_past",
+          "description": "Termination date must be in the past",
+          "severity": "high"
+        }
+      ],
+      "scenario_library": [
+        {
+          "id": "layoff",
+          "name": "Company Layoff",
+          "keywords": ["laid off", "redundancy", "downsizing", "restructuring"],
+          "drafting_instructions": "Clarify this was not due to misconduct"
+        },
+        {
+          "id": "company_closure",
+          "name": "Company Closure",
+          "keywords": ["closed", "shutdown", "went out of business", "bankrupt"],
+          "drafting_instructions": "Document the company closure circumstances"
+        }
+      ],
+      "few_shot_examples": [
+        {
+          "scenario": "layoff",
+          "input": {
+            "full_name": "Jane Doe",
+            "employer_name": "XYZ Corp",
+            "termination_date": "2025-11-15",
+            "termination_reason": "Company restructuring"
+          },
+          "output": "AFFIDAVIT OF UNEMPLOYMENT\n\nI, JANE DOE, do solemnly and sincerely declare:\n\n1. I was employed at XYZ Corp.\n2. On November 15, 2025, my employment was terminated due to company restructuring.\n3. This termination was not due to any misconduct on my part.\n\nAND I make this solemn declaration conscientiously believing the same to be true."
+        }
+      ]
+    }
+  ]
+}

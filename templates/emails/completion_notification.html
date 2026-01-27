@@ -1,0 +1,56 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Affidavit Completed - Affidavit Express{% endblock %}
+
+{% block header %}
+<div class="email-header" style="background: linear-gradient(135deg, #10b981 0%, #059669 100%);">
+    <h1>🎉 Congratulations!</h1>
+    <div class="subtitle">Your affidavit has been successfully commissioned</div>
+</div>
+{% endblock %}
+
+{% block body %}
+<div class="greeting">
+    Hello {{ user_name }},
+</div>
+
+<div class="content">
+    <p>Your affidavit has been <strong>successfully commissioned</strong> and is now a legally valid document.</p>
+</div>
+
+<div class="success-box">
+    <div class="title">✓ Document Completed</div>
+    <div class="text">Your affidavit has been witnessed, signed, and stamped by a Commissioner of Affidavits.</div>
+</div>
+
+<div class="request-code">
+    <div class="label">Reference Code</div>
+    <div class="code">{{ request_code }}</div>
+</div>
+
+<div class="info-box">
+    <div class="label">Affidavit Type</div>
+    <div class="value">{{ affidavit_type }}</div>
+</div>
+
+<div class="info-box">
+    <div class="label">Completed On</div>
+    <div class="value">{{ completed_at }}</div>
+</div>
+
+{% if commissioner_name %}
+<div class="info-box">
+    <div class="label">Commissioner</div>
+    <div class="value">{{ commissioner_name }}</div>
+</div>
+{% endif %}
+
+<div class="warning-box">
+    <div class="title">Keep Your Document Safe</div>
+    <div class="text">Please store your original stamped document in a safe place. You may need it for official purposes.</div>
+</div>
+
+<p style="color: #4b5563; margin-top: 25px;">Thank you for using Affidavit Express. We hope you had a great experience!</p>
+
+<p style="color: #6b7280; font-size: 14px;">Need another affidavit? Visit us anytime at <a href="{{ site_url }}" style="color: #2563eb;">Affidavit Express</a>.</p>
+{% endblock %}

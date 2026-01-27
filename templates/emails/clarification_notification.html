@@ -1,0 +1,61 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Action Required - Affidavit Express{% endblock %}
+
+{% block header %}
+<div class="email-header" style="background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);">
+    <h1>Action Required</h1>
+    <div class="subtitle">We need a bit more information</div>
+</div>
+{% endblock %}
+
+{% block body %}
+<div class="greeting">
+    Hello {{ user_name }},
+</div>
+
+<div class="content">
+    <p>We're almost done processing your affidavit request, but we need some additional information from you to proceed.</p>
+</div>
+
+<div class="request-code">
+    <div class="label">Reference Code</div>
+    <div class="code">{{ request_code }}</div>
+</div>
+
+<div class="info-box">
+    <div class="label">Affidavit Type</div>
+    <div class="value">{{ affidavit_type }}</div>
+</div>
+
+<div class="warning-box">
+    <div class="title">Information Needed</div>
+    <div class="text">{{ clarification_question }}</div>
+</div>
+
+<div style="text-align: center;">
+    <a href="{{ site_url }}/requests/{{ request_id }}" class="cta-button">
+        Provide Information
+    </a>
+</div>
+
+<div class="steps" style="margin-top: 30px;">
+    <h3 style="color: #1f2937;">How to respond:</h3>
+    <div class="step">
+        <div class="step-number">1</div>
+        <div class="step-content">Click the button above or log in to your account</div>
+    </div>
+    <div class="step">
+        <div class="step-number">2</div>
+        <div class="step-content">Review and answer the question above</div>
+    </div>
+    <div class="step">
+        <div class="step-number">3</div>
+        <div class="step-content">Submit your updated information</div>
+    </div>
+</div>
+
+<p style="color: #4b5563; margin-top: 25px;">Once you provide the requested information, we'll quickly process your request and notify you when it's ready.</p>
+
+<p style="color: #4b5563;">Thank you for your patience!</p>
+{% endblock %}
