@@ -11,7 +11,7 @@ from django.utils.html import format_html
 from .models import (
     User, AffidavitType, DecisionTreeNode, 
     Request, Stamp, FrictionReport, ReviewerEdit,
-    RequestEvent, AIRun, AIBaseInstruction
+    RequestEvent, AIRun, AIBaseInstruction, PaymentLog
 )
 
 
@@ -66,7 +66,7 @@ class UserAdmin(BaseUserAdmin):
     
     list_display = [
         'username', 'email', 'role', 'first_name', 'last_name', 
-        'is_active', 'is_featured', 'date_joined'
+        'is_active', 'is_featured', 'date_joined','commission_number', 'payout_rate'
     ]
     list_filter = ['role', 'is_active', 'is_staff', 'is_featured', 'date_joined']
     search_fields = ['username', 'email', 'first_name', 'last_name']
@@ -77,7 +77,7 @@ class UserAdmin(BaseUserAdmin):
             'fields': ('role', 'phone_number', 'profile_image', 'bio', 'is_featured')
         }),
         ('Commissioner Info', {
-            'fields': ('commission_number', 'commission_expiry', 'payout_rate'),
+            'fields': ('commission_number', 'payout_rate'),
             'classes': ('collapse',)
         }),
     )
@@ -356,6 +356,33 @@ class RequestEventAdmin(admin.ModelAdmin):
     def has_change_permission(self, request, obj=None):
         return False
 
+
+@admin.register(PaymentLog)
+class PaymentLogAdmin(admin.ModelAdmin):
+    """Admin for commissioner payment logs."""
+    
+    list_display = [
+        'id', 'commissioner', 'amount_paid', 'stamps_count',
+        'payment_method', 'payment_reference', 'paid_by', 'paid_at'
+    ]
+    list_filter = ['payment_method', 'paid_at', 'paid_by']
+    search_fields = ['commissioner__username', 'commissioner__email', 'payment_reference']
+    readonly_fields = ['paid_at']
+    raw_id_fields = ['commissioner', 'paid_by']
+    ordering = ['-paid_at']
+    date_hierarchy = 'paid_at'
+    
+    fieldsets = (
+        ('Payment Info', {
+            'fields': ('commissioner', 'amount_paid', 'stamps_count')
+        }),
+        ('Payment Details', {
+            'fields': ('payment_method', 'payment_reference', 'notes')
+        }),
+        ('Admin', {
+            'fields': ('paid_by', 'paid_at')
+        }),
+    )
 
 @admin.register(AIRun)
 class AIRunAdmin(admin.ModelAdmin):

@@ -8,6 +8,7 @@ RESTful API endpoints for all user roles:
 - Admin: Policy management, dashboard, learning export
 """
 
+import json
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.db.models import Count, Q, F
@@ -21,7 +22,8 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 
 from .models import (
     User, AffidavitType, DecisionTreeNode, Request, 
-    Stamp, FrictionReport, ReviewerEdit, RequestEvent, AIRun
+    Stamp, FrictionReport, ReviewerEdit, RequestEvent, AIRun, PaymentLog,
+    SiteSettings
 )
 from .serializers import (
     UserSerializer, UserRegistrationSerializer, CommissionerSerializer,
@@ -36,13 +38,15 @@ from .serializers import (
     StampSerializer, MarkCompleteSerializer,
     FrictionReportSerializer, FrictionReportCreateSerializer,
     ReviewerEditSerializer, ReviewerEditCreateSerializer, ApproveRequestSerializer,
-    ConfidenceDashboardSerializer, LearningExportSerializer
+    ConfidenceDashboardSerializer, LearningExportSerializer,
+    PaymentLogSerializer, CommissionerPaymentSummarySerializer, MarkAsPaidSerializer
 )
 from .authentication import (
     IsCommissioner, IsReviewer, IsAdminUser, 
     IsOwnerOrAdmin, IsCommissionerOrReviewerOrAdmin
 )
 from .services import process_request, generate_affidavit_pdf
+from .services.ai_service import validate_inputs_before_submission, translate_to_english
 from .services.notification_service import (
     send_approval_notification, 
     send_clarification_notification,
@@ -84,6 +88,28 @@ class UserRegistrationView(generics.CreateAPIView):
             'user': UserSerializer(user).data,
             'refresh': str(refresh),
             'access': str(refresh.access_token),
+        }, status=status.HTTP_201_CREATED)
+
+
+class CommissionerRegistrationView(APIView):
+    """
+    Public endpoint for commissioner self-registration.
+    Commissioners can sign up with their details, availability, and profile image.
+    """
+    
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        from .serializers import CommissionerRegistrationSerializer, CommissionerSerializer
+        
+        serializer = CommissionerRegistrationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        
+        # Don't auto-login - require admin approval first
+        return Response({
+            'message': 'Your request has been sent! Once approved by admin, you will be able to login.',
+            'email': user.email,
         }, status=status.HTTP_201_CREATED)
 
 
@@ -398,6 +424,80 @@ class RequestDeleteView(APIView):
         })
 
 
+class ValidateRequestInputView(APIView):
+    """
+    Validate user input BEFORE submission.
+    This endpoint is called by the frontend to check if all fields are valid
+    before allowing the user to submit their request.
+    
+    The AI validates each field and returns a list of invalid fields
+    with explanations and examples of valid values.
+    
+    This replaces the old clarification-during-drafting flow.
+    """
+    
+    permission_classes = [AllowAny]  # Anyone can validate their inputs
+    
+    def post(self, request):
+        answers_json = request.data.get('answers_json', {})
+        affidavit_type_id = request.data.get('affidavit_type_id')
+        
+        if not affidavit_type_id:
+            return Response(
+                {'error': 'affidavit_type_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not answers_json:
+            return Response(
+                {'error': 'answers_json is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get the affidavit type for template context
+        affidavit_type = get_object_or_404(AffidavitType, pk=affidavit_type_id)
+        
+        # ===== DEBUG LOGGING =====
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("=" * 80)
+        logger.info("[VALIDATE_VIEW] Starting validation request")
+        logger.info(f"[VALIDATE_VIEW] ORIGINAL answers_json: {json.dumps(answers_json, ensure_ascii=False)}")
+        logger.info("=" * 80)
+        # ===== END DEBUG LOGGING =====
+        
+        # STEP 1: Translate non-English content to English BEFORE validation
+        translated_answers = translate_to_english(answers_json)
+        
+        # ===== DEBUG LOGGING =====
+        logger.info("=" * 80)
+        logger.info(f"[VALIDATE_VIEW] TRANSLATED answers_json: {json.dumps(translated_answers, ensure_ascii=False)}")
+        logger.info(f"[VALIDATE_VIEW] Translation changed data: {answers_json != translated_answers}")
+        logger.info("=" * 80)
+        # ===== END DEBUG LOGGING =====
+        
+        # STEP 2: Run pre-submission validation on translated data
+        validation_result = validate_inputs_before_submission(
+            answers_json=translated_answers,
+            template_html=affidavit_type.template_html,
+            affidavit_type_name=affidavit_type.name
+        )
+        
+        # ===== DEBUG LOGGING =====
+        logger.info("=" * 80)
+        logger.info(f"[VALIDATE_VIEW] VALIDATION RESULT: {validation_result}")
+        logger.info("=" * 80)
+        # ===== END DEBUG LOGGING =====
+        
+        return Response({
+            'success': True,
+            'all_valid': validation_result.get('all_valid', True),
+            'invalid_fields': validation_result.get('invalid_fields', {}),
+            'validation_notes': validation_result.get('validation_notes', []),
+            'field_checks': validation_result.get('field_checks', [])
+        })
+
+
 class RequestSubmitView(APIView):
     """
     Submit a request for AI processing.
@@ -476,11 +576,28 @@ class SelectCommissionerView(APIView):
             )
         
         commissioner_id = request.data.get('commissioner_id')
-        if not commissioner_id:
-            return Response(
-                {'error': 'commissioner_id is required'},
-                status=status.HTTP_400_BAD_REQUEST
+        
+        # Allow withdrawing commissioner selection (set to null)
+        if commissioner_id is None:
+            old_commissioner = request_obj.commissioner
+            request_obj.commissioner = None
+            request_obj.save()
+            
+            # Log the withdrawal
+            RequestEvent.objects.create(
+                request=request_obj,
+                action=RequestEvent.Action.COMMISSIONER_CHANGED,
+                actor=request.user,
+                actor_role=request.user.role,
+                details={
+                    'withdrawn': True,
+                    'previous_commissioner_id': old_commissioner.id if old_commissioner else None,
+                    'previous_commissioner_name': old_commissioner.get_full_name() if old_commissioner else None
+                }
             )
+            
+            serializer = RequestDetailSerializer(request_obj)
+            return Response(serializer.data)
         
         # Validate commissioner exists and is active
         try:
@@ -496,6 +613,7 @@ class SelectCommissionerView(APIView):
             )
         
         # Assign commissioner
+        old_commissioner = request_obj.commissioner
         request_obj.commissioner = commissioner
         request_obj.save()
         
@@ -505,45 +623,121 @@ class SelectCommissionerView(APIView):
             action=RequestEvent.Action.COMMISSIONER_CHANGED,
             actor=request.user,
             actor_role=request.user.role,
-            details={'commissioner_id': commissioner_id, 'commissioner_name': commissioner.get_full_name()}
+            details={
+                'commissioner_id': commissioner_id, 
+                'commissioner_name': commissioner.get_full_name(),
+                'previous_commissioner_id': old_commissioner.id if old_commissioner else None,
+                'previous_commissioner_name': old_commissioner.get_full_name() if old_commissioner else None
+            }
         )
         
         serializer = RequestDetailSerializer(request_obj)
         return Response(serializer.data)
 
 
-class RequestByCodeView(APIView):
+class MarkPaidView(APIView):
     """
-    Retrieve a request by its code (for commissioners).
-    Story 2.1 - Universal Request Retrieval.
-    Only the assigned commissioner can view/access this request.
+    Mark a request as paid by the user (fake payment for now).
     """
     
-    permission_classes = [IsCommissioner]
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request, pk):
+        request_obj = get_object_or_404(
+            Request, 
+            pk=pk, 
+            user=request.user
+        )
+        
+        # Only allow payment for certain statuses
+        allowed_statuses = [
+            Request.Status.DRAFT_READY,
+            Request.Status.NEEDS_REVIEW, 
+            Request.Status.APPROVED,
+            Request.Status.COMPLETED
+        ]
+        if request_obj.status not in allowed_statuses:
+            return Response(
+                {'error': 'Cannot process payment for this request status'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Already paid check
+        if request_obj.is_paid:
+            return Response(
+                {'error': 'This request has already been paid'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Mark as paid
+        request_obj.is_paid = True
+        request_obj.user_paid_at = timezone.now()
+        request_obj.save(update_fields=['is_paid', 'user_paid_at'])
+        
+        # Log the event
+        RequestEvent.objects.create(
+            request=request_obj,
+            action=RequestEvent.Action.STATUS_CHANGED,
+            actor=request.user,
+            actor_role=request.user.role,
+            details={'action': 'payment_completed', 'amount': '50.00', 'currency': 'TTD'}
+        )
+        
+        serializer = RequestDetailSerializer(request_obj)
+        return Response({
+            'success': True,
+            'message': 'Payment confirmed successfully',
+            'request': serializer.data
+        })
+
+
+class RequestByCodeView(APIView):
+    """
+    Retrieve a request by its code (for commissioners and admins).
+    Story 2.1 - Universal Request Retrieval.
+    - Commissioners can only access requests assigned to them (and not completed ones)
+    - Admins can access any request for support purposes
+    """
+    
+    permission_classes = [IsCommissionerOrReviewerOrAdmin]
     
     def get(self, request, code):
         request_obj = get_object_or_404(Request, request_code=code.upper())
         
-        # Check if request has an assigned commissioner
-        if request_obj.commissioner:
-            # Only the assigned commissioner can access this request
-            if request_obj.commissioner.id != request.user.id:
+        # Admins and reviewers can view any request (no assignment check)
+        if request.user.role not in ['admin', 'reviewer']:
+            # Commissioners: Cannot access completed requests
+            if request_obj.status == Request.Status.COMPLETED:
                 return Response(
-                    {'error': f'This request is assigned to {request_obj.commissioner.get_full_name() or request_obj.commissioner.username}. You cannot access it.'},
+                    {'error': 'This request has been completed and notarized. You can no longer access it.'},
                     status=403
                 )
+            
+            # Commissioners: Check if request has an assigned commissioner
+            if request_obj.commissioner:
+                # Only the assigned commissioner can access this request
+                if request_obj.commissioner.id != request.user.id:
+                    return Response(
+                        {'error': f'This request is assigned to {request_obj.commissioner.get_full_name() or request_obj.commissioner.username}. You cannot access it.'},
+                        status=403
+                    )
         
-        # Attempt to acquire lock
-        commissioner = request.user
-        success, locked_by = request_obj.acquire_lock(commissioner)
-        
-        response_data = RequestDetailSerializer(request_obj).data
-        
-        if not success:
-            response_data['lock_warning'] = f"Currently being viewed by {locked_by.get_full_name() or locked_by.username}"
-            response_data['can_takeover'] = True
-        
-        return Response(response_data)
+        # Attempt to acquire lock (skip for admins/reviewers viewing for support)
+        if request.user.role == 'commissioner':
+            commissioner = request.user
+            success, locked_by = request_obj.acquire_lock(commissioner)
+            
+            response_data = RequestDetailSerializer(request_obj).data
+            
+            if not success:
+                response_data['lock_warning'] = f"Currently being viewed by {locked_by.get_full_name() or locked_by.username}"
+                response_data['can_takeover'] = True
+            
+            return Response(response_data)
+        else:
+            # Admins/reviewers just view without locking
+            response_data = RequestDetailSerializer(request_obj).data
+            return Response(response_data)
 
 
 class RequestTakeoverView(APIView):
@@ -787,7 +981,9 @@ class CommissionerAssignedRequestsView(generics.ListAPIView):
     permission_classes = [IsCommissioner]
     
     def get_queryset(self):
-        # Get requests where this commissioner is assigned and status is APPROVED
+        # Get requests where this commissioner is assigned (excluding completed ones)
+        # Show APPROVED (ready to notarize) and DRAFT_READY only
+        # Once notarized (COMPLETED), requests are removed from commissioner's view
         return Request.objects.filter(
             commissioner=self.request.user,
             status__in=[Request.Status.APPROVED, Request.Status.DRAFT_READY]
@@ -822,11 +1018,14 @@ class MarkCompleteView(APIView):
         
         commissioner = request.user
         
+        # Get global payout amount from site settings
+        payout_amount = SiteSettings.get_payout_amount()
+        
         # Create stamp record
         stamp = Stamp.objects.create(
             request=request_obj,
             commissioner=commissioner,
-            payout_amount=commissioner.payout_rate,
+            payout_amount=payout_amount,
             notes=serializer.validated_data.get('notes', '')
         )
         
@@ -1057,16 +1256,29 @@ class RejectRequestView(APIView):
             status=Request.Status.NEEDS_REVIEW
         )
         
+        reviewer = request.user
         reason = request.data.get('reason', '')
         
         request_obj.status = Request.Status.REJECTED
         request_obj.qa_flags_json.append({
             'type': 'rejection',
             'description': reason,
-            'reviewer': request.user.username,
+            'reviewer': reviewer.username,
             'timestamp': timezone.now().isoformat()
         })
         request_obj.save()
+        
+        # Log event for reject action
+        RequestEvent.objects.create(
+            request=request_obj,
+            action=RequestEvent.Action.REJECTED,
+            actor=reviewer,
+            actor_role='reviewer',
+            details={
+                'reason': reason,
+                'rejected_at': timezone.now().isoformat()
+            }
+        )
         
         return Response({
             'success': True,
@@ -1799,6 +2011,110 @@ class AdminReviewerDetailView(generics.RetrieveUpdateDestroyAPIView):
 
 
 # =============================================================================
+# Admin Commissioner Payment Views
+# =============================================================================
+
+class AdminCommissionerPaymentSummaryView(generics.RetrieveAPIView):
+    """
+    Get commissioner details with payment summary (amount to pay, banking details).
+    """
+    
+    permission_classes = [IsAdminUser]
+    serializer_class = CommissionerPaymentSummarySerializer
+    
+    def get_queryset(self):
+        return User.objects.filter(role=User.Role.COMMISSIONER)
+
+
+class AdminCommissionerPaymentHistoryView(generics.ListAPIView):
+    """
+    List payment history for a specific commissioner.
+    """
+    
+    permission_classes = [IsAdminUser]
+    serializer_class = PaymentLogSerializer
+    
+    def get_queryset(self):
+        commissioner_id = self.kwargs.get('pk')
+        return PaymentLog.objects.filter(
+            commissioner_id=commissioner_id
+        ).order_by('-paid_at')
+
+
+class AdminMarkCommissionerPaidView(APIView):
+    """
+    Mark all unpaid stamps for a commissioner as paid.
+    Creates a PaymentLog entry and updates all unpaid stamps.
+    """
+    
+    permission_classes = [IsAdminUser]
+    
+    @transaction.atomic
+    def post(self, request, pk):
+        # Get commissioner
+        commissioner = get_object_or_404(User, pk=pk, role=User.Role.COMMISSIONER)
+        
+        # Validate request data
+        serializer = MarkAsPaidSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Get all unpaid stamps for this commissioner
+        unpaid_stamps = Stamp.objects.filter(
+            commissioner=commissioner,
+            paid=False
+        )
+        
+        if not unpaid_stamps.exists():
+            return Response(
+                {'detail': 'No unpaid stamps found for this commissioner.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Calculate total amount
+        from django.db.models import Sum
+        total_amount = unpaid_stamps.aggregate(total=Sum('payout_amount'))['total'] or 0
+        stamps_count = unpaid_stamps.count()
+        
+        # Create payment log
+        payment_log = PaymentLog.objects.create(
+            commissioner=commissioner,
+            amount_paid=total_amount,
+            stamps_count=stamps_count,
+            paid_by=request.user,
+            payment_reference=serializer.validated_data.get('payment_reference', ''),
+            payment_method=serializer.validated_data.get('payment_method', ''),
+            notes=serializer.validated_data.get('notes', '')
+        )
+        
+        # Mark all stamps as paid
+        now = timezone.now()
+        unpaid_stamps.update(paid=True, paid_at=now)
+        
+        return Response({
+            'detail': f'Successfully marked {stamps_count} stamps as paid.',
+            'payment_log': PaymentLogSerializer(payment_log).data,
+            'total_amount': str(total_amount),
+            'stamps_count': stamps_count
+        }, status=status.HTTP_200_OK)
+
+
+class AdminAllPaymentLogsView(generics.ListAPIView):
+    """
+    List all payment logs across all commissioners.
+    """
+    
+    permission_classes = [IsAdminUser]
+    serializer_class = PaymentLogSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['commissioner__username', 'commissioner__email', 'payment_reference']
+    ordering_fields = ['paid_at', 'amount_paid']
+    ordering = ['-paid_at']
+    
+    def get_queryset(self):
+        return PaymentLog.objects.all()
+
+
+# =============================================================================
 # Admin Affidavit Type CRUD Views
 # =============================================================================
 
@@ -2445,3 +2761,122 @@ class AdminAffidavitTypeDecisionNodesView(APIView):
         serializer.save()
         
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+# =============================================================================
+# Site Settings Views
+# =============================================================================
+
+class SiteSettingsView(APIView):
+    """
+    Get or update global site settings.
+    Only admins can view and modify settings.
+    """
+    
+    permission_classes = [IsAdminUser]
+    
+    def get(self, request):
+        """Get current site settings."""
+        from .serializers import SiteSettingsSerializer
+        
+        settings = SiteSettings.get_settings()
+        serializer = SiteSettingsSerializer(settings)
+        return Response(serializer.data)
+    
+    def patch(self, request):
+        """Update site settings."""
+        from .serializers import SiteSettingsSerializer
+        
+        settings = SiteSettings.get_settings()
+        serializer = SiteSettingsSerializer(settings, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        
+        # Track who made the update
+        settings.updated_by = request.user
+        serializer.save()
+        
+        return Response({
+            'success': True,
+            'message': 'Settings updated successfully',
+            'settings': serializer.data
+        })
+
+
+# =============================================================================
+# Admin Request Listing by Type (for viewing all generated affidavits)
+# =============================================================================
+
+class AdminTypeRequestsView(generics.ListAPIView):
+    """
+    Admin endpoint to list all requests for a specific affidavit type.
+    Shows requests of all statuses: draft, submitted, in review, approved, completed, rejected.
+    Includes rejection reasons from reviewers and friction reports from commissioners.
+    """
+    
+    permission_classes = [IsAdminUser]
+    serializer_class = RequestDetailSerializer
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['request_code', 'user__username', 'user__email']
+    ordering_fields = ['created_at', 'updated_at', 'status', 'submitted_at', 'approved_at', 'completed_at']
+    ordering = ['-created_at']
+    
+    def get_queryset(self):
+        type_id = self.kwargs.get('pk')
+        affidavit_type = get_object_or_404(AffidavitType, pk=type_id)
+        
+        # Get status filter from query params
+        status_filter = self.request.query_params.get('status', None)
+        
+        queryset = Request.objects.filter(affidavit_type=affidavit_type)
+        
+        if status_filter and status_filter != 'all':
+            queryset = queryset.filter(status=status_filter)
+        
+        # Prefetch related data for better performance
+        return queryset.select_related('user', 'affidavit_type', 'commissioner', 'locked_by')
+    
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        
+        # Paginate
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            data = serializer.data
+            
+            # Enhance with rejection/friction info
+            for item in data:
+                request_obj = Request.objects.get(id=item['id'])
+                
+                # Get rejection reason from reviewer (stored in qa_flags_json)
+                reviewer_rejection = None
+                if request_obj.status == 'rejected':
+                    for flag in request_obj.qa_flags_json:
+                        if isinstance(flag, dict) and flag.get('type') == 'rejection':
+                            reviewer_rejection = {
+                                'reason': flag.get('description', ''),
+                                'reviewer': flag.get('reviewer', ''),
+                                'timestamp': flag.get('timestamp', '')
+                            }
+                            break
+                
+                # Get friction reports from commissioners
+                friction_reports = []
+                for fr in request_obj.friction_reports.all():
+                    friction_reports.append({
+                        'id': fr.id,
+                        'reason': fr.reason,
+                        'commissioner': fr.commissioner.get_full_name() or fr.commissioner.username,
+                        'created_at': fr.created_at.isoformat(),
+                        'is_resolved': fr.is_resolved,
+                        'resolution_notes': fr.resolution_notes
+                    })
+                
+                item['reviewer_rejection'] = reviewer_rejection
+                item['friction_reports'] = friction_reports
+            
+            return self.get_paginated_response(data)
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+

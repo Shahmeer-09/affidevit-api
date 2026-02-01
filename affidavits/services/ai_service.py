@@ -145,6 +145,78 @@ def select_relevant_examples(
     return [ex for _, ex in scored_examples[:max_examples]]
 
 
+def translate_to_english(answers_json: dict) -> dict:
+    """
+    Detect and translate non-English content in user answers to English.
+    Handles mixed language input (e.g., "my house is old or ye khrab ho gya h").
+    
+    Args:
+        answers_json: User's intake form answers (may contain non-English text)
+    
+    Returns:
+        dict: Translated answers with all text in English
+    """
+    try:
+        client = get_openai_client()
+        
+        logger.info("[TRANSLATE] Checking all answers for non-English content (including romanized foreign languages)")
+        
+        system_prompt = """You are a language translation assistant. Your job is to translate non-English text to English while preserving the meaning exactly.
+
+**RULES:**
+1. If text is already in English, leave it unchanged
+2. If text is mixed (English + another language), translate ONLY the non-English parts
+3. Preserve all factual information exactly - don't change numbers, names, or addresses
+4. Return the translated answers in the SAME JSON structure
+5. Common languages you may encounter: Urdu, Hindi, Arabic, Spanish, French, etc.
+
+**EXAMPLES:**
+Input: {"repairs": "my house is old or ye khrab ho gya h"}
+Output: {"repairs": "my house is old or it has become damaged"}
+
+Input: {"property": "dwelling house at 15 Queen Street"}
+Output: {"property": "dwelling house at 15 Queen Street"}
+
+Input: {"name": "Ali Ahmed"}
+Output: {"name": "Ali Ahmed"}
+
+**IMPORTANT:**
+- Translate to natural, grammatically correct English
+- Keep the same JSON field names
+- Preserve numbers, dates, and proper nouns
+- Return ONLY the JSON, no explanations"""
+
+        user_prompt = f"""Translate any non-English text in this JSON to English:
+
+{json.dumps(answers_json, indent=2)}
+
+Return the translated JSON with the same structure. If a field is already in English, keep it exactly as is."""
+
+        response = client.chat.completions.create(
+            model=settings.OPENAI_DRAFT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+            response_format={"type": "json_object"}
+        )
+        
+        translated_json = json.loads(response.choices[0].message.content.strip())
+        
+        logger.info(f"[TRANSLATE] Successfully translated answers")
+        logger.info(f"[TRANSLATE] Original: {json.dumps(answers_json, ensure_ascii=False)[:200]}")
+        logger.info(f"[TRANSLATE] Translated: {json.dumps(translated_json)[:200]}")
+        
+        return translated_json
+        
+    except Exception as e:
+        logger.error(f"Error in translation: {e}, using original answers")
+        # If translation fails, return original answers
+        return answers_json
+
+
 def get_base_instruction() -> str:
     """Get the active AI base instruction from the database."""
     try:
@@ -193,6 +265,9 @@ def draft_affidavit(
     try:
         client = get_openai_client()
         start_time = time.time()
+        
+        # STEP 0: Translate non-English content to English
+        answers_json = translate_to_english(answers_json)
         
         # Get base instruction from database
         base_instruction = get_base_instruction()
@@ -396,233 +471,330 @@ Generate the complete affidavit in HTML format:
 def analyze_input_suitability(
     answers_json: dict,
     template_html: str,
+    affidavit_type_name: str,
+    form_fields: list = None
+) -> dict:
+    """
+    DEPRECATED: This function is kept for backward compatibility.
+    Use validate_inputs_before_submission() for the new pre-submission validation flow.
+    
+    This now just returns is_suitable=True to skip the clarification loop.
+    Validation should happen BEFORE submission via the validate endpoint.
+    """
+    return {
+        'is_suitable': True,
+        'issues': [],
+        'clarification_question': '',
+        'clarification_example': '',
+        'calculated_age': None,
+        'resolved_fields': [],
+        'needs_human_review': False,
+        'prompt_tokens': 0,
+        'completion_tokens': 0,
+        'total_tokens': 0,
+    }
+
+
+def validate_inputs_before_submission(
+    answers_json: dict,
+    template_html: str,
     affidavit_type_name: str
 ) -> dict:
     """
-    Validate user input against template requirements BEFORE draft generation.
-    Checks if the user has provided enough specific information to fill the template.
+    Quick validation check BEFORE allowing user to submit.
+    Only checks if inputs are valid - does NOT generate clarification questions.
+    Used to block submission until user fixes all invalid fields.
+    
+    This is called from the frontend BEFORE submission to validate all fields.
     
     Args:
         answers_json: User's intake form answers
-        template_html: The HTML template to be filled
+        template_html: The HTML template with placeholders
         affidavit_type_name: Name of the affidavit type
-        
+    
     Returns:
         dict: {
-            'is_suitable': bool,
-            'issues': list of issue objects,
-            'clarification_question': str (if is_suitable is False),
-            'prompt_tokens': int,
-            'completion_tokens': int,
-            'total_tokens': int
+            'all_valid': bool,
+            'invalid_fields': {'field_name': 'reason why invalid'},
+            'validation_notes': [{'field': 'address', 'issue': 'Not valid', 'example': '...'}]
         }
     """
     try:
         client = get_openai_client()
         
-        # If no template, we can't really validate against it, so assume suitable
         if not template_html:
-            return {
-                'is_suitable': True,
-                'issues': [],
-                'clarification_question': '',
-                'prompt_tokens': 0,
-                'completion_tokens': 0,
-                'total_tokens': 0
-            }
-            
-        system_prompt = """You are an intelligent legal document validation expert with strong analytical skills.
-Your task is to check if the user's input is LOGICALLY CONSISTENT and contains sufficient information to fill the provided affidavit template.
+            return {'all_valid': True, 'invalid_fields': {}, 'validation_notes': []}
+        
+        system_prompt = """You are a lenient field validator for legal documents. Your job is to catch ONLY serious issues - gibberish, completely irrelevant answers, and logical contradictions. Return your response as JSON.
 
-**CRITICAL: HANDLING CLARIFICATIONS - STRICT LOOP PREVENTION**
+**CRITICAL: BE VERY LENIENT - The AI drafter will fix spelling, grammar, and formalize language**
 
-BEFORE flagging ANY issue:
-1. Check if 'PREVIOUS_CLARIFICATIONS' field exists in user input
-2. If it exists and contains ANY text, the user HAS ALREADY RESPONDED to a clarification
-3. Parse the clarification to extract the FINAL CORRECT VALUES
-4. UPDATE your analysis to use the clarified values as ABSOLUTE TRUTH
-5. NEVER ask the same question in different words
-6. NEVER ask for "confirmation" or "verification" of clarified data
+**ONLY FLAG THESE 5 TYPES OF SERIOUS PROBLEMS:**
 
-**CLARIFICATION RESPONSE RULES:**
-- If user said "I am 40" or "my age is 40" → AGE = 40 (FINAL, DO NOT QUESTION)
-- If user said "3 years" or "I lived for 3 years" → DURATION = 3 (FINAL, DO NOT QUESTION)
-- If user said "house is 50" or "50 years old" → HOUSE_AGE = 50 (FINAL, DO NOT QUESTION)
+1. **PURE GIBBERISH (keyboard mashing):**
+   - Examples: "ihdhfihdbhb", "asdfasdfasdf", "fgdgsgsdvchdvudv", "jkljkljkl"
+   - Random characters with NO recognizable words
+   - Must be COMPLETELY meaningless
 
-**MANDATORY LOOP PREVENTION:**
-- If PREVIOUS_CLARIFICATIONS exists → User already answered → Return is_suitable=TRUE UNLESS there's a COMPLETELY NEW contradiction
-- If you already asked about age vs residence → DO NOT ask again about age vs house age (these are related, use clarified age)
-- If any value was clarified, treat it as THE TRUTH and check if OTHER unclarified fields contradict it
-- Maximum 1 clarification request per unique logical contradiction
+2. **COMPLETELY IRRELEVANT ANSWERS:**
+   - Asked about property, user says "i'm sick" or "i'm sad hahaha" → INVALID
+   - Asked about address, user says "i don't like this" → INVALID
+   - Asked about ownership, user says "whatever lol" → INVALID
+   - The answer has NOTHING to do with the question
 
-**WHEN TO RETURN is_suitable=TRUE:**
-- PREVIOUS_CLARIFICATIONS exists AND no new contradictions found → STOP, APPROVE
-- User provided ANY clarification response → ASSUME they fixed the issue, check for NEW issues only
-- You've asked about this combination of fields before → STOP, APPROVE
+3. **LOGICAL CONTRADICTIONS (impossible math):**
+   - Age 25 + "lived here 50 years" → INVALID (can't live somewhere longer than you've been alive)
+   - Date of birth that makes age negative or > 120 → INVALID
+   - Impossible time periods
 
-**INTELLIGENT CONTRADICTION DETECTION**
+4. **IMPOSSIBLE VALUES:**
+   - Age 250, Age -5 → INVALID
+   - Negative durations → INVALID
+   - Clearly impossible numbers
 
-You MUST analyze ALL answers together and check for logical impossibilities:
+5. **TRAILING GIBBERISH/IRRELEVANT CONTENT (valid start, bad ending):**
+   - "replacing windows hahahah i am happy and confused" → INVALID (starts ok but ends with irrelevant emotional content)
+   - "fixing the roof khdfbiewbfiwbf" → INVALID (starts ok but ends with gibberish)
+   - "my property is 100sqm lololol whatever" → INVALID (relevant info + irrelevant trailing)
+   - "new paint job im so bored today" → INVALID (relevant + unrelated personal statement)
+   - The answer STARTS with relevant info but ENDS with gibberish, emotional outbursts, or unrelated content
+   - Look for patterns like: relevant text + "haha", "lol", random letters, personal feelings, off-topic comments
 
-1. **AGE vs DURATION CONTRADICTIONS:**
-   - If user says age is X years, they CANNOT have done anything for more than X years
-   - Example: "I am 23 years old" + "I have lived at this address for 30 years" = IMPOSSIBLE
-   - BUT if user clarified "my age is 40", then "25 years residence" is POSSIBLE - accept it!
+**WHAT TO ACCEPT (DO NOT FLAG) - The drafter will fix these:**
 
-2. **DATE OF BIRTH vs AGE CALCULATION:**
-   - If DOB is provided, CALCULATE the actual age from it
-   - If calculated age differs from stated age by more than 1 year, ask user which is correct
-   - The CALCULATED age should be used in the affidavit if provided
+✅ **SPELLING ERRORS - ALWAYS ACCEPT:**
+   - "councile" → VALID (drafter fixes to "council")
+   - "responsable" → VALID (drafter fixes to "responsible")
+   - Any misspelled words → VALID
 
-3. **DATE OF BIRTH vs DURATION:**
-   - Check ALL duration claims against the birth year
+✅ **INFORMAL/SIMPLE LANGUAGE - ALWAYS ACCEPT:**
+   - "my house is old" → VALID (drafter will formalize)
+   - "i own the house and i am responsible for all the stuff" → VALID
+   - "the council has allowed me" → VALID
+   - "dwelling house at 15 Queen Street" → VALID
+   - Any casual phrasing → VALID
 
-4. **EVENT DATES vs AGE:**
-   - Marriage date, purchase date, employment start date - all must be AFTER birth date
+✅ **INCOMPLETE BUT MEANINGFUL - ALWAYS ACCEPT:**
+   - "Bacolet Street" (missing town) → VALID (has street name)
+   - "my old house" → VALID (describes property)
+   - "the property councile has allowed me" → VALID (has permission info)
+   - "234324323432" (long number for ID) → VALID (could be valid ID)
 
-5. **TIMELINE CONSISTENCY:**
-   - Start dates must be before end dates
+✅ **VAGUE BUT RELEVANT - ALWAYS ACCEPT:**
+   - "my house" for property → VALID (relevant to question)
+   - "the old building" → VALID (describes something)
+   - Simple short answers → VALID
 
-**CALCULATION INSTRUCTIONS:**
-- Current year for calculations: Use the CURRENT DATE provided
-- Age = Current Year - Birth Year
-- Duration = Current Year - Start Year
-- If user clarified a value, USE IT - don't recalculate or question it
+**EXAMPLES OF WHAT TO ACCEPT:**
+- Address: "Bacolet Street, Scarborough" → ✅ VALID
+- Address: "123 Main Street" → ✅ VALID
+- Property: "my house is old" → ✅ VALID
+- Ownership: "i own the house and i am responsible for all the stuff" → ✅ VALID
+- Permission: "the property councile has allowed me" → ✅ VALID
+- Name: "John" → ✅ VALID
+- ID: "234324323432" → ✅ VALID
+- Repairs: "replacing windows and doors" → ✅ VALID (all relevant)
 
-You must respond with a JSON object in this exact format:
+**EXAMPLES OF WHAT TO REJECT:**
+- Address: "ihdhfihdbhb" → ❌ INVALID (pure gibberish)
+- Property: "asdfasdfasdf" → ❌ INVALID (keyboard mashing)
+- Property: "i'm sick haha" → ❌ INVALID (completely irrelevant to property question)
+- Ownership: "lol whatever" → ❌ INVALID (irrelevant)
+- Name: "jkljkljkl" → ❌ INVALID (gibberish)
+- Age: 250 → ❌ INVALID (impossible)
+- Duration: Age 25 + "lived here 50 years" → ❌ INVALID (contradiction)
+- Repairs: "replacing windows hahahah i am happy and confused" → ❌ INVALID (trailing irrelevant content)
+- Repairs: "fixing roof khdfbiewbfiwbf" → ❌ INVALID (trailing gibberish)
+- Property: "my house is nice lol im bored" → ❌ INVALID (trailing irrelevant)
+
+**OUTPUT FORMAT:**
 {
-    "is_suitable": boolean,
-    "issues": [
+    "all_valid": boolean,
+    "field_checks": [
         {
-            "field": "field_name_or_description",
-            "type": "age_duration_contradiction" | "dob_age_mismatch" | "timeline_impossible" | "missing_info",
-            "reason": "Clear explanation: 'User stated age 23, but claims 30 years residence. This is impossible.'",
-            "found_values": {"stated_age": "23", "claimed_duration": "30 years"}
+            "field": "field_name",
+            "value": "what user entered",
+            "is_valid": true/false,
+            "issue": "ONLY if gibberish/irrelevant/contradiction/impossible/trailing-junk - null otherwise",
+            "example": "Example ONLY if invalid - null otherwise"
         }
-    ],
-    "clarification_question": "A detailed, context-aware question that EXPLAINS THE PROBLEM clearly with actual numbers from user input",
-    "clarification_example": "Example answer: '40' or 'I am 40 years old' or '3 years'",
-    "calculated_age": null or number (if DOB was provided, include the calculated age here)
+    ]
 }
 
-**CRITICAL RULES FOR clarification_question:**
-1. ALWAYS state the SPECIFIC contradiction with ACTUAL NUMBERS from user input
-2. EXPLAIN why it's impossible (e.g., "You cannot have lived anywhere longer than you've been alive")
-3. Provide TWO contextual examples showing both possible corrections:
-   - Example if user wants to keep one value: "If you are actually 43 years old (and the 25 years is correct)..."
-   - Example if user wants to correct the other: "If your age of 23 is correct, then residence should be 23 years or less"
-4. Make it CRYSTAL CLEAR what the user needs to fix
-
-Example of a GOOD clarification_question:
-"You stated your age is 23 years old, but you claim to have lived at this address for 25 years. This is mathematically impossible - you cannot have lived anywhere longer than you've been alive.
-
-Please provide the correct information:
-- If you are actually older (to match 25 years residence): 'I am 45 years old'
-- If your age 23 is correct: 'I have lived here for 3 years' (or any number ≤ 23)"
-
-Rules:
-1. "is_suitable" = TRUE if all data is internally consistent OR user has clarified the issues
-2. "is_suitable" = FALSE only if there are NEW contradictions after considering clarifications
-3. If user answered a clarification, ACCEPT it and validate other fields against it
-4. NEVER ask the same question twice
-5. Make clarification_question DETAILED and CONTEXT-AWARE with actual user numbers
-6. If PREVIOUS_CLARIFICATIONS exists, those issues are RESOLVED - don't flag them again
+**GOLDEN RULE:**
+If the answer is ENTIRELY meaningful and related to the question → ACCEPT IT.
+Reject if it contains gibberish, completely irrelevant content, OR trails off into nonsense/personal comments after valid info.
 """
 
-        # Get current date for calculations
         from datetime import date
-        current_date = date.today()
-        current_year = current_date.year
-        current_date_str = current_date.isoformat()
+        current_year = date.today().year
 
         user_prompt = f"""
-Validate this user input for LOGICAL CONSISTENCY:
-
 **AFFIDAVIT TYPE:** {affidavit_type_name}
-
-**CURRENT DATE:** {current_date_str}
 **CURRENT YEAR:** {current_year}
+
+**TEMPLATE (shows what each field is for):**
+{template_html[:4000] if template_html else 'No template'}
 
 **USER INPUT TO VALIDATE:**
 {json.dumps(answers_json, indent=2)}
 
 **YOUR TASK:**
-1. **FIRST: Check if 'PREVIOUS_CLARIFICATIONS' exists**
-   - If YES: Extract the user's corrected values from their response
-   - Parse natural language answers (e.g., "I am 40" means age=40, "3 years" means duration=3)
-   - Treat these as ABSOLUTE TRUTH - the user has already corrected the issue
+1. Go through EACH field in the user input
+2. ONLY flag if the value is:
+   - Pure gibberish/keyboard mashing (like "asdfgh", "ihdhfihdbhb")
+   - Completely irrelevant to the question (asked property, user says "i'm sick")
+   - Logically impossible (age 25 but lived there 50 years)
+   - Impossible number (age 250)
+   - TRAILING GIBBERISH/IRRELEVANT: Starts with valid info but ENDS with gibberish or unrelated content
+     Examples: "replacing windows hahahah i am happy", "fixing roof asdfasdf", "my house lol im bored"
 
-2. **Build a "RESOLVED VALUES" dictionary:**
-   - If user clarified age → resolved_age = extracted_value
-   - If user clarified duration → resolved_duration = extracted_value
-   - Use these RESOLVED values for ALL subsequent checks
+3. ACCEPT everything else including:
+   - Spelling errors (drafter will fix)
+   - Informal language (drafter will formalize)
+   - Simple/vague but relevant answers
+   - Short answers
 
-3. **Check for NEW contradictions ONLY:**
-   - Use resolved_age (if exists) instead of original age
-   - Use resolved_duration (if exists) instead of original duration
-   - ONLY flag issues that involve UNCLARIFIED fields
+**IMPORTANT - CHECK FOR TRAILING JUNK:**
+Read each answer from START to END. If it begins relevant but trails off into:
+- Gibberish letters (khdfbiewbfiwbf)
+- Emotional expressions unrelated to the topic (hahahah, lol, im happy, im confused)
+- Off-topic personal comments (im bored, whatever, idk)
+Then flag it as INVALID with issue "Contains irrelevant trailing content".
 
-4. **CRITICAL DECISION LOGIC:**
-   - If PREVIOUS_CLARIFICATIONS exists AND no new contradictions → is_suitable = TRUE (STOP THE LOOP)
-   - If you detect the same type of issue as before (age vs duration) → is_suitable = TRUE (user already answered)
-   - Only return is_suitable = FALSE for COMPLETELY NEW contradictions
-
-**EXAMPLE:**
-User originally said: age=23, years_residing=25
-First clarification asked: "age vs residence contradiction"
-User responded: "I am 40 and lived for 3 years"
-→ RESOLVED: age=40, years_residing=3
-→ NOW CHECK: Is 40 vs 3 valid? YES → is_suitable=TRUE
-→ DO NOT ask about age/residence again, even if you see house_age=50
-→ If house_age=50 contradicts NOTHING, return is_suitable=TRUE
-
-Return is_suitable=TRUE if clarifications resolve all issues.
-Return is_suitable=FALSE ONLY if there are NEW unresolved contradictions.
+Be LENIENT on spelling/grammar - the AI drafter will fix that.
+But REJECT answers that contain garbage or off-topic content mixed with valid info.
 """
 
         response = client.chat.completions.create(
-            model=settings.OPENAI_QA_MODEL,  # Use QA model (GPT-4o) for better reasoning
+            model=settings.OPENAI_QA_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.1,
-            max_tokens=1000,
+            max_tokens=2000,
             response_format={"type": "json_object"}
         )
         
-        result_text = response.choices[0].message.content.strip()
-        result = json.loads(result_text)
-        usage = response.usage
+        result = json.loads(response.choices[0].message.content.strip())
         
-        # Log with more detail about what was found
-        calculated_age = result.get('calculated_age')
-        issues_count = len(result.get('issues', []))
-        logger.info(f"Input suitability check for {affidavit_type_name}: suitable={result.get('is_suitable')}, issues={issues_count}, calculated_age={calculated_age}")
+        # Transform into simple format for frontend
+        invalid_fields = {}
+        validation_notes = []
+        
+        for check in result.get('field_checks', []):
+            if not check.get('is_valid', True):
+                field_name = check.get('field', 'unknown')
+                invalid_fields[field_name] = check.get('issue', 'Invalid value')
+                validation_notes.append({
+                    'field': field_name,
+                    'value': check.get('value', ''),
+                    'issue': check.get('issue', 'Invalid value'),
+                    'example': check.get('example', '')
+                })
+        
+        all_valid = result.get('all_valid', len(invalid_fields) == 0)
+        
+        logger.info(f"Pre-submission validation for {affidavit_type_name}: "
+                   f"all_valid={all_valid}, invalid_fields={list(invalid_fields.keys())}")
         
         return {
-            'is_suitable': result.get('is_suitable', True),
-            'issues': result.get('issues', []),
-            'clarification_question': result.get('clarification_question', ''),
-            'clarification_example': result.get('clarification_example', ''),
-            'calculated_age': calculated_age,  # Pass this to be used in draft instead of user-stated age
-            'prompt_tokens': usage.prompt_tokens if usage else 0,
-            'completion_tokens': usage.completion_tokens if usage else 0,
-            'total_tokens': usage.total_tokens if usage else 0,
+            'all_valid': all_valid,
+            'invalid_fields': invalid_fields,
+            'validation_notes': validation_notes,
+            'field_checks': result.get('field_checks', [])
         }
         
     except Exception as e:
-        logger.error(f"Error in input suitability check: {e}")
-        # Fail open - assume suitable if check fails to avoid blocking users
+        logger.error(f"Error in pre-submission validation: {e}")
+        
+        # FALLBACK: Use pattern-based validation when AI is unavailable
+        fallback_invalid_fields = {}
+        fallback_notes = []
+        
+        import re
+        
+        for field_name, field_value in answers_json.items():
+            if not isinstance(field_value, str) or len(field_value.strip()) == 0:
+                continue
+            
+            value = field_value.lower().strip()
+            
+            # Pattern 1: Pure keyboard mashing (same char repeated or random consonant clusters)
+            # Example: "asdfasdf", "jkljkljkl", "kldbfihdb"
+            if re.search(r'([qwrtypsdfghjklzxcvbnm])\1{4,}', value):  # Same consonant 5+ times
+                fallback_invalid_fields[field_name] = 'Contains gibberish or keyboard mashing'
+                fallback_notes.append({
+                    'field': field_name,
+                    'value': field_value,
+                    'issue': 'Contains gibberish or keyboard mashing',
+                    'example': 'Please enter meaningful text without random characters'
+                })
+                continue
+            
+            # Pattern 2: Random gibberish strings (low vowel ratio + mixed consonants)
+            # Example: "kldbfihdb", "jhfbdhfbh", "asdfasdf"
+            # Check for words with suspiciously low vowel count
+            words = value.split()
+            for word in words:
+                if len(word) >= 6:  # Only check longer "words"
+                    vowel_count = sum(1 for c in word if c in 'aeiou')
+                    consonant_count = sum(1 for c in word if c.isalpha() and c not in 'aeiou')
+                    
+                    # If < 20% vowels and has multiple different consonants, likely gibberish
+                    if consonant_count > 0:
+                        vowel_ratio = vowel_count / (vowel_count + consonant_count)
+                        unique_consonants = len(set(c for c in word if c.isalpha() and c not in 'aeiou'))
+                        
+                        if vowel_ratio < 0.2 and unique_consonants >= 5:
+                            fallback_invalid_fields[field_name] = 'Contains gibberish text'
+                            fallback_notes.append({
+                                'field': field_name,
+                                'value': field_value,
+                                'issue': 'Contains gibberish or random characters',
+                                'example': 'Please enter meaningful words'
+                            })
+                            break
+            
+            if field_name in fallback_invalid_fields:
+                continue
+            
+            # Pattern 3: Trailing junk - laughs, emotional expressions, excessive punctuation
+            # Example: "hahahah", "lol yeah", "...."
+            if re.search(r'\s+(ha){2,}|lol+|yeah\s+m+\s+\w+|[.]{4,}', value):
+                fallback_invalid_fields[field_name] = 'Contains irrelevant trailing content'
+                fallback_notes.append({
+                    'field': field_name,
+                    'value': field_value,
+                    'issue': 'Contains irrelevant trailing content (laughs, emotions, etc.)',
+                    'example': 'Remove "haha", "lol", or extra punctuation at the end'
+                })
+                continue
+        
+        # If we found issues with fallback validation, return them
+        if fallback_invalid_fields:
+            logger.info(f"Fallback validation caught {len(fallback_invalid_fields)} invalid fields")
+            return {
+                'all_valid': False,
+                'invalid_fields': fallback_invalid_fields,
+                'validation_notes': fallback_notes,
+                'fallback_validation': True,
+                'error': f'AI validation unavailable (using pattern matching): {str(e)}'
+            }
+        
+        # If no obvious issues found and AI failed, return error instead of fail-open
+        # This prevents bad data from being submitted when we can't validate properly
         return {
-            'is_suitable': True,
-            'issues': [{'type': 'system_error', 'description': str(e)}],
-            'clarification_question': '',
-            'clarification_example': '',
-            'calculated_age': None,
-            'prompt_tokens': 0,
-            'completion_tokens': 0,
-            'total_tokens': 0,
+            'all_valid': False,
+            'invalid_fields': {'_system': 'Validation service temporarily unavailable'},
+            'validation_notes': [{
+                'field': '_system',
+                'value': '',
+                'issue': f'Validation service error: {str(e)}. Please try again in a moment.',
+                'example': ''
+            }],
+            'error': str(e)
         }
 
 
@@ -925,10 +1097,6 @@ def process_request(request_obj) -> dict:
     
     if not draft_result['success']:
         request_obj.status = Request.Status.NEEDS_REVIEW
-        request_obj.qa_flags_json = [{
-            'type': 'draft_error',
-            'description': draft_result['error']
-        }]
         request_obj.save()
         return {
             'success': False,
@@ -939,38 +1107,13 @@ def process_request(request_obj) -> dict:
     # Save the draft
     request_obj.draft_text = draft_result['draft_text']
     
-    # Step 2: Run QA check (validates AI OUTPUT quality, not user input)
-    # Get global system instructions if available
-    from ..models import AIBaseInstruction
-    try:
-        system_instructions = AIBaseInstruction.get_active().instruction_text
-    except Exception as e:
-        logger.warning(f"Could not get base instruction for QA: {e}")
-        system_instructions = None
-    
-    qa_result = qa_check(
-        draft_text=draft_result['draft_text'],
-        answers_json=final_answers,
-        policy_json=request_obj.affidavit_type.policy_json,
-        affidavit_type_name=request_obj.affidavit_type.name,
-        template_html=affidavit_type.template_html,
-        system_instructions=system_instructions,
-        affidavit_instructions=affidavit_type.policy_json.get('ai_instructions', '')
-    )
-    
-    # Step 3: Update request based on QA result
-    request_obj.qa_flags_json = qa_result['flags_json']
-    
-    if qa_result['status'] == 'approved':
-        # Check if affidavit type is in instant mode
-        if request_obj.affidavit_type.is_instant_mode:
-            request_obj.status = Request.Status.APPROVED
-            request_obj.final_text = request_obj.draft_text
-        else:
-            # Even if approved, still needs human review unless instant mode
-            request_obj.status = Request.Status.NEEDS_REVIEW
-    
-    else:  # needs_review (QA no longer returns needs_clarification)
+    # All requests go to human review (no QA flagging - reviewer reads completely)
+    if request_obj.affidavit_type.is_instant_mode:
+        # Instant mode: auto-approve
+        request_obj.status = Request.Status.APPROVED
+        request_obj.final_text = request_obj.draft_text
+    else:
+        # Normal mode: needs human review
         request_obj.status = Request.Status.NEEDS_REVIEW
     
     request_obj.save()
@@ -979,7 +1122,7 @@ def process_request(request_obj) -> dict:
         'success': True,
         'status': request_obj.status,
         'draft_text': request_obj.draft_text,
-        'issues': qa_result.get('issues', [])
+        'issues': []
     }
 
 

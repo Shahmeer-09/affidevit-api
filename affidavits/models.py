@@ -103,6 +103,64 @@ CRITICAL GUIDELINES:
 Always maintain professional tone and absolute legal accuracy."""
 
 
+class SiteSettings(models.Model):
+    """
+    Singleton model for global site settings.
+    Stores configuration like default payout amount for commissioners.
+    Only one active record should exist at a time.
+    """
+    
+    default_payout_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=1.00,
+        help_text="Default payout amount per completed affidavit for all commissioners"
+    )
+    
+    # Metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        'User',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='site_settings_updates'
+    )
+    
+    class Meta:
+        db_table = 'site_settings'
+        verbose_name = 'Site Settings'
+        verbose_name_plural = 'Site Settings'
+    
+    def __str__(self):
+        return f"Site Settings (Payout: ${self.default_payout_amount})"
+    
+    def save(self, *args, **kwargs):
+        # Ensure only one settings record exists
+        if not self.pk and SiteSettings.objects.exists():
+            # Update existing instead of creating new
+            existing = SiteSettings.objects.first()
+            existing.default_payout_amount = self.default_payout_amount
+            existing.updated_by = self.updated_by
+            existing.save()
+            return
+        super().save(*args, **kwargs)
+    
+    @classmethod
+    def get_settings(cls):
+        """Get site settings or create with defaults."""
+        settings = cls.objects.first()
+        if not settings:
+            settings = cls.objects.create()
+        return settings
+    
+    @classmethod
+    def get_payout_amount(cls):
+        """Get the current global payout amount."""
+        return cls.get_settings().default_payout_amount
+
+
 class User(AbstractUser):
     """
     Extended User model with role-based access control.
@@ -121,7 +179,13 @@ class User(AbstractUser):
         default=Role.PUBLIC,
         db_index=True
     )
-    phone_number = models.CharField(max_length=20, blank=True, null=True)
+    phone_number = models.CharField(
+        max_length=20, 
+        blank=True, 
+        null=True,
+        unique=True,
+        help_text="Phone number must be unique"
+    )
     
     # Profile image (used for commissioners on landing page)
     profile_image = models.ImageField(
@@ -144,17 +208,62 @@ class User(AbstractUser):
     )
     
     # Commissioner-specific fields
-    commission_number = models.CharField(max_length=50, blank=True, null=True)
+    commission_number = models.CharField(
+        max_length=50, 
+        blank=True, 
+        null=True,
+        unique=True,
+        help_text="Commission number must be unique"
+    )
     commission_expiry = models.DateField(blank=True, null=True)
     payout_rate = models.DecimalField(
         max_digits=10, 
         decimal_places=2, 
-        default=0.00,
+        default=1.00,
         help_text="Amount paid per completed affidavit"
     )
     is_featured = models.BooleanField(
         default=False,
         help_text="Show this commissioner on the landing page"
+    )
+    
+    # Commissioner payment/bank details
+    bank_name = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text="Name of the bank for payments"
+    )
+    bank_branch = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text="Bank branch name or code"
+    )
+    bank_account_number = models.CharField(
+        max_length=50,
+        blank=True,
+        null=True,
+        unique=True,
+        help_text="Bank account number must be unique"
+    )
+    bank_account_name = models.CharField(
+        max_length=200,
+        blank=True,
+        null=True,
+        help_text="Name on the bank account"
+    )
+    payment_preference = models.CharField(
+        max_length=50,
+        blank=True,
+        null=True,
+        choices=[
+            ('bank_transfer', 'Bank Transfer'),
+            ('cheque', 'Cheque'),
+            ('cash', 'Cash'),
+        ],
+        default='bank_transfer',
+        help_text="Preferred payment method"
     )
     
     # Commissioner PDF preferences
@@ -171,6 +280,33 @@ class User(AbstractUser):
     #   "show_commission_number": true,
     #   "custom_footer": "Custom footer text"
     # }
+    
+    # Commissioner availability schedule
+    availability = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Commissioner availability schedule"
+    )
+    # Example availability structure:
+    # {
+    #   "recurring": {
+    #     "monday": [{"start": "09:00", "end": "17:00"}],
+    #     "tuesday": [{"start": "09:00", "end": "12:00"}, {"start": "14:00", "end": "17:00"}],
+    #     ...
+    #   },
+    #   "specific_dates": [
+    #     {"date": "2026-02-15", "available": true, "slots": [{"start": "10:00", "end": "14:00"}]},
+    #     {"date": "2026-02-20", "available": false}  # Not available this day
+    #   ],
+    #   "timezone": "America/Port_of_Spain"
+    # }
+    
+    # Commissioner address/location
+    address = models.TextField(
+        blank=True,
+        null=True,
+        help_text="Office/business address for commissioner"
+    )
     
     class Meta:
         db_table = 'users'
@@ -588,6 +724,17 @@ class Request(models.Model):
         null=True
     )
     
+    # User payment tracking (for download access)
+    is_paid = models.BooleanField(
+        default=False,
+        help_text="Whether user has paid for this affidavit"
+    )
+    user_paid_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the user completed payment"
+    )
+    
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -693,6 +840,17 @@ class Stamp(models.Model):
     )
     stamped_at = models.DateTimeField(auto_now_add=True)
     
+    # Payment tracking
+    paid = models.BooleanField(
+        default=False,
+        help_text="Whether this stamp has been paid out to commissioner"
+    )
+    paid_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the payout was processed"
+    )
+    
     # Optional notes
     notes = models.TextField(blank=True)
     
@@ -704,6 +862,60 @@ class Stamp(models.Model):
     
     def __str__(self):
         return f"Stamp: {self.request.request_code} by {self.commissioner.username}"
+
+
+class PaymentLog(models.Model):
+    """
+    Records payment transactions to commissioners.
+    Each log entry represents a single payment for multiple stamps.
+    """
+    
+    commissioner = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='payment_logs',
+        limit_choices_to={'role': User.Role.COMMISSIONER}
+    )
+    amount_paid = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        help_text="Total amount paid in this transaction"
+    )
+    stamps_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of stamps/affidavits included in this payment"
+    )
+    paid_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        related_name='payments_processed',
+        help_text="Admin who processed this payment"
+    )
+    payment_reference = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Bank transfer reference or payment ID"
+    )
+    payment_method = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="How payment was made (bank_transfer, cheque, cash)"
+    )
+    notes = models.TextField(
+        blank=True,
+        help_text="Additional notes about the payment"
+    )
+    paid_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'payment_logs'
+        verbose_name = 'Payment Log'
+        verbose_name_plural = 'Payment Logs'
+        ordering = ['-paid_at']
+    
+    def __str__(self):
+        return f"Payment ${self.amount_paid} to {self.commissioner.username} on {self.paid_at.strftime('%Y-%m-%d')}"
 
 
 class FrictionReport(models.Model):

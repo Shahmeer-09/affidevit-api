@@ -15,7 +15,7 @@ User = get_user_model()
 class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
     """
     Custom JWT serializer that uses email instead of username.
-    Also adds user role to token claims.
+    Also adds user role to token claims and supports "remember me".
     """
     username_field = 'email'
     
@@ -24,10 +24,12 @@ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
         # Remove 'username' field and add 'email' field
         self.fields.pop('username', None)
         self.fields['email'] = serializers.EmailField()
+        self.fields['remember_me'] = serializers.BooleanField(required=False, default=False)
     
     def validate(self, attrs):
         email = attrs.get('email')
         password = attrs.get('password')
+        remember_me = attrs.get('remember_me', False)
         
         if email and password:
             # Use our EmailBackend for authentication
@@ -45,8 +47,20 @@ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
             if not user.is_active:
                 raise serializers.ValidationError('User account is disabled.')
             
-            # Generate tokens
+            # Check if commissioner is approved (featured field used as approval flag)
+            if user.role == 'commissioner' and not user.is_featured:
+                raise serializers.ValidationError('Your account is pending admin approval. You will be notified once approved.')
+            
+            # Generate tokens with extended lifetime if remember_me is True
             refresh = self.get_token(user)
+            
+            # Extend token lifetime if "remember me" is checked
+            if remember_me:
+                from datetime import timedelta
+                # Access token: 7 days instead of 60 minutes
+                refresh.access_token.set_exp(lifetime=timedelta(days=7))
+                # Refresh token: 30 days instead of 7 days
+                refresh.set_exp(lifetime=timedelta(days=30))
             
             return {
                 'refresh': str(refresh),
@@ -58,7 +72,9 @@ class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
                     'last_name': user.last_name,
                     'role': user.role,
                     'phone': user.phone_number,
-                }
+                    'is_superuser': user.is_superuser,
+                },
+                'remember_me': remember_me,
             }
         
         raise serializers.ValidationError('Must include "email" and "password".')

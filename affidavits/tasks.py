@@ -48,80 +48,16 @@ def process_request_async(self, request_id: int):
             details={'task_id': self.request.id}
         )
 
-        # Prepare answers with any clarifications
+        # Prepare answers - no clarification loop anymore
+        # Validation now happens BEFORE submission via the validate endpoint
         final_answers = request.answers_json.copy() if request.answers_json else {}
-        user_edits = request.user_edits_json or {}
-        clarifications = user_edits.get('clarifications', [])
         
-        if clarifications:
-            # Format clarifications for the AI
-            clarification_text = []
-            for c in clarifications:
-                clarification_text.append(f"Clarification Q: {c.get('question', '')}\nUser Answer: {c.get('response', '')}")
-            
-            final_answers['PREVIOUS_CLARIFICATIONS'] = "\n---\n".join(clarification_text)
+        # Note: The old clarification loop has been removed.
+        # Input validation should happen BEFORE submission via:
+        # POST /api/requests/validate-input/
+        # The AI drafter now receives clean, pre-validated data and just drafts.
         
-        # Step 0: Input Suitability Check (Pre-draft validation)
-        start_time = time.time()
-        input_check = analyze_input_suitability(
-            answers_json=final_answers,
-            template_html=affidavit_type.template_html,
-            affidavit_type_name=affidavit_type.name
-        )
-        check_latency = int((time.time() - start_time) * 1000)
-        
-        # Log AI run for Input Check (if tokens were used)
-        if input_check.get('total_tokens', 0) > 0:
-            ai_run_check = AIRun.objects.create(
-                request=request,
-                node_type=AIRun.NodeType.CLARIFICATION,  # Use CLARIFICATION node type for input checks
-                status=AIRun.Status.SUCCESS,
-                model_name='gpt-4o',
-                prompt_version=request.prompt_version_used or 1,
-                prompt_tokens=input_check.get('prompt_tokens', 0),
-                completion_tokens=input_check.get('completion_tokens', 0),
-                total_tokens=input_check.get('total_tokens', 0),
-                latency_ms=check_latency,
-                input_json={'answers': final_answers, 'check_type': 'suitability'},
-                output_json=input_check,
-                raw_response='',
-                error_message=''
-            )
-            ai_run_check.calculate_cost()
-            ai_run_check.save()
-
-        # If input is not suitable, stop here and ask for clarification
-        if not input_check.get('is_suitable', True):
-            request.status = Request.Status.NEEDS_CLARIFICATION
-            
-            question = input_check.get('clarification_question', 'Please provide more details.')
-            example = input_check.get('clarification_example', '')
-            
-            if example:
-                request.clarification_question = f"{question}\n\n{example}"
-            else:
-                request.clarification_question = question
-                
-            request.qa_flags_json = input_check.get('issues', [])
-            request.save()
-            
-            RequestEvent.objects.create(
-                request=request,
-                action=RequestEvent.Action.QA_COMPLETED, # Use QA_COMPLETED as it's a validation step
-                details={
-                    'reason': 'Input suitability check failed',
-                    'question': request.clarification_question
-                }
-            )
-            
-            logger.info(f"Request {request.request_code} needs clarification: {request.clarification_question}")
-            return {'success': False, 'status': 'needs_clarification', 'question': request.clarification_question}
-
-        # If AI calculated age from DOB, inject it into the answers for the draft
-        calculated_age = input_check.get('calculated_age')
-        if calculated_age is not None:
-            final_answers['_calculated_age'] = calculated_age
-            logger.info(f"Using calculated age {calculated_age} from DOB for request {request.request_code}")
+        logger.info(f"Processing request {request.request_code} - inputs should be pre-validated")
 
         # Step 1: Generate draft - NOW WITH ALL PARAMETERS
         start_time = time.time()

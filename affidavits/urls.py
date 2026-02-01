@@ -16,7 +16,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from .authentication import CustomTokenObtainPairView
 from .views import (
     # Auth
-    UserRegistrationView, UserProfileView,
+    UserRegistrationView, UserProfileView, CommissionerRegistrationView,
     PasswordResetRequestView, PasswordResetConfirmView,
     # Decision Tree
     DecisionTreeRootView, DecisionTreeNodeView, DecisionTreeTraverseView,
@@ -24,9 +24,9 @@ from .views import (
     AffidavitTypeListView, AffidavitTypeDetailView,
     # Requests
     RequestCreateView, RequestDetailView, RequestPatchView, RequestDeleteView,
-    RequestSubmitView, SelectCommissionerView, RequestByCodeView, RequestTakeoverView,
+    RequestSubmitView, SelectCommissionerView, MarkPaidView, RequestByCodeView, RequestTakeoverView,
     MyRequestsView, DownloadPDFView, DownloadWordView, RequestStatusView,
-    DevApproveView, ClarificationResponseView,
+    DevApproveView, ClarificationResponseView, ValidateRequestInputView,
     # Commissioner
     MarkCompleteView, FrictionReportCreateView, CommissionerStampsView,
     CommissionerPDFPreferencesView, CommissionerAssignedRequestsView,
@@ -41,9 +41,11 @@ from .views import (
     # Admin Staff Management
     AdminCommissionerListView, AdminCommissionerDetailView,
     AdminReviewerListView, AdminReviewerDetailView,
+    AdminCommissionerPaymentSummaryView, AdminCommissionerPaymentHistoryView,
+    AdminMarkCommissionerPaidView, AdminAllPaymentLogsView,
     # Admin Affidavit Type CRUD
     AdminAffidavitTypeListView, AdminAffidavitTypeDetailView,
-    AdminAffidavitTypeDuplicateView,
+    AdminAffidavitTypeDuplicateView, AdminTypeRequestsView,
     # Admin Document Upload & Policy Generation
     AdminDocumentUploadView, AdminDocumentListView,
     AdminGeneratePolicyView, AdminPolicyTaskStatusView, AdminDisallowedPhrasesView,
@@ -51,6 +53,8 @@ from .views import (
     # Admin Decision Tree
     AdminDecisionTreeNodeListView, AdminDecisionTreeNodeDetailView,
     AdminDecisionTreeQuestionsView, AdminAffidavitTypeDecisionNodesView,
+    # Admin Site Settings
+    SiteSettingsView,
     # Public
     PublicCommissionerListView,
 )
@@ -62,6 +66,7 @@ urlpatterns = [
     # Authentication Endpoints
     # ==========================================================================
     path('auth/register/', UserRegistrationView.as_view(), name='register'),
+    path('auth/register/commissioner/', CommissionerRegistrationView.as_view(), name='register_commissioner'),
     path('auth/token/', CustomTokenObtainPairView.as_view(), name='token_obtain'),
     path('auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('auth/profile/', UserProfileView.as_view(), name='profile'),
@@ -91,10 +96,12 @@ urlpatterns = [
     # ==========================================================================
     path('requests/', RequestCreateView.as_view(), name='request_create'),
     path('requests/my/', MyRequestsView.as_view(), name='my_requests'),
+    path('requests/validate-input/', ValidateRequestInputView.as_view(), name='validate_request_input'),
     path('requests/<int:pk>/', RequestDetailView.as_view(), name='request_detail'),
     path('requests/<int:pk>/save/', RequestPatchView.as_view(), name='request_save'),
     path('requests/<int:pk>/submit/', RequestSubmitView.as_view(), name='request_submit'),
     path('requests/<int:pk>/select-commissioner/', SelectCommissionerView.as_view(), name='select_commissioner'),
+    path('requests/<int:pk>/mark-paid/', MarkPaidView.as_view(), name='mark_paid'),
     path('requests/<int:pk>/status/', RequestStatusView.as_view(), name='request_status'),
     path('requests/<int:pk>/pdf/', DownloadPDFView.as_view(), name='request_pdf'),
     path('requests/<int:pk>/word/', DownloadWordView.as_view(), name='request_word'),
@@ -143,6 +150,10 @@ urlpatterns = [
     # ==========================================================================
     path('admin/commissioners/', AdminCommissionerListView.as_view(), name='admin_commissioner_list'),
     path('admin/commissioners/<int:pk>/', AdminCommissionerDetailView.as_view(), name='admin_commissioner_detail'),
+    path('admin/commissioners/<int:pk>/payment-summary/', AdminCommissionerPaymentSummaryView.as_view(), name='admin_commissioner_payment_summary'),
+    path('admin/commissioners/<int:pk>/payment-history/', AdminCommissionerPaymentHistoryView.as_view(), name='admin_commissioner_payment_history'),
+    path('admin/commissioners/<int:pk>/mark-paid/', AdminMarkCommissionerPaidView.as_view(), name='admin_commissioner_mark_paid'),
+    path('admin/payment-logs/', AdminAllPaymentLogsView.as_view(), name='admin_all_payment_logs'),
     path('admin/reviewers/', AdminReviewerListView.as_view(), name='admin_reviewer_list'),
     path('admin/reviewers/<int:pk>/', AdminReviewerDetailView.as_view(), name='admin_reviewer_detail'),
     
@@ -152,6 +163,7 @@ urlpatterns = [
     path('admin/types/', AdminAffidavitTypeListView.as_view(), name='admin_type_list'),
     path('admin/types/<int:pk>/', AdminAffidavitTypeDetailView.as_view(), name='admin_type_detail'),
     path('admin/types/<int:pk>/duplicate/', AdminAffidavitTypeDuplicateView.as_view(), name='admin_type_duplicate'),
+    path('admin/types/<int:pk>/requests/', AdminTypeRequestsView.as_view(), name='admin_type_requests'),
     
     # ==========================================================================
     # Admin Document Upload & Policy Generation Endpoints
@@ -170,4 +182,9 @@ urlpatterns = [
     path('admin/decision-tree/<int:pk>/', AdminDecisionTreeNodeDetailView.as_view(), name='admin_decision_tree_detail'),
     path('admin/decision-tree/questions/', AdminDecisionTreeQuestionsView.as_view(), name='admin_decision_tree_questions'),
     path('admin/types/<int:pk>/decision-nodes/', AdminAffidavitTypeDecisionNodesView.as_view(), name='admin_type_decision_nodes'),
+    
+    # ==========================================================================
+    # Admin Site Settings Endpoints
+    # ==========================================================================
+    path('admin/settings/', SiteSettingsView.as_view(), name='admin_site_settings'),
 ]

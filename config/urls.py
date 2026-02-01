@@ -24,7 +24,9 @@ urlpatterns = [
     path('api/', include('affidavits.urls', namespace='affidavits')),
 ]
 
-# Serve media files in development
+# Serve media files locally (needed even when DEBUG=False during local runs)
+urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+# Serve static files only in development; production should use a proper web server/ CDN
 if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
     urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)

@@ -16,7 +16,9 @@ from .models import (
     ReviewerEdit,
     RequestEvent,
     AIRun,
-    AIBaseInstruction
+    AIBaseInstruction,
+    PaymentLog,
+    SiteSettings
 )
 
 User = get_user_model()
@@ -27,20 +29,38 @@ User = get_user_model()
 # =============================================================================
 
 class UserSerializer(serializers.ModelSerializer):
-    """Basic user serializer for nested representations."""
+    """User serializer for profile updates - includes all user fields."""
     
     full_name = serializers.SerializerMethodField()
+    profile_image_url = serializers.SerializerMethodField()
     
     class Meta:
         model = User
         fields = [
             'id', 'username', 'email', 'first_name', 'last_name', 
-            'full_name', 'role', 'phone_number'
+            'full_name', 'role', 'phone_number',
+            # Commissioner-specific fields
+            'commission_number', 'commission_expiry', 'organization',
+            'bio', 'address', 'availability',
+            'profile_image', 'profile_image_url',
+            # Bank/Payment details
+            'bank_name', 'bank_branch', 'bank_account_number',
+            'bank_account_name', 'payment_preference',
+            # PDF Preferences
+            'pdf_preferences',
         ]
-        read_only_fields = ['id', 'role']
+        read_only_fields = ['id', 'role', 'profile_image_url']
     
     def get_full_name(self, obj):
         return obj.get_full_name() or obj.username
+    
+    def get_profile_image_url(self, obj):
+        if obj.profile_image:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.profile_image.url)
+            return obj.profile_image.url
+        return None
 
 
 class UserRegistrationSerializer(serializers.ModelSerializer):
@@ -61,6 +81,21 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 'password_confirm': 'Passwords do not match.'
             })
+        
+        # Check for unique email
+        email = attrs.get('email')
+        if email and User.objects.filter(email=email).exists():
+            raise serializers.ValidationError({
+                'email': 'A user with this email already exists.'
+            })
+        
+        # Check for unique phone number
+        phone_number = attrs.get('phone_number')
+        if phone_number and User.objects.filter(phone_number=phone_number).exists():
+            raise serializers.ValidationError({
+                'phone_number': 'A user with this phone number already exists.'
+            })
+        
         return attrs
     
     def create(self, validated_data):
@@ -87,8 +122,137 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         return user
 
 
+class CommissionerRegistrationSerializer(serializers.ModelSerializer):
+    """Serializer for commissioner self-registration with all required details."""
+    
+    password = serializers.CharField(write_only=True, min_length=8)
+    password_confirm = serializers.CharField(write_only=True)
+    profile_image = serializers.ImageField(required=False, allow_null=True)
+    availability = serializers.JSONField(required=False, default=dict)
+    
+    class Meta:
+        model = User
+        fields = [
+            'email', 'password', 'password_confirm',
+            'first_name', 'last_name', 'phone_number',
+            'profile_image', 'bio', 'organization', 'address',
+            'commission_number', 'commission_expiry',
+            'availability',
+            # Bank/Payment details
+            'bank_name', 'bank_branch', 'bank_account_number',
+            'bank_account_name', 'payment_preference', 'payout_rate',
+        ]
+    
+    def validate(self, attrs):
+        if attrs['password'] != attrs.pop('password_confirm'):
+            raise serializers.ValidationError({
+                'password_confirm': 'Passwords do not match.'
+            })
+        
+        # Check for unique email
+        email = attrs.get('email')
+        if email and User.objects.filter(email=email).exists():
+            raise serializers.ValidationError({
+                'email': 'A user with this email already exists.'
+            })
+        
+        # Check for unique phone number
+        phone_number = attrs.get('phone_number')
+        if phone_number and User.objects.filter(phone_number=phone_number).exists():
+            raise serializers.ValidationError({
+                'phone_number': 'A user with this phone number already exists.'
+            })
+        
+        # Check for unique commission number
+        commission_number = attrs.get('commission_number')
+        if commission_number and User.objects.filter(commission_number=commission_number).exists():
+            raise serializers.ValidationError({
+                'commission_number': 'This commission number is already registered.'
+            })
+        
+        # Check for unique bank account number
+        bank_account_number = attrs.get('bank_account_number')
+        if bank_account_number and User.objects.filter(bank_account_number=bank_account_number).exists():
+            raise serializers.ValidationError({
+                'bank_account_number': 'This bank account number is already registered.'
+            })
+        
+        # Validate availability JSON structure if provided
+        availability = attrs.get('availability', {})
+        if availability:
+            if not isinstance(availability, dict):
+                raise serializers.ValidationError({
+                    'availability': 'Availability must be a JSON object.'
+                })
+            
+            # Validate recurring schedule if present
+            recurring = availability.get('recurring', {})
+            valid_days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+            for day, slots in recurring.items():
+                if day not in valid_days:
+                    raise serializers.ValidationError({
+                        'availability': f'Invalid day: {day}. Must be one of {valid_days}'
+                    })
+                if not isinstance(slots, list):
+                    raise serializers.ValidationError({
+                        'availability': f'Slots for {day} must be a list of time ranges.'
+                    })
+                for slot in slots:
+                    if not isinstance(slot, dict) or 'start' not in slot or 'end' not in slot:
+                        raise serializers.ValidationError({
+                            'availability': f'Each slot must have "start" and "end" times.'
+                        })
+        
+        return attrs
+    
+    def create(self, validated_data):
+        # Auto-generate username from email
+        email = validated_data['email']
+        base_username = email.split('@')[0]
+        username = base_username
+        
+        # Ensure unique username
+        counter = 1
+        while User.objects.filter(username=username).exists():
+            username = f"{base_username}{counter}"
+            counter += 1
+        
+        # Extract profile image separately (handled by DRF's file upload)
+        profile_image = validated_data.pop('profile_image', None)
+        
+        user = User.objects.create_user(
+            username=username,
+            email=validated_data['email'],
+            password=validated_data['password'],
+            first_name=validated_data.get('first_name', ''),
+            last_name=validated_data.get('last_name', ''),
+            phone_number=validated_data.get('phone_number', ''),
+            role=User.Role.COMMISSIONER,
+            bio=validated_data.get('bio', ''),
+            organization=validated_data.get('organization', ''),
+            address=validated_data.get('address', ''),
+            commission_number=validated_data.get('commission_number', ''),
+            commission_expiry=validated_data.get('commission_expiry'),
+            availability=validated_data.get('availability', {}),
+            # Bank/Payment details
+            bank_name=validated_data.get('bank_name', ''),
+            bank_branch=validated_data.get('bank_branch', ''),
+            bank_account_number=validated_data.get('bank_account_number', ''),
+            bank_account_name=validated_data.get('bank_account_name', ''),
+            payment_preference=validated_data.get('payment_preference', 'bank_transfer'),
+            is_featured=False,  # Admin must approve to feature
+        )
+        
+        # Set profile image if provided
+        if profile_image:
+            user.profile_image = profile_image
+            user.save()
+        
+        return user
+
+
 class CommissionerSerializer(serializers.ModelSerializer):
-    """Serializer for commissioner details including PDF preferences."""
+    """Serializer for commissioner details including PDF preferences and bank details."""
     
     full_name = serializers.SerializerMethodField()
     profile_image_url = serializers.SerializerMethodField()
@@ -97,8 +261,12 @@ class CommissionerSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'id', 'username', 'email', 'first_name', 'last_name', 'full_name',
-            'commission_number', 'commission_expiry', 'payout_rate', 'organization',
-            'pdf_preferences', 'profile_image', 'profile_image_url', 'bio', 'is_featured'
+            'phone_number', 'commission_number', 'commission_expiry', 'payout_rate', 
+            'organization', 'address', 'bio', 'availability',
+            'pdf_preferences', 'profile_image', 'profile_image_url', 'is_featured',
+            # Bank/Payment details
+            'bank_name', 'bank_branch', 'bank_account_number',
+            'bank_account_name', 'payment_preference',
         ]
         read_only_fields = ['id', 'profile_image_url']
     
@@ -124,7 +292,8 @@ class CommissionerPublicSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'id', 'first_name', 'last_name', 'full_name',
-            'commission_number', 'profile_image_url', 'bio', 'organization'
+            'commission_number', 'profile_image_url', 'bio', 'organization',
+            'availability', 'address',
         ]
     
     def get_full_name(self, obj):
@@ -220,6 +389,97 @@ class CommissionerPDFPreferencesSerializer(serializers.Serializer):
     signature_spacing = serializers.ChoiceField(choices=['compact', 'normal', 'expanded'], required=False, default='normal')
     show_commission_number = serializers.BooleanField(required=False, default=True)
     custom_footer = serializers.CharField(required=False, allow_blank=True, max_length=200)
+
+
+class PaymentLogSerializer(serializers.ModelSerializer):
+    """Serializer for payment log entries."""
+    
+    commissioner_name = serializers.SerializerMethodField()
+    paid_by_name = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = PaymentLog
+        fields = [
+            'id', 'commissioner', 'commissioner_name', 'amount_paid', 
+            'stamps_count', 'paid_by', 'paid_by_name', 'payment_reference',
+            'payment_method', 'notes', 'paid_at'
+        ]
+        read_only_fields = ['id', 'paid_at', 'commissioner_name', 'paid_by_name']
+    
+    def get_commissioner_name(self, obj):
+        return obj.commissioner.get_full_name() or obj.commissioner.username
+    
+    def get_paid_by_name(self, obj):
+        if obj.paid_by:
+            return obj.paid_by.get_full_name() or obj.paid_by.username
+        return None
+
+
+class CommissionerPaymentSummarySerializer(serializers.ModelSerializer):
+    """Serializer for commissioner with payment summary."""
+    
+    full_name = serializers.SerializerMethodField()
+    profile_image_url = serializers.SerializerMethodField()
+    amount_to_pay = serializers.SerializerMethodField()
+    unpaid_stamps_count = serializers.SerializerMethodField()
+    total_earned = serializers.SerializerMethodField()
+    total_paid = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = User
+        fields = [
+            'id', 'username', 'email', 'first_name', 'last_name', 'full_name',
+            'phone_number', 'commission_number', 'payout_rate', 
+            'organization', 'address', 'bio', 'profile_image_url', 'is_featured',
+            # Bank/Payment details
+            'bank_name', 'bank_branch', 'bank_account_number',
+            'bank_account_name', 'payment_preference',
+            # Payment summary
+            'amount_to_pay', 'unpaid_stamps_count', 'total_earned', 'total_paid',
+        ]
+        read_only_fields = ['id', 'profile_image_url', 'amount_to_pay', 
+                          'unpaid_stamps_count', 'total_earned', 'total_paid']
+    
+    def get_full_name(self, obj):
+        return obj.get_full_name() or obj.username
+    
+    def get_profile_image_url(self, obj):
+        if obj.profile_image:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.profile_image.url)
+            return obj.profile_image.url
+        return None
+    
+    def get_amount_to_pay(self, obj):
+        """Calculate total unpaid amount from stamps."""
+        from django.db.models import Sum
+        unpaid = obj.stamps.filter(paid=False).aggregate(total=Sum('payout_amount'))
+        return str(unpaid['total'] or 0)
+    
+    def get_unpaid_stamps_count(self, obj):
+        """Count unpaid stamps."""
+        return obj.stamps.filter(paid=False).count()
+    
+    def get_total_earned(self, obj):
+        """Total lifetime earnings from all stamps."""
+        from django.db.models import Sum
+        total = obj.stamps.aggregate(total=Sum('payout_amount'))
+        return str(total['total'] or 0)
+    
+    def get_total_paid(self, obj):
+        """Total amount paid out."""
+        from django.db.models import Sum
+        paid = obj.payment_logs.aggregate(total=Sum('amount_paid'))
+        return str(paid['total'] or 0)
+
+
+class MarkAsPaidSerializer(serializers.Serializer):
+    """Serializer for marking commissioner stamps as paid."""
+    
+    payment_reference = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    payment_method = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
 
 
 # =============================================================================
@@ -677,7 +937,7 @@ class RequestDetailSerializer(serializers.ModelSerializer):
             'policy_version_used', 'prompt_version_used', 'template_version_used',
             'user_edits_json', 'time_to_complete_seconds', 'pdf_url',
             'locked_by', 'locked_at', 'is_locked', 'lock_holder_name',
-            'pdf_file', 'created_at', 'updated_at', 'submitted_at',
+            'pdf_file', 'is_paid', 'user_paid_at', 'created_at', 'updated_at', 'submitted_at',
             'approved_at', 'completed_at'
         ]
         read_only_fields = [
@@ -1068,4 +1328,20 @@ class DisallowedPhrasesSerializer(serializers.Serializer):
         # Remove duplicates and empty strings
         cleaned = list(set(p.strip() for p in value if p.strip()))
         return cleaned
+
+
+# =============================================================================
+# Site Settings Serializers
+# =============================================================================
+
+class SiteSettingsSerializer(serializers.ModelSerializer):
+    """Serializer for global site settings."""
+    
+    class Meta:
+        model = SiteSettings
+        fields = [
+            'id', 'default_payout_amount', 
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
 
