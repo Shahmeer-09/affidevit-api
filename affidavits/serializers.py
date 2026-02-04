@@ -18,7 +18,10 @@ from .models import (
     AIRun,
     AIBaseInstruction,
     PaymentLog,
-    SiteSettings
+    SiteSettings,
+    Ticket,
+    TicketMessage,
+    TicketAttachment
 )
 
 User = get_user_model()
@@ -490,6 +493,7 @@ class AffidavitTypeSerializer(serializers.ModelSerializer):
     """Full affidavit type serializer including policy and tier info."""
     
     min_volume_threshold = serializers.ReadOnlyField()
+    intake_schema = serializers.SerializerMethodField()
     
     class Meta:
         model = AffidavitType
@@ -501,6 +505,19 @@ class AffidavitTypeSerializer(serializers.ModelSerializer):
             'is_active', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'min_volume_threshold', 'created_at', 'updated_at']
+    
+    def get_intake_schema(self, obj):
+        """
+        Return intake_schema with T&T validation rules applied.
+        This ensures all fields have proper validation even if saved before the feature.
+        """
+        from .services.policy_generator_service import upgrade_intake_schema_with_tt_validation
+        
+        if not obj.intake_schema:
+            return []
+        
+        # Apply T&T validation rules to all fields
+        return upgrade_intake_schema_with_tt_validation(obj.intake_schema)
 
 
 class AffidavitTypeListSerializer(serializers.ModelSerializer):
@@ -1344,4 +1361,56 @@ class SiteSettingsSerializer(serializers.ModelSerializer):
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+
+# =============================================================================
+# Ticket Serializers
+# =============================================================================
+
+class TicketAttachmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TicketAttachment
+        fields = ['id', 'file', 'uploaded_at']
+        read_only_fields = ['uploaded_at']
+
+class TicketMessageSerializer(serializers.ModelSerializer):
+    sender_name = serializers.CharField(source='sender.get_full_name', read_only=True)
+    sender_role = serializers.CharField(source='sender.role', read_only=True)
+    sender_avatar = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = TicketMessage
+        fields = ['id', 'sender', 'sender_name', 'sender_role', 'sender_avatar', 'message', 'created_at', 'is_internal']
+        read_only_fields = ['id', 'sender', 'created_at']
+        
+    def get_sender_avatar(self, obj):
+        if obj.sender.profile_image:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.sender.profile_image.url)
+            return obj.sender.profile_image.url
+        return None
+
+class TicketSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.get_full_name', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    priority_display = serializers.CharField(source='get_priority_display', read_only=True)
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
+    
+    class Meta:
+        model = Ticket
+        fields = [
+            'id', 'user', 'user_name', 'request', 'subject', 'description', 
+            'category', 'category_display', 'status', 'status_display', 
+            'priority', 'priority_display', 'created_at', 'updated_at', 'resolved_at'
+        ]
+        read_only_fields = ['id', 'user', 'created_at', 'updated_at', 'resolved_at']
+
+class TicketDetailSerializer(TicketSerializer):
+    messages = TicketMessageSerializer(many=True, read_only=True)
+    attachments = TicketAttachmentSerializer(many=True, read_only=True)
+    
+    class Meta(TicketSerializer.Meta):
+        fields = TicketSerializer.Meta.fields + ['messages', 'attachments']
+
 

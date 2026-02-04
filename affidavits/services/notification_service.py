@@ -132,6 +132,38 @@ Best regards,
 The Affidavit Express Team
 """
     
+    elif 'ticket_created' in template_name:
+        return f"""
+Hello {context.get('user_name', 'User')},
+
+We have received your support ticket.
+
+Ticket Details:
+- Ticket ID: #{context.get('ticket_id', 'N/A')}
+- Subject: {context.get('subject', 'N/A')}
+- Status: {context.get('status', 'Open')}
+
+We will get back to you as soon as possible.
+
+Best regards,
+The Affidavit Express Team
+"""
+
+    elif 'ticket_reply' in template_name:
+        return f"""
+Hello {context.get('user_name', 'User')},
+
+There is a new update on your ticket #{context.get('ticket_id', 'N/A')}.
+
+Update from {context.get('sender_name', 'Support')}:
+"{context.get('message_preview', 'New message received.')}"
+
+Please log in to your dashboard to view the full conversation and reply.
+
+Best regards,
+The Affidavit Express Team
+"""
+
     else:
         return f"Thank you for using Affidavit Express. Reference: {context.get('request_code', 'N/A')}"
 
@@ -322,3 +354,63 @@ The Affidavit Express Team
     except Exception as e:
         logger.error(f"Failed to send submission notification: {e}")
         return {'success': False, 'error': str(e)}
+
+
+def send_ticket_created_notification(ticket_obj) -> dict:
+    """
+    Send notification to user when a ticket is successfully created.
+    """
+    user = ticket_obj.user
+    
+    if not user.email:
+        return {'success': False, 'error': 'User has no email address'}
+        
+    context = {
+        'user_name': user.get_full_name() or user.username,
+        'ticket_id': ticket_obj.id,
+        'subject': ticket_obj.subject,
+        'status': ticket_obj.get_status_display(),
+    }
+    
+    result = send_email_with_template(
+        subject=f"Support Ticket Created - #{ticket_obj.id}",
+        template_name='ticket_created_notification.html',
+        context=context,
+        recipient_email=user.email
+    )
+    
+    if result['success']:
+        logger.info(f"Sent ticket created notification for #{ticket_obj.id} to {user.email}")
+        
+    return result
+
+
+def send_ticket_reply_notification(ticket_obj, message_obj) -> dict:
+    """
+    Notify user of an update or response to their ticket.
+    """
+    user = ticket_obj.user
+    
+    if not user.email:
+        return {'success': False, 'error': 'User has no email address'}
+        
+    context = {
+        'user_name': user.get_full_name() or user.username,
+        'ticket_id': ticket_obj.id,
+        'status': ticket_obj.get_status_display(),
+        'sender_name': message_obj.sender.get_full_name() or message_obj.sender.username,
+        'message_preview': message_obj.message[:100] + ('...' if len(message_obj.message) > 100 else '')
+    }
+    
+    result = send_email_with_template(
+        subject=f"Update on your Ticket - #{ticket_obj.id}",
+        template_name='ticket_reply_notification.html',
+        context=context,
+        recipient_email=user.email
+    )
+    
+    if result['success']:
+        logger.info(f"Sent ticket reply notification for #{ticket_obj.id} to {user.email}")
+        
+    return result
+

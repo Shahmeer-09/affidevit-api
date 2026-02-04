@@ -17,7 +17,7 @@ from .authentication import CustomTokenObtainPairView
 from .views import (
     # Auth
     UserRegistrationView, UserProfileView, CommissionerRegistrationView,
-    PasswordResetRequestView, PasswordResetConfirmView,
+    PasswordResetRequestView, PasswordResetConfirmView, VerifyOTPView,
     # Decision Tree
     DecisionTreeRootView, DecisionTreeNodeView, DecisionTreeTraverseView,
     # Affidavit Types
@@ -57,6 +57,8 @@ from .views import (
     SiteSettingsView,
     # Public
     PublicCommissionerListView,
+    # Tickets
+    TicketViewSet
 )
 
 app_name = 'affidavits'
@@ -67,6 +69,7 @@ urlpatterns = [
     # ==========================================================================
     path('auth/register/', UserRegistrationView.as_view(), name='register'),
     path('auth/register/commissioner/', CommissionerRegistrationView.as_view(), name='register_commissioner'),
+    path('auth/verify-otp/', VerifyOTPView.as_view(), name='verify_otp'),
     path('auth/token/', CustomTokenObtainPairView.as_view(), name='token_obtain'),
     path('auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('auth/profile/', UserProfileView.as_view(), name='profile'),
@@ -187,4 +190,12 @@ urlpatterns = [
     # Admin Site Settings Endpoints
     # ==========================================================================
     path('admin/settings/', SiteSettingsView.as_view(), name='admin_site_settings'),
+    
+    # ==========================================================================
+    # Ticket Endpoints
+    # ==========================================================================
+    path('tickets/', TicketViewSet.as_view({'get': 'list', 'post': 'create'}), name='ticket_list'),
+    path('tickets/<int:pk>/', TicketViewSet.as_view({'get': 'retrieve'}), name='ticket_detail'),
+    path('tickets/<int:pk>/reply/', TicketViewSet.as_view({'post': 'reply'}), name='ticket_reply'),
+    path('tickets/<int:pk>/status/', TicketViewSet.as_view({'post': 'status'}), name='ticket_status'),
 ]

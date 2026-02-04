@@ -6,10 +6,12 @@ Uses GPT-4o to analyze uploaded example affidavits and generate:
 - Policy JSON with validation rules
 - Suggested disallowed phrases
 - Few-shot examples for training
+- Smart field validation for Trinidad & Tobago
 """
 
 import json
 import logging
+import re
 from typing import Dict, List, Optional
 from django.conf import settings
 
@@ -17,6 +19,227 @@ logger = logging.getLogger(__name__)
 
 # Lazy import openai
 openai_client = None
+
+# =============================================================================
+# TRINIDAD & TOBAGO SPECIFIC VALIDATION RULES
+# =============================================================================
+
+# Field patterns for smart detection and validation
+TT_FIELD_RULES = {
+    # National ID / Electoral ID - Trinidad & Tobago format (11 digits: YYYYMMDDXXX)
+    'national_id': {
+        'patterns': [
+            'national_id', 'id_number', 'identification_number', 'id_card', 'national_identification',
+            'electoral_id', 'electoral_identification', 'electoral_card', 'electoral_identification_card',
+            'electoral_identification_card_number', 'eic', 'eic_number'
+        ],
+        'validation': {
+            'pattern': r'^\d{11}$',
+            'input_mode': 'numeric',
+            'max_length': 11,
+            'min_length': 11,
+            'message': 'Enter valid Trinidad & Tobago Electoral ID (11 digits: YYYYMMDDXXX)'
+        },
+        'type': 'text',
+        'placeholder': '19741104044',
+        'help_text': 'Your 11-digit Trinidad & Tobago Electoral ID (includes your date of birth)'
+    },
+    # Phone number - Trinidad & Tobago format
+    'phone': {
+        'patterns': ['phone', 'telephone', 'mobile', 'contact_number', 'cell'],
+        'validation': {
+            'pattern': r'^(\+?1)?[-.\s]?868[-.\s]?\d{3}[-.\s]?\d{4}$',
+            'input_mode': 'tel',
+            'message': 'Enter valid Trinidad & Tobago phone number (868-XXX-XXXX)'
+        },
+        'type': 'phone',
+        'placeholder': '868-123-4567'
+    },
+    # Name fields - text only, no numbers
+    'name': {
+        'patterns': ['full_name', 'first_name', 'last_name', 'middle_name', 'surname', 'given_name', 
+                    'deponent_name', 'witness_name', 'applicant_name', 'name_of'],
+        'validation': {
+            'pattern': r'^[a-zA-Z\s\-\'\.]+$',
+            'input_mode': 'text_only',
+            'min_length': 2,
+            'max_length': 100,
+            'message': 'Name can only contain letters, spaces, hyphens, and apostrophes'
+        },
+        'type': 'text',
+        'placeholder': 'John Michael Smith'
+    },
+    # Date of Birth - with age calculation, cannot be in future
+    'date_of_birth': {
+        'patterns': ['date_of_birth', 'dob', 'birth_date', 'birthdate'],
+        'validation': {
+            'max_date': 'today',
+            'date_constraint': 'past_only',
+            'message': 'Date of birth cannot be in the future'
+        },
+        'type': 'date',
+        'computed_fields': ['age']  # Age will be calculated from this
+    },
+    # Age field - CONVERT to Date of Birth with calendar picker
+    # Age will be auto-calculated from DOB
+    'age': {
+        'patterns': ['age', 'years_old', 'current_age'],
+        'convert_to_dob': True,  # Flag to convert this field to date_of_birth
+        'replacement_field': {
+            'id': 'date_of_birth',
+            'label': 'Date of Birth',
+            'type': 'date',
+            'help_text': 'Your age will be calculated automatically from your date of birth',
+            'validation': {
+                'max_date': 'today',
+                'date_constraint': 'past_only',
+                'message': 'Date of birth cannot be in the future'
+            }
+        },
+        'type': 'date'  # Will be converted to date picker
+    },
+    # Declaration date - cannot be in future
+    'declaration_date': {
+        'patterns': ['declaration_date', 'sworn_date', 'dated', 'date_declared', 'affirmed_date'],
+        'validation': {
+            'max_date': 'today',
+            'date_constraint': 'past_or_today',
+            'message': 'Declaration date cannot be in the future'
+        },
+        'type': 'date'
+    },
+    # Event dates - typically past dates
+    'event_date': {
+        'patterns': ['incident_date', 'event_date', 'occurrence_date', 'date_of_incident', 'date_of_event'],
+        'validation': {
+            'max_date': 'today',
+            'date_constraint': 'past_only',
+            'message': 'Event date cannot be in the future'
+        },
+        'type': 'date'
+    },
+    # Address fields - text with numbers allowed
+    'address': {
+        'patterns': ['address', 'street_address', 'residential_address', 'home_address', 'mailing_address'],
+        'validation': {
+            'input_mode': 'text',
+            'min_length': 5,
+            'max_length': 200,
+            'message': 'Please enter a valid address'
+        },
+        'type': 'textarea',
+        'placeholder': '15 Queen Street, St. Augustine'
+    },
+    # City/Town - text only
+    'city': {
+        'patterns': ['city', 'town', 'village', 'municipality', 'location'],
+        'validation': {
+            'pattern': r'^[a-zA-Z\s\-\'\.]+$',
+            'input_mode': 'text_only',
+            'message': 'City/Town can only contain letters'
+        },
+        'type': 'text',
+        'placeholder': 'Port of Spain'
+    },
+    # Month names - with future date check for declaration contexts
+    'month': {
+        'patterns': ['month', 'month_name', 'declaration_month'],
+        'validation': {
+            'pattern': r'^(January|February|March|April|May|June|July|August|September|October|November|December)$',
+            'input_mode': 'text_only',
+            'message': 'Please select a valid month',
+            'check_future_date': True
+        },
+        'type': 'select',
+        'placeholder': 'Select month',
+        'options': [
+            {'value': 'January', 'label': 'January'},
+            {'value': 'February', 'label': 'February'},
+            {'value': 'March', 'label': 'March'},
+            {'value': 'April', 'label': 'April'},
+            {'value': 'May', 'label': 'May'},
+            {'value': 'June', 'label': 'June'},
+            {'value': 'July', 'label': 'July'},
+            {'value': 'August', 'label': 'August'},
+            {'value': 'September', 'label': 'September'},
+            {'value': 'October', 'label': 'October'},
+            {'value': 'November', 'label': 'November'},
+            {'value': 'December', 'label': 'December'}
+        ]
+    },
+    # Year - numeric only, prevent future years for declarations
+    'year': {
+        'patterns': ['year', 'year_of', 'declaration_year'],
+        'validation': {
+            'pattern': r'^\d{4}$',
+            'input_mode': 'numeric',
+            'min': 1900,
+            'max_year_current': True,
+            'check_future_date': True,
+            'message': 'Enter a valid year (cannot be in the future)'
+        },
+        'type': 'number',
+        'placeholder': '2026'
+    },
+    # Day - numeric only, with future date check for declaration contexts
+    'day': {
+        'patterns': ['day', 'day_of', 'declaration_day'],
+        'validation': {
+            'pattern': r'^([1-9]|[12]\d|3[01])$',
+            'input_mode': 'numeric',
+            'min': 1,
+            'max': 31,
+            'check_future_date': True,
+            'message': 'Enter a valid day (1-31)'
+        },
+        'type': 'number',
+        'placeholder': '4'
+    },
+    # Email
+    'email': {
+        'patterns': ['email', 'email_address', 'e_mail'],
+        'validation': {
+            'pattern': r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$',
+            'input_mode': 'email',
+            'message': 'Enter a valid email address'
+        },
+        'type': 'email',
+        'placeholder': 'example@email.com'
+    },
+    # Occupation - text only
+    'occupation': {
+        'patterns': ['occupation', 'profession', 'job', 'employment', 'work'],
+        'validation': {
+            'pattern': r'^[a-zA-Z\s\-\'\.]+$',
+            'input_mode': 'text_only',
+            'min_length': 2,
+            'message': 'Occupation can only contain letters'
+        },
+        'type': 'text',
+        'placeholder': 'Teacher'
+    },
+    # Passport number
+    'passport': {
+        'patterns': ['passport', 'passport_number', 'passport_no'],
+        'validation': {
+            'pattern': r'^[A-Z]{2}\d{7}$',
+            'input_mode': 'text',
+            'message': 'Enter valid Trinidad & Tobago passport number (e.g., TB1234567)'
+        },
+        'type': 'text',
+        'placeholder': 'TB1234567'
+    },
+    # Driver's permit
+    'drivers_permit': {
+        'patterns': ['drivers_permit', 'driving_permit', 'license_number', 'permit_number'],
+        'validation': {
+            'input_mode': 'text',
+            'message': 'Enter valid driver\'s permit number'
+        },
+        'type': 'text',
+        'placeholder': 'DL123456'
+    }
+}
 
 
 def get_openai_client():
@@ -86,17 +309,180 @@ CRITICAL RULES - TEMPLATE MUST MATCH EXAMPLE FORMAT EXACTLY:
    - Location information
    - Specific facts that vary per affidavit
 
+=== TRINIDAD & TOBAGO SPECIFIC FIELD RULES (CRITICAL) ===
+
+When detecting fields, apply these SMART VALIDATIONS for Trinidad & Tobago:
+
+**IDENTITY FIELDS:**
+- National ID / Electoral ID: Use id "electoral_id" or "national_id", type "text", MUST be exactly 11 digits (format: YYYYMMDDXXX)
+- Electoral Identification Card Number = National ID = same format (11 digits, first 8 = DOB)
+- Passport: Use id containing "passport", Trinidad format (2 letters + 7 digits, e.g., TB1234567)
+- Driver's Permit: Use id "drivers_permit"
+
+**NAME FIELDS (TEXT-ONLY - NO NUMBERS ALLOWED):**
+- Any field containing: full_name, first_name, last_name, surname, deponent_name, witness_name
+- Set input_mode: "text_only" in validation
+- Pattern: letters, spaces, hyphens, apostrophes only
+
+**AGE FIELD - CRITICAL CONVERSION:**
+- NEVER ask for age as a number input!
+- When the document shows "age X years" or asks for age:
+  1. In template_html: Use {{calculated_age}} as placeholder (this will be auto-calculated)
+  2. In detected_fields: Create a "date_of_birth" field with type "date" (calendar picker)
+  3. The system will automatically calculate age from date_of_birth
+- Example template: "I, {{full_name}}, age {{calculated_age}} years, of {{address}}..."
+- Example field: {"id": "date_of_birth", "label": "Date of Birth", "type": "date", "help_text": "Your age will be calculated automatically"}
+
+**DATE FIELDS:**
+- Declaration date: MUST have max_date: "today" (cannot be in future)
+- Event/incident dates: MUST have max_date: "today" (past events only)
+- Date of Birth: MUST have max_date: "today" and date_constraint: "past_only"
+- Set date_constraint: "past_only" or "past_or_today" appropriately
+
+**LOCATION FIELDS (TEXT-ONLY for city/town):**
+- City, Town, Village: input_mode "text_only" - no numbers
+- Address: Allow both text and numbers (street addresses have numbers)
+
+**NUMBER-ONLY FIELDS:**
+- Day (1-31): input_mode "numeric"
+- Year: input_mode "numeric", 4 digits
+- Phone: input_mode "tel", Trinidad format 868-XXX-XXXX
+
+**MONTH FIELDS:**
+- If month is asked separately, use type "select" with month options
+- Or input_mode "text_only" if free text
+
+**VALIDATION OBJECT STRUCTURE:**
+For each detected_field, include a "validation" object:
+{
+    "id": "field_id",
+    "label": "Label",
+    "type": "text|date|number|select|email|phone",
+    "required": true,
+    "validation": {
+        "pattern": "regex pattern if applicable",
+        "input_mode": "text_only|numeric|tel|email|text",
+        "min_length": number,
+        "max_length": number,
+        "min": number (for numeric),
+        "max": number (for numeric),
+        "max_date": "today" (for dates that can't be future),
+        "min_date": "today" (for dates that must be future),
+        "date_constraint": "past_only|past_or_today|future_only",
+        "message": "User-friendly error message"
+    }
+}
+
+=== END TRINIDAD & TOBAGO RULES ===
+
+**IMPORTANT - GENERATE ALL FIELDS AS SIMPLE, FLAT LIST:**
+- Create one field for EACH piece of information that appears in ANY of the example documents
+- Do NOT use conditional logic (show_if) - create ALL fields as regular required/optional fields
+- Users will fill in the fields that apply to their situation
+- Empty/unused fields will be handled gracefully by the AI drafter
+- This ensures we capture ALL possible information needs across all document variations
+- The more fields you detect, the better - don't skip any information that varies between documents
+
+**CRITICAL - EVERY FIELD MUST HAVE HELP TEXT AND PLACEHOLDER:**
+- ALL fields must include helpful "help_text" explaining what to enter
+- ALL fields must include "placeholder" showing an example value
+- Make help_text clear and user-friendly
+- Make placeholders realistic examples that match Trinidad & Tobago format
+
+Examples of good help_text and placeholders:
+- Date of Birth: help_text="Your age will be calculated automatically from your date of birth", placeholder=""
+- Full Name: help_text="Enter your full legal name as it appears on your ID", placeholder="John Michael Smith"
+- Address: help_text="Your current residential address in Trinidad & Tobago", placeholder="15 Queen Street, Port of Spain"
+- Electoral ID: help_text="Your 9-digit Trinidad & Tobago ID number", placeholder="123456789"
+- Phone: help_text="Your contact number including area code", placeholder="868-123-4567"
+- Email: help_text="Your email address for notifications", placeholder="your.email@example.com"
+
+**CRITICAL - SELECT FIELDS MUST INCLUDE OPTIONS:**
+For fields with type "select", you MUST include the "options" array.
+
+Example for month field:
+{
+    "id": "declaration_month",
+    "label": "Declaration Month",
+    "type": "select",
+    "required": true,
+    "placeholder": "Select month",
+    "help_text": "Month when this declaration is made",
+    "options": [
+        {"value": "January", "label": "January"},
+        {"value": "February", "label": "February"},
+        {"value": "March", "label": "March"},
+        {"value": "April", "label": "April"},
+        {"value": "May", "label": "May"},
+        {"value": "June", "label": "June"},
+        {"value": "July", "label": "July"},
+        {"value": "August", "label": "August"},
+        {"value": "September", "label": "September"},
+        {"value": "October", "label": "October"},
+        {"value": "November", "label": "November"},
+        {"value": "December", "label": "December"}
+    ]
+}
+
 Respond ONLY with a valid JSON object in this exact structure:
 {
-    "template_html": "<html template with {{placeholders}} - MUST match example format exactly>",
+    "template_html": "<html template with {{placeholders}} - MUST match example format exactly. Use {{calculated_age}} for age, NOT a direct age input>",
     "detected_fields": [
         {
-            "id": "field_id",
-            "label": "Human Readable Label",
-            "type": "text|textarea|date|select|number",
+            "id": "date_of_birth",
+            "label": "Date of Birth",
+            "type": "date",
             "required": true,
-            "placeholder": "Example value",
-            "help_text": "What this field is for"
+            "placeholder": "",
+            "help_text": "Your age will be calculated automatically from your date of birth",
+            "validation": {
+                "max_date": "today",
+                "date_constraint": "past_only",
+                "message": "Date of birth cannot be in the future"
+            }
+        },
+        {
+            "id": "full_name",
+            "label": "Full Name",
+            "type": "text",
+            "required": true,
+            "placeholder": "John Michael Smith",
+            "help_text": "Enter your full legal name as it appears on your ID",
+            "validation": {
+                "input_mode": "text_only",
+                "message": "Name can only contain letters"
+            }
+        },
+        {
+            "id": "address",
+            "label": "Current Address",
+            "type": "text",
+            "required": true,
+            "placeholder": "15 Queen Street, Port of Spain",
+            "help_text": "Your current residential address in Trinidad & Tobago"
+        },
+        {
+            "id": "electoral_id",
+            "label": "Electoral ID Number",
+            "type": "text",
+            "required": true,
+            "placeholder": "19741104044",
+            "help_text": "Your 11-digit Trinidad & Tobago Electoral ID (format: YYYYMMDDXXX)",
+            "validation": {
+                "pattern": "^\\d{11}$",
+                "input_mode": "numeric",
+                "min_length": 11,
+                "max_length": 11,
+                "message": "Enter valid Trinidad & Tobago Electoral ID (11 digits)"
+            }
+        },
+        {
+            "id": "phone_number",
+            "label": "Phone Number",
+            "type": "text",
+            "required": false,
+            "placeholder": "868-123-4567",
+            "help_text": "Your contact number including area code"
         }
     ],
     "required_sections": ["Section Name 1", "Section Name 2"],
@@ -110,11 +496,13 @@ Respond ONLY with a valid JSON object in this exact structure:
         }
     ],
     "few_shot_example": {
-        "input": {"field_id": "example value"},
-        "output_html": "<example output matching the exact template format>"
+        "input": {"full_name": "John Smith", "date_of_birth": "1985-03-15", "ownership_type": "self"},
+        "output_html": "<example output with {{calculated_age}} showing computed age>"
     },
-    "analysis_notes": "Brief notes about the affidavit type structure",
-    "format_warnings": ["Any deviations from standard format noted in examples"]
+    "analysis_notes": "Brief notes about the affidavit type structure and identified scenarios",
+    "format_warnings": ["Any deviations from standard format noted in examples"],
+    "field_conversions": ["age -> date_of_birth (age will be calculated from DOB)"],
+    "identified_scenarios": ["List of all unique scenarios detected across the example documents"]
 }"""
 
 
@@ -200,7 +588,7 @@ Remember: Only include NEW fields in detected_fields that are not already covere
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.2,
-            max_tokens=4000,
+            max_tokens=8000,  # Increased for more comprehensive question generation
             response_format={"type": "json_object"}
         )
         
@@ -219,6 +607,8 @@ Remember: Only include NEW fields in detected_fields that are not already covere
             'validation_rules': result.get('validation_rules', []),
             'few_shot_example': result.get('few_shot_example'),
             'analysis_notes': result.get('analysis_notes', ''),
+            'scenario_mapping': result.get('scenario_mapping', {}),
+            'identified_scenarios': result.get('identified_scenarios', []),
             'prompt_tokens': response.usage.prompt_tokens if response.usage else 0,
             'completion_tokens': response.usage.completion_tokens if response.usage else 0,
             'error': None
@@ -360,7 +750,7 @@ Provide the updated policy JSON:"""
                 {"role": "user", "content": user_prompt}
             ],
             temperature=0.2,
-            max_tokens=4000,
+            max_tokens=8000,  # Increased for more comprehensive question generation
             response_format={"type": "json_object"}
         )
         
@@ -385,14 +775,17 @@ Provide the updated policy JSON:"""
 def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> List[Dict]:
     """
     Convert AI-detected fields to the intake_schema format used by the system.
+    Applies smart Trinidad & Tobago specific validation rules automatically.
+    Converts age fields to date_of_birth with calendar picker.
     
     Args:
         detected_fields: Fields detected by generate_policy_from_examples
     
     Returns:
-        List of intake_schema question objects
+        List of intake_schema question objects with validation
     """
     intake_schema = []
+    has_dob_field = False  # Track if we already have a DOB field
     
     type_mapping = {
         'text': 'text',
@@ -401,26 +794,198 @@ def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> Lis
         'select': 'select',
         'number': 'number',
         'email': 'email',
-        'phone': 'tel',
+        'phone': 'phone',
+        'tel': 'phone',
     }
     
+    # First pass: check if DOB already exists
     for field in detected_fields:
+        field_id = field.get('id', '').lower()
+        if _matches_field_pattern(field_id, TT_FIELD_RULES.get('date_of_birth', {}).get('patterns', [])):
+            has_dob_field = True
+            break
+    
+    for field in detected_fields:
+        field_id = field.get('id', '').lower()
+        field_label = field.get('label', field.get('id', ''))
+        
+        # Check if this is an age field that should be converted to DOB
+        age_rules = TT_FIELD_RULES.get('age', {})
+        if _matches_field_pattern(field_id, age_rules.get('patterns', [])) or \
+           _matches_field_pattern(field_label.lower(), age_rules.get('patterns', [])):
+            
+            # Only convert if we don't already have a DOB field
+            if not has_dob_field and age_rules.get('convert_to_dob'):
+                replacement = age_rules.get('replacement_field', {})
+                question = {
+                    'id': replacement.get('id', 'date_of_birth'),
+                    'label': replacement.get('label', 'Date of Birth'),
+                    'type': 'date',
+                    'required': field.get('required', True),
+                    'placeholder': '',
+                    'help_text': replacement.get('help_text', 'Your age will be calculated automatically'),
+                    'validation': replacement.get('validation', {
+                        'max_date': 'today',
+                        'date_constraint': 'past_only',
+                        'message': 'Date of birth cannot be in the future'
+                    }),
+                    '_converted_from': 'age'  # Mark that this was converted from age
+                }
+                intake_schema.append(question)
+                has_dob_field = True
+                continue  # Skip adding the original age field
+        
         question = {
             'id': field.get('id', ''),
-            'label': field.get('label', field.get('id', '')),
+            'label': field_label,
             'type': type_mapping.get(field.get('type', 'text'), 'text'),
             'required': field.get('required', True),
             'placeholder': field.get('placeholder', ''),
             'help_text': field.get('help_text', ''),
         }
         
+        # Start with any validation from the AI
+        validation = field.get('validation', {})
+        
+        # Apply smart T&T validation rules based on field ID/label
+        validation = apply_smart_validation(field_id, field_label, validation, question)
+        
+        # Add validation if we have any rules
+        if validation:
+            question['validation'] = validation
+        
         # Add options if it's a select type
-        if question['type'] == 'select' and 'options' in field:
-            question['options'] = field['options']
+        if question['type'] == 'select':
+            if 'options' in field:
+                question['options'] = field['options']
+            # Check if we should add month options
+            elif _matches_field_pattern(field_id, TT_FIELD_RULES.get('month', {}).get('patterns', [])):
+                question['options'] = TT_FIELD_RULES['month']['options']
         
         intake_schema.append(question)
     
     return intake_schema
+
+
+def apply_smart_validation(field_id: str, field_label: str, existing_validation: Dict, question: Dict) -> Dict:
+    """
+    Apply smart Trinidad & Tobago specific validation based on field detection.
+    
+    Args:
+        field_id: The field ID (snake_case)
+        field_label: Human readable label
+        existing_validation: Any validation already set by AI
+        question: The question dict (may be modified for type changes)
+    
+    Returns:
+        Enhanced validation dict
+    """
+    validation = existing_validation.copy() if existing_validation else {}
+    field_lower = field_id.lower()
+    label_lower = field_label.lower()
+    
+    # Check each rule set
+    for rule_key, rules in TT_FIELD_RULES.items():
+        patterns = rules.get('patterns', [])
+        
+        if _matches_field_pattern(field_lower, patterns) or _matches_field_pattern(label_lower, patterns):
+            # Get the validation rules for this field type
+            rule_validation = rules.get('validation', {})
+            
+            # Merge validations (existing takes precedence, but fill gaps)
+            for key, value in rule_validation.items():
+                if key not in validation:
+                    validation[key] = value
+            
+            # Update field type if specified
+            if 'type' in rules and question['type'] == 'text':
+                new_type = rules['type']
+                if new_type in ['date', 'number', 'email', 'phone', 'select']:
+                    question['type'] = new_type
+            
+            # Add placeholder if not set
+            if not question.get('placeholder') and 'placeholder' in rules:
+                question['placeholder'] = rules['placeholder']
+            
+            # Add options for select type
+            if 'options' in rules:
+                question['options'] = rules['options']
+            
+            # Handle field conversion suggestions (e.g., age -> date_of_birth)
+            if 'convert_to' in rules:
+                validation['_conversion_suggestion'] = rules['convert_to']
+            
+            break  # Use first matching rule
+    
+    return validation
+
+
+def _matches_field_pattern(field_name: str, patterns: List[str]) -> bool:
+    """
+    Check if a field name matches any of the given patterns.
+    
+    Args:
+        field_name: The field name to check (already lowercase)
+        patterns: List of patterns to match against
+    
+    Returns:
+        True if matches any pattern
+    """
+    field_name = field_name.lower().replace(' ', '_').replace('-', '_')
+    
+    for pattern in patterns:
+        pattern_lower = pattern.lower()
+        # Exact match
+        if field_name == pattern_lower:
+            return True
+        # Contains match
+        if pattern_lower in field_name:
+            return True
+        # Field contains pattern
+        if field_name in pattern_lower:
+            return True
+    
+    return False
+
+
+def enhance_field_with_tt_rules(field: Dict) -> Dict:
+    """
+    Enhance a single field with Trinidad & Tobago specific validation rules.
+    Can be used to upgrade existing intake_schema fields.
+    
+    Args:
+        field: An intake_schema question dict
+    
+    Returns:
+        Enhanced field dict with validation
+    """
+    field_id = field.get('id', '').lower()
+    field_label = field.get('label', '').lower()
+    
+    # Get or create validation
+    validation = field.get('validation', {})
+    
+    # Apply smart validation
+    validation = apply_smart_validation(field_id, field_label, validation, field)
+    
+    if validation:
+        field['validation'] = validation
+    
+    return field
+
+
+def upgrade_intake_schema_with_tt_validation(intake_schema: List[Dict]) -> List[Dict]:
+    """
+    Upgrade an existing intake_schema with Trinidad & Tobago validation rules.
+    Use this to enhance existing affidavit types with smart validation.
+    
+    Args:
+        intake_schema: Existing list of intake questions
+    
+    Returns:
+        Enhanced intake_schema with validation rules
+    """
+    return [enhance_field_with_tt_rules(field.copy()) for field in intake_schema]
 
 
 def build_policy_json_from_generation(generation_result: Dict) -> Dict:

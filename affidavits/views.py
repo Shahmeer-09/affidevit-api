@@ -23,7 +23,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from .models import (
     User, AffidavitType, DecisionTreeNode, Request, 
     Stamp, FrictionReport, ReviewerEdit, RequestEvent, AIRun, PaymentLog,
-    SiteSettings
+    SiteSettings, Ticket, TicketMessage, TicketAttachment
 )
 from .serializers import (
     UserSerializer, UserRegistrationSerializer, CommissionerSerializer,
@@ -39,7 +39,8 @@ from .serializers import (
     FrictionReportSerializer, FrictionReportCreateSerializer,
     ReviewerEditSerializer, ReviewerEditCreateSerializer, ApproveRequestSerializer,
     ConfidenceDashboardSerializer, LearningExportSerializer,
-    PaymentLogSerializer, CommissionerPaymentSummarySerializer, MarkAsPaidSerializer
+    PaymentLogSerializer, CommissionerPaymentSummarySerializer, MarkAsPaidSerializer,
+    TicketSerializer, TicketDetailSerializer, TicketMessageSerializer, TicketAttachmentSerializer
 )
 from .authentication import (
     IsCommissioner, IsReviewer, IsAdminUser, 
@@ -50,7 +51,9 @@ from .services.ai_service import validate_inputs_before_submission, translate_to
 from .services.notification_service import (
     send_approval_notification, 
     send_clarification_notification,
-    send_completion_notification
+    send_completion_notification,
+    send_ticket_created_notification,
+    send_ticket_reply_notification
 )
 from .services.dashboard_service import (
     get_dashboard_data,
@@ -76,19 +79,85 @@ class UserRegistrationView(generics.CreateAPIView):
     permission_classes = [AllowAny]
     
     def create(self, request, *args, **kwargs):
+        from rest_framework_simplejwt.tokens import RefreshToken
+        
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
         
-        # Generate JWT tokens for the new user
-        from rest_framework_simplejwt.tokens import RefreshToken
+        # OTP verification disabled for now - activate user immediately
+        user.is_active = True
+        user.save()
+        
+        # Generate tokens and log user in directly
         refresh = RefreshToken.for_user(user)
         
         return Response({
+            'message': 'Registration successful.',
             'user': UserSerializer(user).data,
             'refresh': str(refresh),
             'access': str(refresh.access_token),
         }, status=status.HTTP_201_CREATED)
+
+
+class VerifyOTPView(APIView):
+    """
+    Verify OTP for phone number verification.
+    """
+    permission_classes = [AllowAny]
+    
+    def post(self, request):
+        from .services.twilio_service import TwilioService
+        from rest_framework_simplejwt.tokens import RefreshToken
+        
+        user_id = request.data.get('user_id')
+        code = request.data.get('code')
+        
+        if not user_id or not code:
+            return Response(
+                {'error': 'User ID and Code are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        user = get_object_or_404(User, pk=user_id)
+        
+        if not user.phone_number:
+            return Response(
+                {'error': 'User has no phone number'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        # Verify code
+        result = TwilioService.check_verification_token(user.phone_number, code)
+        
+        if result['success']:
+            user.is_phone_verified = True
+            
+            # If user is a public user, activate them and log them in
+            if user.role == User.Role.PUBLIC:
+                user.is_active = True
+                user.save()
+                
+                refresh = RefreshToken.for_user(user)
+                return Response({
+                    'success': True,
+                    'message': 'Phone verified successfully',
+                    'user': UserSerializer(user).data,
+                    'refresh': str(refresh),
+                    'access': str(refresh.access_token),
+                })
+            else:
+                # For commissioners, just mark verified but keep inactive (admin approval needed)
+                user.save()
+                return Response({
+                    'success': True,
+                    'message': 'Phone verified successfully. Waiting for admin approval.'
+                })
+        else:
+            return Response(
+                {'error': result.get('error', 'Invalid verification code')},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
 
 class CommissionerRegistrationView(APIView):
@@ -106,10 +175,13 @@ class CommissionerRegistrationView(APIView):
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
         
-        # Don't auto-login - require admin approval first
+        # Commissioner remains inactive until admin approval (no OTP needed)
+        user.is_active = False
+        user.save()
+        
         return Response({
-            'message': 'Your request has been sent! Once approved by admin, you will be able to login.',
-            'email': user.email,
+            'message': 'Registration successful. Please wait for admin approval.',
+            'user_id': user.id,
         }, status=status.HTTP_201_CREATED)
 
 
@@ -677,7 +749,7 @@ class MarkPaidView(APIView):
         # Log the event
         RequestEvent.objects.create(
             request=request_obj,
-            action=RequestEvent.Action.STATUS_CHANGED,
+            action=RequestEvent.Action.PAYMENT_CONFIRMED,
             actor=request.user,
             actor_role=request.user.role,
             details={'action': 'payment_completed', 'amount': '50.00', 'currency': 'TTD'}
@@ -2396,6 +2468,7 @@ class AdminPolicyTaskStatusView(APIView):
     
     def get(self, request, task_id):
         from celery.result import AsyncResult
+        from rest_framework import serializers
         from .services.policy_generator_service import (
             convert_detected_fields_to_intake_schema,
             build_policy_json_from_generation
@@ -2471,6 +2544,13 @@ class AdminPolicyTaskStatusView(APIView):
                 except AffidavitType.DoesNotExist:
                     result['saved'] = False
                     result['save_error'] = 'Affidavit type not found'
+                except serializers.ValidationError as e:
+                    result['saved'] = False
+                    result['save_error'] = f'Validation error: {str(e)}'
+                    result['validation_details'] = e.detail if hasattr(e, 'detail') else str(e)
+                except Exception as e:
+                    result['saved'] = False
+                    result['save_error'] = f'Error saving: {str(e)}'
             else:
                 result['saved'] = False
             
@@ -2879,4 +2959,127 @@ class AdminTypeRequestsView(generics.ListAPIView):
         
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
+
+
+# =============================================================================
+# Ticket Views
+# =============================================================================
+
+class TicketViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing support tickets.
+    Users see their own; Admins see all.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        if user.role == 'admin':
+            return Ticket.objects.all().select_related('user', 'request').prefetch_related('messages')
+        return Ticket.objects.filter(user=user).select_related('user', 'request').prefetch_related('messages')
+        
+    def get_serializer_class(self):
+        if self.action in ['retrieve', 'update', 'partial_update']:
+            return TicketDetailSerializer
+        return TicketSerializer
+        
+    def perform_create(self, serializer):
+        ticket = serializer.save(user=self.request.user)
+        
+        # Create attachment if provided
+        files = self.request.FILES.getlist('files')
+        for file in files:
+            TicketAttachment.objects.create(ticket=ticket, file=file)
+            
+        # Send notification and mark email sent time
+        try:
+            send_ticket_created_notification(ticket)
+            ticket.last_email_sent_at = timezone.now()
+            ticket.save(update_fields=['last_email_sent_at'])
+        except Exception as e:
+            # Log error but don't fail the request
+            print(f"Failed to send ticket notification: {e}")
+            
+    @action(detail=True, methods=['post'])
+    def reply(self, request, pk=None):
+        ticket = self.get_object()
+        message_text = request.data.get('message')
+        
+        if not message_text:
+            return Response({'error': 'Message is required'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        is_internal = request.data.get('is_internal', False) if request.user.role == 'admin' else False
+        
+        message = TicketMessage.objects.create(
+            ticket=ticket,
+            sender=request.user,
+            message=message_text,
+            is_internal=is_internal
+        )
+        
+        # Update ticket updated_at timestamp
+        ticket.save()
+        
+        # Send notification with 5-minute debouncing
+        # Only send if: admin reply to user, not internal note, and email cooldown passed
+        if request.user.role == 'admin' and request.user != ticket.user and not is_internal:
+            from datetime import timedelta
+            should_send_email = False
+            
+            if ticket.last_email_sent_at is None:
+                # First admin reply - always send
+                should_send_email = True
+            else:
+                # Check if 5 minutes have passed since last email
+                time_since_last = timezone.now() - ticket.last_email_sent_at
+                if time_since_last >= timedelta(seconds=30):
+                    should_send_email = True
+            
+            if should_send_email:
+                try:
+                    send_ticket_reply_notification(ticket, message)
+                    ticket.last_email_sent_at = timezone.now()
+                    ticket.save(update_fields=['last_email_sent_at'])
+                except Exception as e:
+                    print(f"Failed to send ticket reply notification: {e}")
+        
+        return Response(TicketMessageSerializer(message).data, status=status.HTTP_201_CREATED)
+        
+    @action(detail=True, methods=['post'])
+    def status(self, request, pk=None):
+        if request.user.role != 'admin':
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+            
+        ticket = self.get_object()
+        old_status = ticket.status
+        new_status = request.data.get('status')
+        priority = request.data.get('priority')
+        
+        if new_status:
+            ticket.status = new_status
+            if new_status in [Ticket.Status.RESOLVED, Ticket.Status.CLOSED]:
+                ticket.resolved_at = timezone.now()
+                
+        if priority:
+            ticket.priority = priority
+            
+        ticket.save()
+        
+        # Send email notification on status changes (always, bypass debounce)
+        if new_status and new_status != old_status:
+            try:
+                # Create a status change message for email context
+                status_message = TicketMessage(
+                    ticket=ticket,
+                    sender=request.user,
+                    message=f"Ticket status changed to: {ticket.get_status_display()}"
+                )
+                send_ticket_reply_notification(ticket, status_message)
+                ticket.last_email_sent_at = timezone.now()
+                ticket.save(update_fields=['last_email_sent_at'])
+            except Exception as e:
+                print(f"Failed to send status change notification: {e}")
+        
+        return Response(TicketDetailSerializer(ticket).data)
+
 

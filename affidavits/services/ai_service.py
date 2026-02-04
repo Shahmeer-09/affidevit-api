@@ -516,7 +516,7 @@ def validate_inputs_before_submission(
         dict: {
             'all_valid': bool,
             'invalid_fields': {'field_name': 'reason why invalid'},
-            'validation_notes': [{'field': 'address', 'issue': 'Not valid', 'example': '...'}]
+            'validation_notes': [{'field': 'address', 'issue': 'Not valid', 'suggestion': '...'}]
         }
     """
     try:
@@ -525,113 +525,141 @@ def validate_inputs_before_submission(
         if not template_html:
             return {'all_valid': True, 'invalid_fields': {}, 'validation_notes': []}
         
-        system_prompt = """You are a lenient field validator for legal documents. Your job is to catch ONLY serious issues - gibberish, completely irrelevant answers, and logical contradictions. Return your response as JSON.
+        system_prompt = """You are a strict field validator for legal documents in Trinidad and Tobago. Your job is to catch serious issues - gibberish, future dates, irrelevant answers, and logical contradictions. Return your response as JSON.
 
-**CRITICAL: BE VERY LENIENT - The AI drafter will fix spelling, grammar, and formalize language**
+**CRITICAL RULES:**
+1. BE LENIENT on spelling/grammar - The AI drafter will fix those
+2. BE STRICT on future dates, gibberish, and contradictions - these MUST be flagged
+3. DO NOT return "informational notes" - ONLY REAL ERRORS
+4. If a value is VALID, do NOT include it in any error list
+5. If house_age is given as a date, CALCULATE the age yourself
 
-**ONLY FLAG THESE 5 TYPES OF SERIOUS PROBLEMS:**
+**FLAG THESE SERIOUS PROBLEMS:**
 
-1. **PURE GIBBERISH (keyboard mashing):**
+1. **FUTURE DATES (CRITICAL - MUST CHECK):**
+   - Check declaration_month + declaration_year + declaration_day combinations
+   - If the date is IN THE FUTURE compared to current date → INVALID
+   - Example: Current date is February 4, 2026. User enters "March 2026" → FUTURE DATE ❌
+   - Example: Current date is February 4, 2026. User enters "February 10, 2026" → FUTURE DATE ❌
+   - Example: User enters "January 2026" → VALID ✅ (in the past)
+   - Check ANY date-related fields (declaration_month, declaration_year, declaration_day, event dates)
+   - Month names: January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, September=9, October=10, November=11, December=12
+
+2. **PURE GIBBERISH (keyboard mashing):**
    - Examples: "ihdhfihdbhb", "asdfasdfasdf", "fgdgsgsdvchdvudv", "jkljkljkl"
    - Random characters with NO recognizable words
    - Must be COMPLETELY meaningless
 
-2. **COMPLETELY IRRELEVANT ANSWERS:**
+3. **TRAILING GIBBERISH (valid start, bad ending) - BE AGGRESSIVE:**
+   - "15 Queen Street asdfasdf" → INVALID (gibberish at end)
+   - "replacing windows hahahah i am happy" → INVALID (irrelevant at end)
+   - "fixing the roof khdfbiewbfiwbf" → INVALID (gibberish at end)
+   - "my property is 100sqm lololol" → INVALID (nonsense at end)
+   - "valid address ????" → INVALID (junk at end)
+   - "something !!!!!!!!" → INVALID (excessive punctuation)
+   - "text here ......." → INVALID (trailing dots)
+   - Look for: random chars, "haha", "lol", "????", "!!!!", ".....", keyboard mashing ANYWHERE in the text
+
+4. **COMPLETELY IRRELEVANT ANSWERS:**
    - Asked about property, user says "i'm sick" or "i'm sad hahaha" → INVALID
    - Asked about address, user says "i don't like this" → INVALID
-   - Asked about ownership, user says "whatever lol" → INVALID
    - The answer has NOTHING to do with the question
 
-3. **LOGICAL CONTRADICTIONS (impossible math):**
-   - Age 25 + "lived here 50 years" → INVALID (can't live somewhere longer than you've been alive)
-   - Date of birth that makes age negative or > 120 → INVALID
-   - Impossible time periods
+5. **ACTUAL MATHEMATICAL CONTRADICTIONS:**
+   - Residence duration > person's age → IMPOSSIBLE
+   - Residence duration > house age → IMPOSSIBLE
+   - Events before person was born → IMPOSSIBLE
+   - ONLY flag when math is truly impossible
 
-4. **IMPOSSIBLE VALUES:**
+6. **IMPOSSIBLE VALUES:**
    - Age 250, Age -5 → INVALID
    - Negative durations → INVALID
-   - Clearly impossible numbers
 
-5. **TRAILING GIBBERISH/IRRELEVANT CONTENT (valid start, bad ending):**
-   - "replacing windows hahahah i am happy and confused" → INVALID (starts ok but ends with irrelevant emotional content)
-   - "fixing the roof khdfbiewbfiwbf" → INVALID (starts ok but ends with gibberish)
-   - "my property is 100sqm lololol whatever" → INVALID (relevant info + irrelevant trailing)
-   - "new paint job im so bored today" → INVALID (relevant + unrelated personal statement)
-   - The answer STARTS with relevant info but ENDS with gibberish, emotional outbursts, or unrelated content
-   - Look for patterns like: relevant text + "haha", "lol", random letters, personal feelings, off-topic comments
+7. **ID NUMBER FORMAT (Trinidad & Tobago) - 11 DIGITS WITH DOB:**
+   - Electoral ID MUST be exactly 11 digits in format YYYYMMDDXXX
+   - First 8 digits encode date of birth: YYYYMMDD (Year-Month-Day)
+   - Last 3 digits are unique sequence number
+   - Extract ONLY the digits from input (ignore spaces, dashes)
+   - Count digits: if count == 11 → Check if valid format ✅
+   - Count digits: if count != 11 → INVALID ❌
+   - Example: "19741104044" → 11 digits, DOB=1974-11-04 → VALID ✅
+   - Example: "1974-11-04-044" → 11 digits → VALID ✅  
+   - Example: "123456789" → 9 digits → INVALID ❌ (old format)
+   
+   **CRITICAL - CROSS-VALIDATE WITH DATE OF BIRTH:**
+   - If BOTH electoral_id AND date_of_birth fields are provided:
+     * Extract year (chars 1-4), month (chars 5-6), day (chars 7-8) from electoral_id
+     * Format as YYYY-MM-DD
+     * Compare with the date_of_birth field value
+     * ONLY FLAG if they are DIFFERENT (mismatch)
+     * DO NOT FLAG if they MATCH - matching is CORRECT!
+   - Example: electoral_id="19741104044" + date_of_birth="1974-11-04" → MATCH → DO NOT FLAG ✅ (this is correct!)
+   - Example: electoral_id="19900614044" + date_of_birth="1990-06-14" → MATCH → DO NOT FLAG ✅ (this is correct!)
+   - Example: electoral_id="19741104044" + date_of_birth="1980-05-15" → MISMATCH → FLAG ERROR ❌
+   - ONLY return error when dates are DIFFERENT, NEVER when they match!
+   - Error message (only for mismatch): "Your Electoral ID indicates birth date 1974-11-04, but you entered 1980-05-15 as Date of Birth"
 
 **WHAT TO ACCEPT (DO NOT FLAG) - The drafter will fix these:**
 
-✅ **SPELLING ERRORS - ALWAYS ACCEPT:**
-   - "councile" → VALID (drafter fixes to "council")
-   - "responsable" → VALID (drafter fixes to "responsible")
-   - Any misspelled words → VALID
+✅ Spelling errors, informal language, incomplete but meaningful, vague but relevant answers
 
-✅ **INFORMAL/SIMPLE LANGUAGE - ALWAYS ACCEPT:**
-   - "my house is old" → VALID (drafter will formalize)
-   - "i own the house and i am responsible for all the stuff" → VALID
-   - "the council has allowed me" → VALID
-   - "dwelling house at 15 Queen Street" → VALID
-   - Any casual phrasing → VALID
-
-✅ **INCOMPLETE BUT MEANINGFUL - ALWAYS ACCEPT:**
-   - "Bacolet Street" (missing town) → VALID (has street name)
-   - "my old house" → VALID (describes property)
-   - "the property councile has allowed me" → VALID (has permission info)
-   - "234324323432" (long number for ID) → VALID (could be valid ID)
-
-✅ **VAGUE BUT RELEVANT - ALWAYS ACCEPT:**
-   - "my house" for property → VALID (relevant to question)
-   - "the old building" → VALID (describes something)
-   - Simple short answers → VALID
-
-**EXAMPLES OF WHAT TO ACCEPT:**
-- Address: "Bacolet Street, Scarborough" → ✅ VALID
-- Address: "123 Main Street" → ✅ VALID
-- Property: "my house is old" → ✅ VALID
-- Ownership: "i own the house and i am responsible for all the stuff" → ✅ VALID
-- Permission: "the property councile has allowed me" → ✅ VALID
-- Name: "John" → ✅ VALID
-- ID: "234324323432" → ✅ VALID
-- Repairs: "replacing windows and doors" → ✅ VALID (all relevant)
-
-**EXAMPLES OF WHAT TO REJECT:**
-- Address: "ihdhfihdbhb" → ❌ INVALID (pure gibberish)
-- Property: "asdfasdfasdf" → ❌ INVALID (keyboard mashing)
-- Property: "i'm sick haha" → ❌ INVALID (completely irrelevant to property question)
-- Ownership: "lol whatever" → ❌ INVALID (irrelevant)
-- Name: "jkljkljkl" → ❌ INVALID (gibberish)
-- Age: 250 → ❌ INVALID (impossible)
-- Duration: Age 25 + "lived here 50 years" → ❌ INVALID (contradiction)
-- Repairs: "replacing windows hahahah i am happy and confused" → ❌ INVALID (trailing irrelevant content)
-- Repairs: "fixing roof khdfbiewbfiwbf" → ❌ INVALID (trailing gibberish)
-- Property: "my house is nice lol im bored" → ❌ INVALID (trailing irrelevant)
-
-**OUTPUT FORMAT:**
+**OUTPUT FORMAT - INCLUDE HELPFUL SUGGESTIONS:**
 {
     "all_valid": boolean,
+    "contradictions_found": [
+        {
+            "type": "age_vs_residence" | "house_vs_residence" | "date_contradiction" | "other",
+            "fields_involved": ["field1", "field2"],
+            "explanation": "You said you're 30 years old but have lived here for 45 years. This is impossible - you cannot live somewhere longer than you've been alive.",
+            "suggestion": "Please check: either your age/date of birth or your residence duration needs to be corrected. If you're 30, you could have lived there at most 30 years."
+        }
+    ],
     "field_checks": [
         {
             "field": "field_name",
             "value": "what user entered",
             "is_valid": true/false,
-            "issue": "ONLY if gibberish/irrelevant/contradiction/impossible/trailing-junk - null otherwise",
-            "example": "Example ONLY if invalid - null otherwise"
+            "issue": "Clear explanation of what's wrong - null if valid",
+            "suggestion": "Helpful suggestion of what they SHOULD enter - null if valid. Be specific and give examples.",
+            "correct_format": "Show the correct format if applicable (e.g., '123456789' for ID)"
         }
     ]
 }
 
-**GOLDEN RULE:**
-If the answer is ENTIRELY meaningful and related to the question → ACCEPT IT.
-Reject if it contains gibberish, completely irrelevant content, OR trails off into nonsense/personal comments after valid info.
+**IMPORTANT - ONLY RETURN ACTUAL ERRORS:**
+- If something is VALID, set all_valid=true and return EMPTY arrays
+- DO NOT include "informational notes" or "observations" in the response
+- DO NOT complain about data formats (dates vs numbers) - just calculate what you need
+- If house_age is given as a date like "1994-07-04", calculate: current_year - 1994 = house age
+- ONLY return items in contradictions_found or field_checks if there is an ACTUAL ERROR
+
+Examples of what NOT to return:
+❌ "House age is given as a date instead of years" - just calculate it!
+❌ "This is valid but needs clarification" - if it's valid, don't return it!
+❌ "The values are consistent" - good, then return all_valid=true with empty arrays
+
+Examples of what TO return:
+✅ "You lived here 50 years but are only 30 years old - impossible"
+✅ "Electoral ID must be 11 digits, you entered 5"
+✅ "This field contains gibberish: asdfghjkl"
 """
 
         from datetime import date
         current_year = date.today().year
+        current_month = date.today().month
+        current_day = date.today().day
+        current_date = date.today().isoformat()
+        current_month_name = date.today().strftime('%B')
 
         user_prompt = f"""
 **AFFIDAVIT TYPE:** {affidavit_type_name}
+**CURRENT DATE:** {current_date}
 **CURRENT YEAR:** {current_year}
+**CURRENT MONTH:** {current_month_name} (month number: {current_month})
+**CURRENT DAY:** {current_day}
+
+**MONTH NUMBER REFERENCE:**
+January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, September=9, October=10, November=11, December=12
 
 **TEMPLATE (shows what each field is for):**
 {template_html[:4000] if template_html else 'No template'}
@@ -639,31 +667,61 @@ Reject if it contains gibberish, completely irrelevant content, OR trails off in
 **USER INPUT TO VALIDATE:**
 {json.dumps(answers_json, indent=2)}
 
-**YOUR TASK:**
-1. Go through EACH field in the user input
-2. ONLY flag if the value is:
-   - Pure gibberish/keyboard mashing (like "asdfgh", "ihdhfihdbhb")
-   - Completely irrelevant to the question (asked property, user says "i'm sick")
-   - Logically impossible (age 25 but lived there 50 years)
-   - Impossible number (age 250)
-   - TRAILING GIBBERISH/IRRELEVANT: Starts with valid info but ENDS with gibberish or unrelated content
-     Examples: "replacing windows hahahah i am happy", "fixing roof asdfasdf", "my house lol im bored"
+**CRITICAL INSTRUCTIONS - CHECK THESE IN ORDER:**
 
-3. ACCEPT everything else including:
-   - Spelling errors (drafter will fix)
-   - Informal language (drafter will formalize)
-   - Simple/vague but relevant answers
-   - Short answers
+1. **FUTURE DATE CHECK (MOST IMPORTANT):**
+   - Look for declaration_month, declaration_year, declaration_day fields
+   - Convert month name to number (March=3, April=4, etc.)
+   - TODAY'S DATE IS VALID - do NOT flag today as future!
+   - Comparison rules:
+     * If year > {current_year} → FUTURE DATE ❌
+     * If year == {current_year} AND month > {current_month} → FUTURE DATE ❌
+     * If year == {current_year} AND month == {current_month} AND day > {current_day} → FUTURE DATE ❌
+     * If year == {current_year} AND month == {current_month} AND day == {current_day} → TODAY = VALID ✅
+   - Examples with current date {current_month_name} {current_day}, {current_year}:
+     * Month="March", Year="2026" → March=3 > {current_month} = FUTURE ❌
+     * Month="February", Year="2026", Day=5 → Same month, but 5 > {current_day} = FUTURE ❌
+     * Month="February", Year="2026", Day=4 → Same month, 4 == {current_day} = TODAY = VALID ✅
+     * Month="February", Year="2026", Day=3 → Same month, 3 < {current_day} = PAST = VALID ✅
+     * Month="January", Year="2026" → January=1 < {current_month} = PAST ✅
 
-**IMPORTANT - CHECK FOR TRAILING JUNK:**
-Read each answer from START to END. If it begins relevant but trails off into:
-- Gibberish letters (khdfbiewbfiwbf)
-- Emotional expressions unrelated to the topic (hahahah, lol, im happy, im confused)
-- Off-topic personal comments (im bored, whatever, idk)
-Then flag it as INVALID with issue "Contains irrelevant trailing content".
+2. **TRAILING GIBBERISH CHECK:**
+   - Scan EVERY text field for gibberish at the END
+   - Look for: random characters, "haha", "lol", "????", "!!!!", ".....", keyboard mashing
+   - Example: "15 Queen Street asdfg" → Has gibberish "asdfg" at end → INVALID
+   - Example: "fixing roof hahaha" → Has "hahaha" at end → INVALID
 
-Be LENIENT on spelling/grammar - the AI drafter will fix that.
-But REJECT answers that contain garbage or off-topic content mixed with valid info.
+3. **PURE GIBBERISH CHECK:**
+   - Fields that are ENTIRELY meaningless: "asdfasdf", "jkljkl", etc.
+
+4. **CONTRADICTION CHECK:**
+   - Calculate age from date_of_birth if present
+   - Calculate house age from build date if present
+   - ONLY FLAG if residence > age OR residence > house_age
+
+5. **ID FORMAT CHECK (11 DIGITS + DOB VALIDATION):**
+   - Extract ONLY digits from the ID field (remove spaces, dashes, any non-digits)
+   - Count the digits
+   - If digit count == 11 → Extract first 8 digits as YYYYMMDD and validate date
+   - If digit count != 11 → INVALID (flag: "Electoral ID must be 11 digits, you entered X digits")
+   - Example: "19741104044" has 11 digits → Check if 19741104 is valid date → VALID
+   - Example: "1974 11 04 044" has 11 digits → VALID
+   - Example: "123456789" has 9 digits → INVALID (old format, must be 11)
+   
+   **CROSS-VALIDATE ELECTORAL ID WITH DATE OF BIRTH:**
+   - If electoral_id field exists AND date_of_birth field exists:
+     * Extract digits 1-4 (year), 5-6 (month), 7-8 (day) from electoral_id
+     * Format as YYYY-MM-DD (e.g., "19741104" → "1974-11-04")
+     * Compare with date_of_birth field value
+     * ONLY flag if they are DIFFERENT!
+     * If they MATCH → This is CORRECT, do NOT flag it!
+   - Example: electoral_id="19900614044" + date_of_birth="1990-06-14" → MATCH → VALID, DO NOT FLAG ✅
+   - Example: electoral_id="19741104044" + date_of_birth="1974-11-04" → MATCH → VALID, DO NOT FLAG ✅
+   - Example: electoral_id="19741104044" + date_of_birth="1980-05-15" → MISMATCH → FLAG ERROR ❌
+   - NEVER flag when DOB matches the ID! Only flag when they differ.
+
+**BE STRICT** on future dates and gibberish - these MUST be caught.
+**BE LENIENT** on spelling/grammar - the AI drafter fixes that.
 """
 
         response = client.chat.completions.create(
@@ -683,15 +741,32 @@ But REJECT answers that contain garbage or off-topic content mixed with valid in
         invalid_fields = {}
         validation_notes = []
         
+        # Add contradictions to validation notes with high priority
+        for contradiction in result.get('contradictions_found', []):
+            for field in contradiction.get('fields_involved', []):
+                if field not in invalid_fields:
+                    invalid_fields[field] = contradiction.get('explanation', 'Logical contradiction detected')
+            validation_notes.append({
+                'type': 'contradiction',
+                'contradiction_type': contradiction.get('type', 'other'),
+                'fields': contradiction.get('fields_involved', []),
+                'issue': contradiction.get('explanation', 'Logical contradiction detected'),
+                'suggestion': contradiction.get('suggestion', 'Please review the related fields for consistency')
+            })
+        
+        # Add individual field issues
         for check in result.get('field_checks', []):
             if not check.get('is_valid', True):
                 field_name = check.get('field', 'unknown')
-                invalid_fields[field_name] = check.get('issue', 'Invalid value')
+                if field_name not in invalid_fields:  # Don't overwrite contradiction messages
+                    invalid_fields[field_name] = check.get('issue', 'Invalid value')
                 validation_notes.append({
+                    'type': 'field_error',
                     'field': field_name,
                     'value': check.get('value', ''),
                     'issue': check.get('issue', 'Invalid value'),
-                    'example': check.get('example', '')
+                    'suggestion': check.get('suggestion', ''),
+                    'correct_format': check.get('correct_format', '')
                 })
         
         all_valid = result.get('all_valid', len(invalid_fields) == 0)
@@ -715,34 +790,113 @@ But REJECT answers that contain garbage or off-topic content mixed with valid in
         
         import re
         
+        # First, try to detect basic contradictions
+        age = None
+        residence_duration = None
+        house_age = None
+        date_of_birth = None
+        
+        # Extract numeric values for contradiction checking
+        for field_name, field_value in answers_json.items():
+            field_lower = field_name.lower()
+            value_str = str(field_value).lower().strip()
+            
+            # Try to extract age
+            if 'date_of_birth' in field_lower or 'dob' in field_lower:
+                try:
+                    from datetime import datetime, date as dt_date
+                    dob = datetime.strptime(str(field_value), '%Y-%m-%d').date()
+                    today = dt_date.today()
+                    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+                    date_of_birth = field_value
+                except:
+                    pass
+            elif 'age' in field_lower and not 'house' in field_lower:
+                try:
+                    age = int(re.search(r'\d+', str(field_value)).group())
+                except:
+                    pass
+            
+            # Try to extract residence duration
+            if 'residence' in field_lower or 'living' in field_lower or 'resided' in field_lower:
+                try:
+                    match = re.search(r'(\d+)\s*(?:years?|yrs?)', value_str)
+                    if match:
+                        residence_duration = int(match.group(1))
+                except:
+                    pass
+            
+            # Try to extract house age
+            if 'house_age' in field_lower or 'property_age' in field_lower:
+                try:
+                    match = re.search(r'(\d+)\s*(?:years?|yrs?)', value_str)
+                    if match:
+                        house_age = int(match.group(1))
+                except:
+                    pass
+        
+        # Check for contradictions
+        if age is not None and residence_duration is not None:
+            if residence_duration > age:
+                fallback_invalid_fields['residence_duration'] = f'You cannot have lived somewhere for {residence_duration} years if you are only {age} years old'
+                fallback_notes.append({
+                    'type': 'contradiction',
+                    'fields': ['date_of_birth' if date_of_birth else 'age', 'residence_duration'],
+                    'issue': f'Contradiction: You said you\'re {age} years old but have lived here for {residence_duration} years. This is impossible.',
+                    'suggestion': f'Please correct either your age/date of birth or residence duration. If you\'re {age}, you could have lived there at most {age} years.'
+                })
+        
+        if house_age is not None and residence_duration is not None:
+            if residence_duration > house_age:
+                fallback_invalid_fields['house_age'] = f'You cannot have lived in a house for {residence_duration} years if it is only {house_age} years old'
+                fallback_notes.append({
+                    'type': 'contradiction',
+                    'fields': ['house_age', 'residence_duration'],
+                    'issue': f'Contradiction: You said the house is {house_age} years old but you\'ve lived there for {residence_duration} years. The house didn\'t exist!',
+                    'suggestion': f'Please check: if the house is {house_age} years old, you could have lived there at most {house_age} years.'
+                })
+        
         for field_name, field_value in answers_json.items():
             if not isinstance(field_value, str) or len(field_value.strip()) == 0:
                 continue
             
             value = field_value.lower().strip()
+            field_lower = field_name.lower()
+            
+            # Check ID number format (should be 11 digits for T&T Electoral ID: YYYYMMDDXXX)
+            if 'electoral' in field_lower or 'national_id' in field_lower or 'id_number' in field_lower:
+                digits_only = re.sub(r'\D', '', str(field_value))
+                if len(digits_only) != 11:
+                    fallback_invalid_fields[field_name] = f'Electoral ID must be exactly 11 digits (you entered {len(digits_only)})'
+                    fallback_notes.append({
+                        'type': 'field_error',
+                        'field': field_name,
+                        'value': field_value,
+                        'issue': f'Trinidad & Tobago Electoral ID must be exactly 11 digits (format: YYYYMMDDXXX). You entered {len(digits_only)} digits.',
+                        'suggestion': 'Enter your 11-digit Electoral ID. First 8 digits are your date of birth.',
+                        'correct_format': '19901234567'
+                    })
+                    continue
             
             # Pattern 1: Pure keyboard mashing (same char repeated or random consonant clusters)
-            # Example: "asdfasdf", "jkljkljkl", "kldbfihdb"
-            if re.search(r'([qwrtypsdfghjklzxcvbnm])\1{4,}', value):  # Same consonant 5+ times
+            if re.search(r'([qwrtypsdfghjklzxcvbnm])\1{4,}', value):
                 fallback_invalid_fields[field_name] = 'Contains gibberish or keyboard mashing'
                 fallback_notes.append({
+                    'type': 'field_error',
                     'field': field_name,
                     'value': field_value,
-                    'issue': 'Contains gibberish or keyboard mashing',
-                    'example': 'Please enter meaningful text without random characters'
+                    'issue': 'This looks like random keyboard characters, not a real answer.',
+                    'suggestion': 'Please enter a meaningful response. For example, if this is asking for a name, enter your full legal name.'
                 })
                 continue
             
             # Pattern 2: Random gibberish strings (low vowel ratio + mixed consonants)
-            # Example: "kldbfihdb", "jhfbdhfbh", "asdfasdf"
-            # Check for words with suspiciously low vowel count
             words = value.split()
             for word in words:
-                if len(word) >= 6:  # Only check longer "words"
+                if len(word) >= 6:
                     vowel_count = sum(1 for c in word if c in 'aeiou')
                     consonant_count = sum(1 for c in word if c.isalpha() and c not in 'aeiou')
                     
-                    # If < 20% vowels and has multiple different consonants, likely gibberish
                     if consonant_count > 0:
                         vowel_ratio = vowel_count / (vowel_count + consonant_count)
                         unique_consonants = len(set(c for c in word if c.isalpha() and c not in 'aeiou'))
@@ -750,25 +904,26 @@ But REJECT answers that contain garbage or off-topic content mixed with valid in
                         if vowel_ratio < 0.2 and unique_consonants >= 5:
                             fallback_invalid_fields[field_name] = 'Contains gibberish text'
                             fallback_notes.append({
+                                'type': 'field_error',
                                 'field': field_name,
                                 'value': field_value,
-                                'issue': 'Contains gibberish or random characters',
-                                'example': 'Please enter meaningful words'
+                                'issue': 'This contains what appears to be random characters.',
+                                'suggestion': 'Please remove the gibberish and enter only meaningful text.'
                             })
                             break
             
             if field_name in fallback_invalid_fields:
                 continue
             
-            # Pattern 3: Trailing junk - laughs, emotional expressions, excessive punctuation
-            # Example: "hahahah", "lol yeah", "...."
+            # Pattern 3: Trailing junk - laughs, emotional expressions
             if re.search(r'\s+(ha){2,}|lol+|yeah\s+m+\s+\w+|[.]{4,}', value):
                 fallback_invalid_fields[field_name] = 'Contains irrelevant trailing content'
                 fallback_notes.append({
+                    'type': 'field_error',
                     'field': field_name,
                     'value': field_value,
-                    'issue': 'Contains irrelevant trailing content (laughs, emotions, etc.)',
-                    'example': 'Remove "haha", "lol", or extra punctuation at the end'
+                    'issue': 'Your answer has irrelevant content at the end (like "haha" or "lol").',
+                    'suggestion': 'Please remove any jokes, laughs, or off-topic comments. Keep only the relevant information.'
                 })
                 continue
         
@@ -784,15 +939,15 @@ But REJECT answers that contain garbage or off-topic content mixed with valid in
             }
         
         # If no obvious issues found and AI failed, return error instead of fail-open
-        # This prevents bad data from being submitted when we can't validate properly
         return {
             'all_valid': False,
             'invalid_fields': {'_system': 'Validation service temporarily unavailable'},
             'validation_notes': [{
+                'type': 'system_error',
                 'field': '_system',
                 'value': '',
                 'issue': f'Validation service error: {str(e)}. Please try again in a moment.',
-                'example': ''
+                'suggestion': 'Please wait a moment and try submitting again.'
             }],
             'error': str(e)
         }

@@ -186,6 +186,10 @@ class User(AbstractUser):
         unique=True,
         help_text="Phone number must be unique"
     )
+    is_phone_verified = models.BooleanField(
+        default=False,
+        help_text="Whether the user has verified their phone number via OTP"
+    )
     
     # Profile image (used for commissioners on landing page)
     profile_image = models.ImageField(
@@ -1049,6 +1053,9 @@ class RequestEvent(models.Model):
         PDF_DOWNLOADED = 'pdf_downloaded', 'PDF Downloaded'
         COMMISSIONER_OPENED = 'commissioner_opened', 'Commissioner Opened'
         COMMISSIONER_CHANGED = 'commissioner_changed', 'Commissioner Changed'
+        TICKET_CREATED = 'ticket_created', 'Ticket Created'
+        TICKET_UPDATED = 'ticket_updated', 'Ticket Updated'
+        PAYMENT_CONFIRMED = 'payment_confirmed', 'Payment Confirmed'
     
     request = models.ForeignKey(
         Request,
@@ -1193,3 +1200,76 @@ class AIRun(models.Model):
         
         self.estimated_cost_usd = input_cost + output_cost
         return self.estimated_cost_usd
+
+
+class Ticket(models.Model):
+    """
+    Support ticket for users to report issues or ask for help.
+    """
+    class Status(models.TextChoices):
+        OPEN = 'open', 'Open'
+        IN_PROGRESS = 'in_progress', 'In Progress'
+        RESOLVED = 'resolved', 'Resolved'
+        CLOSED = 'closed', 'Closed'
+
+    class Priority(models.TextChoices):
+        LOW = 'low', 'Low'
+        MEDIUM = 'medium', 'Medium'
+        HIGH = 'high', 'High'
+        URGENT = 'urgent', 'Urgent'
+        
+    class Category(models.TextChoices):
+        TECHNICAL = 'technical', 'Technical Issue'
+        BILLING = 'billing', 'Billing'
+        LEGAL = 'legal', 'Legal Question'
+        OTHER = 'other', 'Other'
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='tickets')
+    request = models.ForeignKey(Request, on_delete=models.SET_NULL, null=True, blank=True, related_name='tickets')
+    subject = models.CharField(max_length=255)
+    description = models.TextField()
+    category = models.CharField(max_length=20, choices=Category.choices, default=Category.OTHER)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.OPEN)
+    priority = models.CharField(max_length=20, choices=Priority.choices, default=Priority.MEDIUM)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    last_email_sent_at = models.DateTimeField(null=True, blank=True, help_text="Last time an email notification was sent for this ticket")
+
+    class Meta:
+        db_table = 'tickets'
+        ordering = ['-created_at']
+        
+    def __str__(self):
+        return f"Ticket #{self.id}: {self.subject}"
+
+
+class TicketMessage(models.Model):
+    """
+    Messages within a support ticket thread.
+    """
+    ticket = models.ForeignKey(Ticket, on_delete=models.CASCADE, related_name='messages')
+    sender = models.ForeignKey(User, on_delete=models.CASCADE, related_name='ticket_messages')
+    message = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_internal = models.BooleanField(default=False, help_text="Internal note for admins only")
+
+    class Meta:
+        db_table = 'ticket_messages'
+        ordering = ['created_at']
+        
+    def __str__(self):
+        return f"Message on #{self.ticket.id} by {self.sender.username}"
+
+
+class TicketAttachment(models.Model):
+    """
+    Files attached to a ticket.
+    """
+    ticket = models.ForeignKey(Ticket, on_delete=models.CASCADE, related_name='attachments')
+    file = models.FileField(upload_to='tickets/%Y/%m/%d/')
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'ticket_attachments'
+

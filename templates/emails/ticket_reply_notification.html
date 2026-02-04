@@ -1,0 +1,28 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Update on Ticket #{{ ticket_id }} - Affidavit Express{% endblock %}
+
+{% block body %}
+<div class="greeting">
+    Hello {{ user_name }},
+</div>
+
+<div class="content">
+    <p>There is a new update on your support ticket.</p>
+</div>
+
+<div class="info-box">
+    <div class="label">Update from</div>
+    <div class="value">{{ sender_name }}</div>
+</div>
+
+<div class="content" style="background-color: #f9fafb; padding: 15px; border-radius: 6px; border-left: 4px solid #3b82f6; margin: 20px 0;">
+    <p style="margin: 0; font-style: italic; color: #4b5563;">"{{ message_preview }}"</p>
+</div>
+
+<div class="cta-container">
+    <a href="{{ site_url }}/tickets/{{ ticket_id }}" class="button">View Full Conversation</a>
+</div>
+
+<p style="color: #4b5563;">Thank you for using Affidavit Express!</p>
+{% endblock %}

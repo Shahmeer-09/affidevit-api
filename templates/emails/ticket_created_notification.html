@@ -1,0 +1,34 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Support Ticket Created - Affidavit Express{% endblock %}
+
+{% block body %}
+<div class="greeting">
+    Hello {{ user_name }},
+</div>
+
+<div class="content">
+    <p>We have received your support ticket and our team will review it shortly.</p>
+</div>
+
+<div class="info-box">
+    <div class="label">Ticket ID</div>
+    <div class="value">#{{ ticket_id }}</div>
+</div>
+
+<div class="info-box">
+    <div class="label">Subject</div>
+    <div class="value">{{ subject }}</div>
+</div>
+
+<div class="info-box">
+    <div class="label">Status</div>
+    <div class="value">{{ status }}</div>
+</div>
+
+<div class="content">
+    <p>We aim to respond to all inquiries within 24 hours. You will receive an email notification when we reply.</p>
+</div>
+
+<p style="color: #4b5563;">Thank you for contacting Affidavit Express Support.</p>
+{% endblock %}
