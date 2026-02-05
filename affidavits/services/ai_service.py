@@ -333,6 +333,7 @@ def draft_affidavit(
 - DO NOT modernize or "improve" the commissioner section format
 - Replace ONLY the {{placeholder}} values with actual data
 - Preserve all static text, legal language, and formatting exactly as shown
+- **CRITICAL: If the template uses "That I am...", "That I have...", "That this..." paragraph format for statements, preserve that format - do NOT convert them to numbered lists (1. 2. 3.) or ordered lists (<ol>).**
 """
         
         # Check if we have a calculated age from DOB validation
@@ -385,7 +386,8 @@ User wrote: "work at hospital" → "employed at the hospital"
    - "IN THE MATTER OF THE STATUTORY DECLARATION ACT"
    - "CHAPTER 7: No 04"
    - Declarant introduction with full name, age, address, and ID number
-   - Numbered factual statements (rephrase user answers into complete, grammatically correct sentences)
+   - Factual statements (rephrase user answers into complete, grammatically correct sentences)
+   - **FORMATTING OF FACTUAL STATEMENTS: If the template uses "That I am..." paragraph format, keep that format - do NOT convert to numbered lists. Only use numbered lists if the template uses them.**
    - Declaration of truth with legal consequences acknowledgment
    - Commissioner attestation section (simple format: "Declared at...", "Before me, Commissioner of Affidavits.")
 3. **Intelligently integrate** the user's details - don't copy-paste their raw text
@@ -699,26 +701,37 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
    - Calculate house age from build date if present
    - ONLY FLAG if residence > age OR residence > house_age
 
-5. **ID FORMAT CHECK (11 DIGITS + DOB VALIDATION):**
-   - Extract ONLY digits from the ID field (remove spaces, dashes, any non-digits)
-   - Count the digits
-   - If digit count == 11 → Extract first 8 digits as YYYYMMDD and validate date
-   - If digit count != 11 → INVALID (flag: "Electoral ID must be 11 digits, you entered X digits")
-   - Example: "19741104044" has 11 digits → Check if 19741104 is valid date → VALID
-   - Example: "1974 11 04 044" has 11 digits → VALID
-   - Example: "123456789" has 9 digits → INVALID (old format, must be 11)
+5. **ID FORMAT CHECK (SUPPORTS MULTIPLE ID TYPES):**
+   Trinidad & Tobago accepts THREE types of ID documents:
    
-   **CROSS-VALIDATE ELECTORAL ID WITH DATE OF BIRTH:**
-   - If electoral_id field exists AND date_of_birth field exists:
+   a) **Electoral ID (11 digits):**
+      - Extract ONLY digits (remove spaces, dashes)
+      - If digit count == 11 → VALID
+      - First 8 digits are DOB (YYYYMMDD), last 3 are sequence
+      - Example: "19900909098" → 11 digits → VALID
+      - Example: "1990 09 09 098" → 11 digits → VALID
+   
+   b) **Driver's Permit (8 digits):**
+      - Extract ONLY digits
+      - If digit count == 8 → VALID
+      - Example: "12345678" → 8 digits → VALID
+   
+   c) **Passport (2 letters + 6 digits):**
+      - Format: Two uppercase letters followed by 6 digits
+      - Examples: "TA123456", "TB987654", "TC456789" → VALID
+   
+   **VALIDATION RULES:**
+   - If format matches ANY of the above → VALID, DO NOT FLAG
+   - If format matches NONE → INVALID, flag with helpful message
+   - For Electoral ID, cross-validate DOB with date_of_birth field if present
+   
+   **CROSS-VALIDATE ELECTORAL ID WITH DATE OF BIRTH (only for 11-digit IDs):**
+   - If electoral_id has 11 digits AND date_of_birth field exists:
      * Extract digits 1-4 (year), 5-6 (month), 7-8 (day) from electoral_id
-     * Format as YYYY-MM-DD (e.g., "19741104" → "1974-11-04")
      * Compare with date_of_birth field value
      * ONLY flag if they are DIFFERENT!
-     * If they MATCH → This is CORRECT, do NOT flag it!
-   - Example: electoral_id="19900614044" + date_of_birth="1990-06-14" → MATCH → VALID, DO NOT FLAG ✅
-   - Example: electoral_id="19741104044" + date_of_birth="1974-11-04" → MATCH → VALID, DO NOT FLAG ✅
-   - Example: electoral_id="19741104044" + date_of_birth="1980-05-15" → MISMATCH → FLAG ERROR ❌
-   - NEVER flag when DOB matches the ID! Only flag when they differ.
+   - Example: electoral_id="19900614044" + date_of_birth="1990-06-14" → MATCH → VALID ✅
+   - Example: electoral_id="19741104044" + date_of_birth="1980-05-15" → MISMATCH → FLAG ❌
 
 **BE STRICT** on future dates and gibberish - these MUST be caught.
 **BE LENIENT** on spelling/grammar - the AI drafter fixes that.
@@ -770,6 +783,243 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
                 })
         
         all_valid = result.get('all_valid', len(invalid_fields) == 0)
+        
+        # PYTHON-BASED DATE AND ID VALIDATION OVERRIDE
+        # Run reliable checking to CORRECT any AI hallucinations
+        import re
+        from datetime import datetime
+        
+        today = datetime.now().date()
+        date_patterns = [
+            r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})',  # DD/MM/YYYY or DD-MM-YYYY
+            r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})',  # YYYY/MM/DD or YYYY-MM-DD
+            r'(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{4})',  # DD Month YYYY
+        ]
+        month_names = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+                       'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
+        
+        # Track fields to remove (AI hallucinations we're correcting)
+        fields_to_remove = []
+        
+        # === MULTI-FIELD DATE VALIDATION ===
+        # Check for declaration_year + declaration_month + declaration_day combinations
+        if 'declaration_year' in answers_json and 'declaration_month' in answers_json and 'declaration_day' in answers_json:
+            try:
+                year_val = answers_json.get('declaration_year', '').strip()
+                month_val = answers_json.get('declaration_month', '').strip().lower()
+                day_val = answers_json.get('declaration_day', '').strip()
+                
+                # Parse year
+                year = int(year_val) if year_val.isdigit() else None
+                
+                # Parse month (name or number)
+                if month_val.isdigit():
+                    month = int(month_val)
+                else:
+                    month = month_names.get(month_val[:3], 0)
+                
+                # Parse day
+                day = int(day_val) if day_val.isdigit() else None
+                
+                if year and month and day:
+                    declaration_date = datetime(year, month, day).date()
+                    is_future = declaration_date > today
+                    
+                    # Check if AI flagged any of these fields
+                    for field in ['declaration_year', 'declaration_month', 'declaration_day']:
+                        ai_flagged = field in invalid_fields
+                        ai_says_future = ai_flagged and any(kw in invalid_fields.get(field, '').lower() for kw in ['future', 'ahead', 'not yet', 'hasn\'t happened'])
+                        
+                        if is_future and not ai_flagged:
+                            # Date IS future but AI missed it - add error
+                            invalid_fields[field] = f'Declaration date {declaration_date.strftime("%B %d, %Y")} is in the future (today is {today.strftime("%B %d, %Y")})'
+                            all_valid = False
+                        elif not is_future and ai_says_future:
+                            # Date is NOT future but AI hallucinated - REMOVE the error
+                            logger.info(f"Python override: Removing AI hallucination for valid date field {field} (combined date: {declaration_date}, today: {today})")
+                            fields_to_remove.append(field)
+            except (ValueError, KeyError) as e:
+                logger.warning(f"Could not parse multi-field date: {e}")
+        
+        for field_name, field_value in answers_json.items():
+            if not isinstance(field_value, str):
+                continue
+            
+            field_lower = field_name.lower()
+            value_lower = field_value.lower().strip()
+            
+            # === ID VALIDATION OVERRIDE ===
+            # Check if AI flagged an ID field - verify with Python
+            if any(kw in field_lower for kw in ['electoral', 'national_id', 'id_number', 'passport', 'permit', 'driver']):
+                value_upper = str(field_value).strip().upper()
+                is_valid_id = False
+                is_electoral_id = False
+                digits_only = None
+                
+                # Check Passport format: 2 letters + 6 digits
+                if re.match(r'^[A-Z]{2}\d{6}$', value_upper):
+                    is_valid_id = True
+                else:
+                    # Check numeric formats (Electoral ID: 11 digits, Driver's Permit: 8 digits)
+                    digits_only = re.sub(r'\D', '', str(field_value))
+                    if len(digits_only) == 11:
+                        is_valid_id = True
+                        is_electoral_id = True
+                    elif len(digits_only) == 8:
+                        is_valid_id = True
+                
+                # Cross-validate Electoral ID with DOB if present
+                if is_electoral_id and digits_only and len(digits_only) == 11:
+                    # Extract DOB from Electoral ID (first 8 digits: YYYYMMDD)
+                    try:
+                        id_year = int(digits_only[0:4])
+                        id_month = int(digits_only[4:6])
+                        id_day = int(digits_only[6:8])
+                        id_dob = datetime(id_year, id_month, id_day).date()
+                        
+                        # Check if there's a separate DOB field
+                        dob_field = None
+                        for dob_key in ['date_of_birth', 'dob', 'birth_date', 'birthdate']:
+                            if dob_key in answers_json:
+                                dob_field = answers_json[dob_key]
+                                break
+                        
+                        if dob_field:
+                            # Parse the DOB field
+                            parsed_dob = None
+                            dob_str = str(dob_field).strip()
+                            
+                            # Try YYYY-MM-DD format
+                            if re.match(r'^\d{4}-\d{2}-\d{2}$', dob_str):
+                                try:
+                                    parsed_dob = datetime.strptime(dob_str, '%Y-%m-%d').date()
+                                except ValueError:
+                                    pass
+                            
+                            # Try DD/MM/YYYY format
+                            if not parsed_dob and re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', dob_str):
+                                try:
+                                    parsed_dob = datetime.strptime(dob_str, '%d/%m/%Y').date()
+                                except ValueError:
+                                    pass
+                            
+                            # Compare DOBs
+                            if parsed_dob:
+                                if parsed_dob != id_dob:
+                                    # DOB mismatch - this is a REAL error
+                                    error_msg = f'Electoral ID indicates birth date {id_dob.strftime("%Y-%m-%d")}, but Date of Birth field shows {parsed_dob.strftime("%Y-%m-%d")}'
+                                    if field_name not in invalid_fields:
+                                        invalid_fields[field_name] = error_msg
+                                        all_valid = False
+                                        logger.info(f"Python validation: Electoral ID DOB mismatch - ID: {id_dob}, DOB field: {parsed_dob}")
+                                    is_valid_id = False  # Don't remove AI error if there's a mismatch
+                                else:
+                                    # DOBs MATCH - this is correct, remove any AI error about mismatch
+                                    if field_name in invalid_fields:
+                                        ai_error = invalid_fields.get(field_name, '').lower()
+                                        if 'birth' in ai_error or 'dob' in ai_error or 'date of birth' in ai_error:
+                                            logger.info(f"Python override: Removing AI hallucination for Electoral ID {field_name} - DOBs match correctly (ID: {id_dob}, DOB: {parsed_dob})")
+                                            fields_to_remove.append(field_name)
+                    except (ValueError, IndexError) as e:
+                        logger.warning(f"Could not parse Electoral ID DOB: {e}")
+                
+                # If valid ID format and no DOB mismatch, but AI flagged it, remove the AI error
+                if is_valid_id and field_name in invalid_fields:
+                    # Only remove if it's a format error, not a DOB mismatch
+                    ai_error = invalid_fields.get(field_name, '').lower()
+                    if 'format' in ai_error or 'digit' in ai_error or 'invalid' in ai_error:
+                        logger.info(f"Python override: Removing AI hallucination for valid ID field {field_name}")
+                        fields_to_remove.append(field_name)
+                # If invalid ID and AI didn't catch it, add error
+                elif not is_valid_id and field_name not in invalid_fields:
+                    invalid_fields[field_name] = f'Invalid ID format. Accepted: Electoral ID (11 digits), Driver\'s Permit (8 digits), or Passport (2 letters + 6 digits)'
+                    all_valid = False
+                continue
+            
+            # === DATE VALIDATION OVERRIDE ===
+            # Skip DOB fields (always in the past)
+            if 'birth' in field_lower or 'dob' in field_lower:
+                continue
+            
+            # Check fields that contain dates
+            if any(kw in field_lower for kw in ['date', 'when', 'occurred', 'incident', 'event', 'declaration', 'year']):
+                parsed_date = None
+                
+                # Try Month DD, YYYY pattern (e.g., "January 06, 2026", "January 6, 2026")
+                match = re.search(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{1,2}),?\s+(\d{4})', value_lower, re.IGNORECASE)
+                if match:
+                    try:
+                        month = month_names.get(match.group(1).lower()[:3], 0)
+                        day = int(match.group(2))
+                        year = int(match.group(3))
+                        if month > 0:
+                            parsed_date = datetime(year, month, day).date()
+                    except (ValueError, KeyError):
+                        pass
+                
+                # Try DD Month YYYY pattern (e.g., "06 January 2026")
+                if not parsed_date:
+                    match = re.search(r'(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{4})', value_lower, re.IGNORECASE)
+                    if match:
+                        try:
+                            day = int(match.group(1))
+                            month = month_names.get(match.group(2).lower()[:3], 0)
+                            year = int(match.group(3))
+                            if month > 0:
+                                parsed_date = datetime(year, month, day).date()
+                        except (ValueError, KeyError):
+                            pass
+                
+                # Try DD/MM/YYYY pattern
+                if not parsed_date:
+                    match = re.search(date_patterns[0], field_value)
+                    if match:
+                        try:
+                            day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                            parsed_date = datetime(year, month, day).date()
+                        except ValueError:
+                            pass
+                
+                # Try YYYY-MM-DD pattern
+                if not parsed_date:
+                    match = re.search(date_patterns[1], field_value)
+                    if match:
+                        try:
+                            year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                            parsed_date = datetime(year, month, day).date()
+                        except ValueError:
+                            pass
+                
+                if parsed_date:
+                    is_future = parsed_date > today
+                    ai_flagged = field_name in invalid_fields
+                    ai_says_future = ai_flagged and any(kw in invalid_fields.get(field_name, '').lower() for kw in ['future', 'ahead', 'not yet', 'hasn\'t happened', 'current date'])
+                    
+                    if is_future and not ai_flagged:
+                        # Date IS future but AI missed it - add error
+                        invalid_fields[field_name] = f'Date cannot be in the future. You entered {field_value}, but today is {today.strftime("%B %d, %Y")}'
+                        validation_notes.append({
+                            'type': 'field_error',
+                            'field': field_name,
+                            'value': field_value,
+                            'issue': f'Future date detected: {field_value} is after today ({today.strftime("%B %d, %Y")})',
+                            'suggestion': f'Please enter a date on or before {today.strftime("%B %d, %Y")}'
+                        })
+                        all_valid = False
+                    elif not is_future and ai_says_future:
+                        # Date is NOT future but AI hallucinated - REMOVE the error
+                        logger.info(f"Python override: Removing AI hallucination for valid date field {field_name} (value: {field_value}, parsed: {parsed_date}, today: {today})")
+                        fields_to_remove.append(field_name)
+        
+        # Remove AI hallucinations
+        for field_name in fields_to_remove:
+            if field_name in invalid_fields:
+                del invalid_fields[field_name]
+            # Also remove from validation_notes
+            validation_notes[:] = [note for note in validation_notes if note.get('field') != field_name]
+        
+        # Recalculate all_valid after removing hallucinations
+        all_valid = len(invalid_fields) == 0
         
         logger.info(f"Pre-submission validation for {affidavit_type_name}: "
                    f"all_valid={all_valid}, invalid_fields={list(invalid_fields.keys())}")
@@ -863,18 +1113,75 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
             value = field_value.lower().strip()
             field_lower = field_name.lower()
             
-            # Check ID number format (should be 11 digits for T&T Electoral ID: YYYYMMDDXXX)
-            if 'electoral' in field_lower or 'national_id' in field_lower or 'id_number' in field_lower:
+            # Check ID number format - supports multiple Trinidad & Tobago ID types:
+            # 1. Electoral ID: 11 digits (YYYYMMDDXXX)
+            # 2. Driver's Permit: 8 digits
+            # 3. Passport: 2 letters + 6 digits (e.g., TA123456)
+            if 'electoral' in field_lower or 'national_id' in field_lower or 'id_number' in field_lower or 'passport' in field_lower or 'permit' in field_lower or 'driver' in field_lower:
+                value_upper = str(field_value).strip().upper()
+                
+                # Check for Passport format: 2 letters + 6 digits (e.g., TA123456, TB987654)
+                if re.match(r'^[A-Z]{2}\d{6}$', value_upper):
+                    continue  # Valid passport format
+                
+                # Check for numeric ID formats (Electoral ID or Driver's Permit)
                 digits_only = re.sub(r'\D', '', str(field_value))
-                if len(digits_only) != 11:
-                    fallback_invalid_fields[field_name] = f'Electoral ID must be exactly 11 digits (you entered {len(digits_only)})'
+                
+                # Valid formats: 11 digits (Electoral ID) or 8 digits (Driver's Permit)
+                if len(digits_only) == 11 or len(digits_only) == 8:
+                    continue  # Valid ID format
+                
+                # Invalid format - provide helpful error message
+                fallback_invalid_fields[field_name] = f'Invalid ID format. Accepted formats: Electoral ID (11 digits), Driver\'s Permit (8 digits), or Passport (2 letters + 6 digits like TA123456)'
+                fallback_notes.append({
+                    'type': 'field_error',
+                    'field': field_name,
+                    'value': field_value,
+                    'issue': f'ID format not recognized. You entered: "{field_value}"',
+                    'suggestion': 'Enter one of: Electoral ID (11 digits, e.g., 19900909098), Driver\'s Permit (8 digits), or Passport (2 letters + 6 digits, e.g., TA123456)',
+                    'correct_format': 'Electoral: 19900909098, Driver: 12345678, Passport: TA123456'
+                })
+                continue
+            
+            # Date validation - check for future dates
+            if any(kw in field_lower for kw in ['date', 'when', 'occurred', 'incident', 'event']) and 'birth' not in field_lower and 'dob' not in field_lower:
+                from datetime import datetime
+                today = datetime.now().date()
+                date_patterns = [
+                    (r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', 'dmy'),  # DD/MM/YYYY
+                    (r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', 'ymd'),  # YYYY-MM-DD
+                    (r'(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{4})', 'dmy_text'),
+                ]
+                month_names = {'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+                               'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12}
+                
+                parsed_date = None
+                for pattern, fmt in date_patterns:
+                    match = re.search(pattern, field_value, re.IGNORECASE)
+                    if match:
+                        try:
+                            if fmt == 'dmy':
+                                day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                            elif fmt == 'ymd':
+                                year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                            else:  # dmy_text
+                                day = int(match.group(1))
+                                month = month_names.get(match.group(2).lower()[:3], 0)
+                                year = int(match.group(3))
+                            if month > 0:
+                                parsed_date = datetime(year, month, day).date()
+                                break
+                        except ValueError:
+                            pass
+                
+                if parsed_date and parsed_date > today:
+                    fallback_invalid_fields[field_name] = f'Date cannot be in the future. You entered {field_value}, but today is {today.strftime("%B %d, %Y")}'
                     fallback_notes.append({
                         'type': 'field_error',
                         'field': field_name,
                         'value': field_value,
-                        'issue': f'Trinidad & Tobago Electoral ID must be exactly 11 digits (format: YYYYMMDDXXX). You entered {len(digits_only)} digits.',
-                        'suggestion': 'Enter your 11-digit Electoral ID. First 8 digits are your date of birth.',
-                        'correct_format': '19901234567'
+                        'issue': f'Future date detected: {field_value} is after today ({today.strftime("%B %d, %Y")})',
+                        'suggestion': f'Please enter a date on or before {today.strftime("%B %d, %Y")}'
                     })
                     continue
             

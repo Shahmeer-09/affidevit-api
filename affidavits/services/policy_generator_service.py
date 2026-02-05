@@ -278,7 +278,18 @@ CRITICAL RULES - TEMPLATE MUST MATCH EXAMPLE FORMAT EXACTLY:
    - DO NOT modernize or "improve" the format - replicate it exactly
    - Maintain the exact ordering of sections as seen in examples
 
-2. **Commissioner/Attestation Section - CRITICAL:**
+2. **HEADINGS MUST BE BOLD (CRITICAL):**
+   - ALL document headings and titles MUST be wrapped in <strong> tags
+   - Examples of headings that MUST be bold:
+     * "REPUBLIC OF TRINIDAD AND TOBAGO:" → <strong>REPUBLIC OF TRINIDAD AND TOBAGO:</strong>
+     * "IN THE MATTER OF THE STATUTORY DECLARATION ACT" → <strong>IN THE MATTER OF THE STATUTORY DECLARATION ACT</strong>
+     * "CHAPTER 7: No 04" → <strong>CHAPTER 7: No 04</strong>
+     * "AFFIDAVIT" or any title → <strong>AFFIDAVIT</strong>
+   - Any text that appears as a header, title, or legal reference at the top of the document should be bold
+   - The body text (declarations, statements) should NOT be bold
+   - "Before me," and "Commissioner of Affidavits." can remain non-bold
+
+3. **Commissioner/Attestation Section - CRITICAL:**
    - Copy the EXACT format from the examples for the commissioner section
    - If examples use simple format like:
      ```
@@ -293,17 +304,17 @@ CRITICAL RULES - TEMPLATE MUST MATCH EXAMPLE FORMAT EXACTLY:
    - DO NOT add "Commissioner / Notary Public" or "Deponent Signature" labels if not in examples
    - The commissioner section is for official stamp only - keep it simple as shown
 
-3. **Placeholder Format:**
+4. **Placeholder Format:**
    - Use {{field_name}} format (double curly braces)
    - Field names should be snake_case (e.g., {{full_name}}, {{date_of_birth}})
    - Replace ONLY variable data with placeholders, preserve all static text exactly
 
-4. **Content Preservation:**
+5. **Content Preservation:**
    - Keep all legal language, references, and declarations exactly as in examples
    - Numbered statements should follow the same numbering style as examples
    - Preserve paragraph structure and formatting
 
-5. **What to Extract as Fields:**
+6. **What to Extract as Fields:**
    - Personal details (name, age, address, ID numbers)
    - Dates (declaration date, relevant dates in the content)
    - Location information

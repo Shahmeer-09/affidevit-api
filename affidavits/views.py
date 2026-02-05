@@ -1753,17 +1753,16 @@ class DownloadPDFView(APIView):
         else:
             request_obj = get_object_or_404(Request, pk=pk, user=user)
         
-        # Check if PDF exists
-        if not request_obj.pdf_file:
-            # Generate PDF if not exists (allow NEEDS_REVIEW for draft preview)
-            if request_obj.status not in [Request.Status.APPROVED, Request.Status.COMPLETED, Request.Status.NEEDS_REVIEW, Request.Status.DRAFT_READY]:
+        # Always regenerate PDF to ensure latest content and styling is used
+        if request_obj.status not in [Request.Status.APPROVED, Request.Status.COMPLETED, Request.Status.NEEDS_REVIEW, Request.Status.DRAFT_READY]:
+            if not request_obj.pdf_file:
                 return Response(
                     {'error': 'PDF not available for this request'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            
-            # Need draft_text to generate PDF
-            if not request_obj.draft_text:
+        else:
+            # Need draft_text or final_text to generate PDF
+            if not request_obj.draft_text and not request_obj.final_text:
                 return Response(
                     {'error': 'No draft available to generate PDF'},
                     status=status.HTTP_400_BAD_REQUEST

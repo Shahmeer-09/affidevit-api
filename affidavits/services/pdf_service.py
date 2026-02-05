@@ -410,10 +410,20 @@ def get_default_pdf_css() -> str:
     ol {
         margin-left: 20pt;
         margin-bottom: 10pt;
+        list-style-type: decimal;
+        padding-left: 20pt;
+    }
+    
+    ul {
+        margin-left: 20pt;
+        margin-bottom: 10pt;
+        list-style-type: disc;
+        padding-left: 20pt;
     }
     
     li {
         margin-bottom: 8pt;
+        margin-left: 5pt;
     }
     
     .header {
@@ -543,6 +553,23 @@ def generate_pdf_from_html(
         # Add custom CSS if provided
         if custom_css:
             full_html = full_html.replace('</style>', f'{custom_css}</style>')
+        
+        # FIX: xhtml2pdf doesn't render list numbers when <li> contains <p> tags
+        # Remove <p> tags from inside <li> elements
+        import re
+        # Pattern to match <li><p>content</p></li> and replace with <li>content</li>
+        full_html = re.sub(r'<li>\s*<p>(.*?)</p>\s*</li>', r'<li>\1</li>', full_html, flags=re.DOTALL)
+        
+        # Debug: Log the HTML content being converted
+        logger.info(f"[PDF_HTML_DEBUG] Converting HTML to PDF")
+        logger.info(f"[PDF_HTML_DEBUG] Has <ol> in full_html: {'<ol>' in full_html}")
+        logger.info(f"[PDF_HTML_DEBUG] Has <li> in full_html: {'<li>' in full_html}")
+        
+        # Log the body content (skip CSS)
+        body_start = full_html.find('<body>')
+        if body_start > 0:
+            body_content = full_html[body_start:body_start+2000]
+            logger.info(f"[PDF_HTML_DEBUG] Body content (first 2000 chars): {body_content}")
         
         # Create PDF
         result = io.BytesIO()
