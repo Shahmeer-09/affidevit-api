@@ -338,7 +338,7 @@ class User(AbstractUser):
         
         Priority:
         1. If is_superuser=True (e.g., from createsuperuser), force role to Admin
-        2. Otherwise, sync is_staff/is_superuser based on role
+        2. Otherwise, sync is_staff based on role (do NOT auto-enable superuser)
         """
         # Handle Django's createsuperuser command - it sets is_superuser before save
         if self.is_superuser:
@@ -346,7 +346,6 @@ class User(AbstractUser):
             self.is_staff = True
         # Sync permissions based on role
         elif self.role == self.Role.ADMIN:
-            self.is_superuser = True
             self.is_staff = True
         elif self.role == self.Role.REVIEWER:
             self.is_superuser = False
@@ -1031,6 +1030,72 @@ class ReviewerEdit(models.Model):
         }
 
 
+class ReviewerFeedback(models.Model):
+    """Minimal reviewer feedback notes for improving future prompts (offline learning loop)."""
+
+    class Category(models.TextChoices):
+        GRAMMAR = 'grammar', 'Grammar/Spelling'
+        LEGAL_ERROR = 'legal_error', 'Legal Error'
+        MISSING_INFO = 'missing_info', 'Missing Information'
+        CONTRADICTION = 'contradiction', 'Contradiction'
+        FORMATTING = 'formatting', 'Formatting Issue'
+        INAPPROPRIATE = 'inappropriate', 'Inappropriate Content'
+        OTHER = 'other', 'Other'
+
+    request = models.ForeignKey(
+        Request,
+        on_delete=models.CASCADE,
+        related_name='reviewer_feedback'
+    )
+    reviewer = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='feedback_given',
+        limit_choices_to={'role': User.Role.REVIEWER}
+    )
+    category = models.CharField(
+        max_length=30,
+        choices=Category.choices,
+        default=Category.OTHER
+    )
+    message = models.TextField(
+        help_text='Minimal, actionable feedback (keep short and specific)'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'reviewer_feedback'
+        verbose_name = 'Reviewer Feedback'
+        verbose_name_plural = 'Reviewer Feedback'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Feedback: {self.request.request_code} - {self.get_category_display()}"
+
+
+class SubmitFeedback(models.Model):
+    """Generic feedback entries submitted via admin tools or marketing pages."""
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name='submitted_feedback',
+        blank=True,
+        null=True,
+    )
+    subject = models.CharField(max_length=200)
+    message = models.TextField()
+    email = models.EmailField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'submit_feedback'
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        display = self.user.get_full_name() or self.user.username if self.user else (self.email or 'anonymous')
+        return f"{self.subject} ({display})"
+
 class RequestEvent(models.Model):
     """
     Audit trail for request actions.
@@ -1273,3 +1338,38 @@ class TicketAttachment(models.Model):
     class Meta:
         db_table = 'ticket_attachments'
 
+class CommissionerSlot(models.Model):
+    """
+    Represents a 30-minute availability slot for a commissioner.
+    Unique per commissioner per start_time.
+    """
+    commissioner = models.ForeignKey(
+        User, 
+        on_delete=models.CASCADE, 
+        related_name='slots',
+        limit_choices_to={'role': User.Role.COMMISSIONER}
+    )
+    request = models.OneToOneField(
+        Request, 
+        on_delete=models.SET_NULL, 
+        null=True, 
+        blank=True, 
+        related_name='appointment_slot'
+    )
+    start_time = models.DateTimeField(db_index=True)
+    is_booked = models.BooleanField(default=False)
+    
+    class Meta:
+        db_table = 'commissioner_slots'
+        verbose_name = 'Commissioner Slot'
+        verbose_name_plural = 'Commissioner Slots'
+        ordering = ['start_time']
+        unique_together = ['commissioner', 'start_time']
+        indexes = [
+            models.Index(fields=['commissioner', 'start_time']),
+            models.Index(fields=['start_time']),
+        ]
+
+    def __str__(self):
+        status = "Booked" if self.is_booked else "Available"
+        return f"{self.commissioner.username} - {self.start_time} ({status})"

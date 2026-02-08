@@ -152,6 +152,19 @@ class IsAdminUser(permissions.BasePermission):
         return request.user.role == 'admin'
 
 
+class IsSuperUser(permissions.BasePermission):
+    """
+    Allow access only to superusers.
+    Used for super-admin only actions (decision tree + affidavit type management).
+    """
+    message = "Superuser access required."
+    
+    def has_permission(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return False
+        return bool(request.user.is_superuser)
+
+
 class IsOwnerOrAdmin(permissions.BasePermission):
     """
     Object-level permission: allow access only to the owner or admins.

@@ -159,7 +159,8 @@ def process_request_async(self, request_id: int):
                 request.status = Request.Status.APPROVED
                 request.final_text = request.draft_text
             else:
-                request.status = Request.Status.NEEDS_REVIEW
+                # User needs to schedule appointment and pay before review
+                request.status = Request.Status.DRAFT_READY
         elif qa_status == 'needs_clarification':
             request.status = Request.Status.NEEDS_CLARIFICATION
         else:
@@ -419,3 +420,31 @@ def generate_policy_async(self, affidavit_type_id, html_examples, additional_con
         logger.exception(f"Error in generate_policy_async: {exc}")
         # Retry on failure
         raise self.retry(exc=exc)
+
+
+@shared_task
+def generate_daily_slots():
+    """
+    Periodic task to generate daily slots for all commissioners.
+    Maintains a rolling window of availability.
+    Run daily via Celery Beat.
+    """
+    from affidavits.models import User
+    from affidavits.services.slot_service import generate_slots_for_commissioner
+    
+    try:
+        logger.info("Starting daily slot generation...")
+        commissioners = User.objects.filter(role=User.Role.COMMISSIONER)
+        total_slots = 0
+        
+        for commissioner in commissioners:
+            # Generate next 14 days (rolling window) and clean up unbooked future slots first
+            slots_created = generate_slots_for_commissioner(commissioner, days=14, cleanup=True)
+            total_slots += slots_created
+            
+        logger.info(f"Daily slot generation completed. Created {total_slots} new slots.")
+        return {'success': True, 'slots_created': total_slots}
+        
+    except Exception as exc:
+        logger.exception(f"Error generating daily slots: {exc}")
+        return {'success': False, 'error': str(exc)}

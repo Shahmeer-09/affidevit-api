@@ -14,11 +14,41 @@ import logging
 import re
 from typing import Dict, List, Optional
 from django.conf import settings
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = logging.getLogger(__name__)
 
 # Lazy import openai
 openai_client = None
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((ConnectionError, TimeoutError, Exception)),
+    before_sleep=lambda retry_state: logger.warning(f"OpenAI API retry {retry_state.attempt_number}/3 in policy generator after error: {retry_state.outcome.exception()}")
+)
+def call_openai_with_retry(client, model, messages, **kwargs):
+    """
+    Wrapper for OpenAI API calls with retry logic and exponential back-off.
+    
+    Args:
+        client: OpenAI client instance
+        model: OpenAI model name
+        messages: List of message dictionaries
+        **kwargs: Additional parameters for the API call
+        
+    Returns:
+        OpenAI API response
+        
+    Raises:
+        Exception: If all retries are exhausted
+    """
+    return client.chat.completions.create(
+        model=model,
+        messages=messages,
+        **kwargs
+    )
 
 # =============================================================================
 # TRINIDAD & TOBAGO SPECIFIC VALIDATION RULES
@@ -394,19 +424,21 @@ For each detected_field, include a "validation" object:
 - This ensures we capture ALL possible information needs across all document variations
 - The more fields you detect, the better - don't skip any information that varies between documents
 
-**CRITICAL - EVERY FIELD MUST HAVE HELP TEXT AND PLACEHOLDER:**
-- ALL fields must include helpful "help_text" explaining what to enter
-- ALL fields must include "placeholder" showing an example value
-- Make help_text clear and user-friendly
-- Make placeholders realistic examples that match Trinidad & Tobago format
+**CRITICAL - EVERY FIELD MUST HAVE LABEL, HELP TEXT, AND PLACEHOLDER:**
+- Each detected_field MUST include:
+  - label: User-friendly question/title (no jargon, Title Case, specific)
+  - help_text: One short sentence telling the user exactly what to enter (and why, if useful)
+  - placeholder: Realistic example value, formatted for Trinidad & Tobago
+- If the source text is vague (e.g., "number", "details"), rewrite into a precise label (e.g., "Vehicle Registration Number", "Describe the incident in 2–3 sentences").
+- Do NOT leave labels/help_text/placeholder empty. Fill them with clear guidance.
 
-Examples of good help_text and placeholders:
-- Date of Birth: help_text="Your age will be calculated automatically from your date of birth", placeholder=""
-- Full Name: help_text="Enter your full legal name as it appears on your ID", placeholder="John Michael Smith"
-- Address: help_text="Your current residential address in Trinidad & Tobago", placeholder="15 Queen Street, Port of Spain"
-- Electoral ID: help_text="Your 9-digit Trinidad & Tobago ID number", placeholder="123456789"
-- Phone: help_text="Your contact number including area code", placeholder="868-123-4567"
-- Email: help_text="Your email address for notifications", placeholder="your.email@example.com"
+Examples of good label/help_text/placeholder:
+- Date of Birth: label="Date of Birth", help_text="Select your date of birth; your age is calculated automatically.", placeholder="1990-06-14"
+- Full Name: label="Full Name", help_text="Enter your full legal name as on your ID.", placeholder="John Michael Smith"
+- Address: label="Residential Address", help_text="Enter your current residential address in Trinidad & Tobago.", placeholder="15 Queen Street, Port of Spain"
+- Electoral ID: label="Electoral ID (11 digits)", help_text="11 digits in YYYYMMDDXXX format (first 8 = date of birth).", placeholder="19741104044"
+- Phone: label="Phone Number", help_text="Enter a Trinidad & Tobago phone number (868-XXX-XXXX).", placeholder="868-123-4567"
+- Email: label="Email Address", help_text="Enter your email to receive updates.", placeholder="your.email@example.com"
 
 **CRITICAL - SELECT FIELDS MUST INCLUDE OPTIONS:**
 For fields with type "select", you MUST include the "options" array.
@@ -592,7 +624,8 @@ IMPORTANT:
 Generate the policy configuration JSON as specified.
 Remember: Only include NEW fields in detected_fields that are not already covered by existing questions."""
 
-        response = client.chat.completions.create(
+        response = call_openai_with_retry(
+            client=client,
             model=settings.OPENAI_QA_MODEL,  # Use GPT-4o for analysis
             messages=[
                 {"role": "system", "content": POLICY_GENERATION_SYSTEM_PROMPT},
@@ -754,7 +787,8 @@ Admin Feedback:
 
 Provide the updated policy JSON:"""
 
-        response = client.chat.completions.create(
+        response = call_openai_with_retry(
+            client=client,
             model=settings.OPENAI_QA_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -840,7 +874,8 @@ def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> Lis
                         'date_constraint': 'past_only',
                         'message': 'Date of birth cannot be in the future'
                     }),
-                    '_converted_from': 'age'  # Mark that this was converted from age
+                    '_converted_from': 'age',  # Mark that this was converted from age
+                    'type_locked': True  # Prevent frontend from overriding backend type
                 }
                 intake_schema.append(question)
                 has_dob_field = True
@@ -853,6 +888,7 @@ def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> Lis
             'required': field.get('required', True),
             'placeholder': field.get('placeholder', ''),
             'help_text': field.get('help_text', ''),
+            'type_locked': True  # Prevent frontend from overriding backend type
         }
         
         # Start with any validation from the AI
@@ -908,11 +944,14 @@ def apply_smart_validation(field_id: str, field_label: str, existing_validation:
                 if key not in validation:
                     validation[key] = value
             
-            # Update field type if specified
-            if 'type' in rules and question['type'] == 'text':
-                new_type = rules['type']
-                if new_type in ['date', 'number', 'email', 'phone', 'select']:
-                    question['type'] = new_type
+            # Update field type if specified AND not locked by backend
+            if 'type' in rules and not question.get('type_locked', False):
+                current_type = question.get('type', 'text')
+                # Only override if it's the default 'text' type (not user-set)
+                if current_type == 'text':
+                    new_type = rules['type']
+                    if new_type in ['date', 'number', 'email', 'phone', 'select']:
+                        question['type'] = new_type
             
             # Add placeholder if not set
             if not question.get('placeholder') and 'placeholder' in rules:
@@ -973,12 +1012,25 @@ def enhance_field_with_tt_rules(field: Dict) -> Dict:
     field_id = field.get('id', '').lower()
     field_label = field.get('label', '').lower()
     
+    # Debug logging for property_age field
+    if 'property_age' in field_id or 'property age' in field_label.lower():
+        logger.info(f"DEBUG: Processing property_age field - ID: {field_id}, Label: {field_label}, Type: {field.get('type')}, type_locked: {field.get('type_locked')}")
+    
+    # Preserve admin-defined type before smart rules run
+    if 'type_locked' not in field:
+        field['type_locked'] = True
+    
     # Get or create validation
     validation = field.get('validation', {})
     
-    # Apply smart validation
+    # Apply smart validation (respect type_locked flag)
     validation = apply_smart_validation(field_id, field_label, validation, field)
     
+    # Debug logging after smart validation
+    if 'property_age' in field_id or 'property age' in field_label.lower():
+        logger.info(f"DEBUG: After smart validation - Type: {field.get('type')}, type_locked: {field.get('type_locked')}")
+    
+    # Add validation if we have any
     if validation:
         field['validation'] = validation
     
@@ -1012,10 +1064,13 @@ def build_policy_json_from_generation(generation_result: Dict) -> Dict:
     if not generation_result.get('success'):
         return {}
     
+    detected_fields = _apply_field_defaults(generation_result.get('detected_fields', []))
+
     policy = {
         'required_sections': generation_result.get('required_sections', []),
         'validation_rules': generation_result.get('validation_rules', []),
         'few_shot_examples': [],
+        'detected_fields': detected_fields,
     }
     
     # Add few-shot example if generated
@@ -1024,3 +1079,103 @@ def build_policy_json_from_generation(generation_result: Dict) -> Dict:
         policy['few_shot_examples'].append(few_shot)
     
     return policy
+
+
+# ---------------------------------------------------------------------------
+# Helpers: enforce label/help_text/placeholder defaults for detected_fields
+# ---------------------------------------------------------------------------
+
+FIELD_DEFAULTS = {
+    'full_name': {
+        'label': 'Full Name',
+        'placeholder': 'John Michael Smith',
+        'help_text': 'Enter your full legal name as on your ID.'
+    },
+    'date_of_birth': {
+        'label': 'Date of Birth',
+        'placeholder': '1990-06-14',
+        'help_text': 'Select your date of birth; your age is calculated automatically.'
+    },
+    'address': {
+        'label': 'Residential Address',
+        'placeholder': '15 Queen Street, Port of Spain',
+        'help_text': 'Enter your current residential address in Trinidad & Tobago.'
+    },
+    'phone': {
+        'label': 'Phone Number',
+        'placeholder': '868-123-4567',
+        'help_text': 'Enter a Trinidad & Tobago phone number (868-XXX-XXXX).'
+    },
+    'email': {
+        'label': 'Email Address',
+        'placeholder': 'your.email@example.com',
+        'help_text': 'Enter your email to receive updates.'
+    },
+    'electoral_id': {
+        'label': 'Electoral ID (11 digits)',
+        'placeholder': '19741104044',
+        'help_text': '11 digits in YYYYMMDDXXX format (first 8 = date of birth).'
+    },
+    'national_id': {
+        'label': 'National ID (11 digits)',
+        'placeholder': '19741104044',
+        'help_text': '11 digits in YYYYMMDDXXX format (first 8 = date of birth).'
+    },
+    'passport': {
+        'label': 'Passport Number',
+        'placeholder': 'TB1234567',
+        'help_text': '2 letters + 7 digits (e.g., TB1234567).'
+    },
+    'drivers_permit': {
+        'label': "Driver's Permit Number",
+        'placeholder': 'DL123456',
+        'help_text': "Enter the number from your driver's permit."
+    },
+    'declaration_month': {
+        'label': 'Declaration Month',
+        'placeholder': 'February',
+        'help_text': 'Select the month of declaration.'
+    },
+    'declaration_day': {
+        'label': 'Declaration Day',
+        'placeholder': '14',
+        'help_text': 'Enter the day of the month (1–31).'
+    },
+    'declaration_year': {
+        'label': 'Declaration Year',
+        'placeholder': '2026',
+        'help_text': 'Enter the 4-digit year.'
+    },
+}
+
+
+def _title_from_id(field_id: str) -> str:
+    return ' '.join(part.capitalize() for part in field_id.split('_')) if field_id else ''
+
+
+def _apply_field_defaults(detected_fields: List[Dict]) -> List[Dict]:
+    updated = []
+    for field in detected_fields or []:
+        field_id = field.get('id', '').strip()
+        defaults = FIELD_DEFAULTS.get(field_id, {})
+
+        # Label
+        if not field.get('label'):
+            field['label'] = defaults.get('label') or _title_from_id(field_id)
+
+        # Placeholder
+        if not field.get('placeholder'):
+            field['placeholder'] = defaults.get('placeholder') or ''
+
+        # Help text
+        if not field.get('help_text'):
+            # If type-specific default exists
+            if defaults.get('help_text'):
+                field['help_text'] = defaults['help_text']
+            else:
+                # Generic fallback
+                field['help_text'] = f"Enter your {field.get('label', field_id).lower()}."
+
+        updated.append(field)
+
+    return updated

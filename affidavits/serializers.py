@@ -8,12 +8,14 @@ from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from .models import (
-    AffidavitType, 
-    DecisionTreeNode, 
-    Request, 
-    Stamp, 
-    FrictionReport, 
+    User,
+    AffidavitType,
+    DecisionTreeNode,
+    Request,
     ReviewerEdit,
+    CommissionerSlot,
+    ReviewerFeedback,
+    SubmitFeedback,
     RequestEvent,
     AIRun,
     AIBaseInstruction,
@@ -21,7 +23,9 @@ from .models import (
     SiteSettings,
     Ticket,
     TicketMessage,
-    TicketAttachment
+    TicketAttachment,
+    Stamp,
+    FrictionReport,
 )
 
 User = get_user_model()
@@ -41,7 +45,7 @@ class UserSerializer(serializers.ModelSerializer):
         model = User
         fields = [
             'id', 'username', 'email', 'first_name', 'last_name', 
-            'full_name', 'role', 'phone_number',
+            'full_name', 'role', 'phone_number', 'is_superuser',
             # Commissioner-specific fields
             'commission_number', 'commission_expiry', 'organization',
             'bio', 'address', 'availability',
@@ -788,6 +792,46 @@ class AdminDecisionTreePathSerializer(serializers.Serializer):
 
 
 # =============================================================================
+# Guest Auth Serializers
+# =============================================================================
+
+class GuestSignupStartSerializer(serializers.Serializer):
+    """Serializer for starting guest signup (sending OTP)."""
+    email = serializers.EmailField()
+    full_name = serializers.CharField(max_length=150)
+    phone_number = serializers.CharField(max_length=20, required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        email = attrs.get('email')
+        phone_number = (attrs.get('phone_number') or '').strip()
+
+        errors = {}
+
+        if email and User.objects.filter(email__iexact=email).exists():
+            errors['email'] = 'An account with this email already exists. Please sign in instead.'
+
+        if phone_number and User.objects.filter(phone_number=phone_number).exists():
+            errors['phone_number'] = 'An account with this phone number already exists. Please sign in instead.'
+
+        if errors:
+            raise serializers.ValidationError(errors)
+
+        attrs['phone_number'] = phone_number
+        return attrs
+
+
+class GuestSignupVerifySerializer(serializers.Serializer):
+    """Serializer for verifying guest OTP and creating account."""
+    email = serializers.EmailField()
+    otp = serializers.CharField(max_length=6)
+    full_name = serializers.CharField(max_length=150)
+    phone_number = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    affidavit_type_id = serializers.IntegerField()
+    answers_json = serializers.JSONField()
+    draft_text = serializers.CharField(required=False, allow_blank=True)
+
+
+# =============================================================================
 # Request Serializers
 # =============================================================================
 
@@ -942,6 +986,11 @@ class RequestDetailSerializer(serializers.ModelSerializer):
     commissioner = serializers.SerializerMethodField()
     is_locked = serializers.SerializerMethodField()
     lock_holder_name = serializers.SerializerMethodField()
+    appointment_date = serializers.DateTimeField(
+        source='appointment_slot.start_time', 
+        read_only=True, 
+        allow_null=True
+    )
     
     class Meta:
         model = Request
@@ -955,7 +1004,7 @@ class RequestDetailSerializer(serializers.ModelSerializer):
             'user_edits_json', 'time_to_complete_seconds', 'pdf_url',
             'locked_by', 'locked_at', 'is_locked', 'lock_holder_name',
             'pdf_file', 'is_paid', 'user_paid_at', 'created_at', 'updated_at', 'submitted_at',
-            'approved_at', 'completed_at'
+            'approved_at', 'completed_at', 'appointment_date'
         ]
         read_only_fields = [
             'id', 'request_code', 'policy_version_used', 
@@ -965,11 +1014,20 @@ class RequestDetailSerializer(serializers.ModelSerializer):
     
     def get_commissioner(self, obj):
         if obj.commissioner:
+            profile_image_url = None
+            if obj.commissioner.profile_image:
+                request = self.context.get('request')
+                if request:
+                    profile_image_url = request.build_absolute_uri(obj.commissioner.profile_image.url)
+                else:
+                    profile_image_url = obj.commissioner.profile_image.url
+
             return {
                 'id': obj.commissioner.id,
                 'first_name': obj.commissioner.first_name,
                 'last_name': obj.commissioner.last_name,
-                'full_name': obj.commissioner.get_full_name() or f"{obj.commissioner.first_name} {obj.commissioner.last_name}"
+                'full_name': obj.commissioner.get_full_name() or f"{obj.commissioner.first_name} {obj.commissioner.last_name}",
+                'profile_image_url': profile_image_url
             }
         return None
     
@@ -1142,6 +1200,55 @@ class ReviewerEditCreateSerializer(serializers.ModelSerializer):
             reviewer=reviewer,
             **validated_data
         )
+
+
+class ReviewerFeedbackSerializer(serializers.ModelSerializer):
+    """Serializer for listing reviewer feedback."""
+
+    request_code = serializers.CharField(source='request.request_code', read_only=True)
+    reviewer_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReviewerFeedback
+        fields = ['id', 'request', 'request_code', 'reviewer', 'reviewer_name', 'category', 'message', 'created_at']
+        read_only_fields = ['id', 'reviewer', 'created_at']
+
+    def get_reviewer_name(self, obj):
+        return obj.reviewer.get_full_name() or obj.reviewer.username
+
+
+class ReviewerFeedbackCreateSerializer(serializers.ModelSerializer):
+    """Serializer for creating minimal reviewer feedback."""
+
+    class Meta:
+        model = ReviewerFeedback
+        fields = ['request', 'category', 'message']
+
+    def validate_message(self, value: str):
+        message = (value or '').strip()
+        if len(message) < 10:
+            raise serializers.ValidationError('Please provide minimal feedback (at least 10 characters).')
+        if len(message) > 300:
+            raise serializers.ValidationError('Please keep feedback minimal (max 300 characters).')
+        return message
+
+    def create(self, validated_data):
+        reviewer = self.context['request'].user
+        return ReviewerFeedback.objects.create(
+            reviewer=reviewer,
+            **validated_data
+        )
+
+
+class SubmitFeedbackSerializer(serializers.ModelSerializer):
+    """Serializer for generic admin feedback submissions."""
+
+    user = serializers.HiddenField(default=serializers.CurrentUserDefault())
+
+    class Meta:
+        model = SubmitFeedback
+        fields = ['id', 'user', 'subject', 'message', 'email', 'created_at']
+        read_only_fields = ['id', 'created_at']
 
 
 class ApproveRequestSerializer(serializers.Serializer):
@@ -1414,3 +1521,34 @@ class TicketDetailSerializer(TicketSerializer):
         fields = TicketSerializer.Meta.fields + ['messages', 'attachments']
 
 
+class CommissionerSlotSerializer(serializers.ModelSerializer):
+    """Serializer for commissioner availability slots."""
+    
+    request_details = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = CommissionerSlot
+        fields = ['id', 'commissioner', 'start_time', 'is_booked', 'request_details']
+        read_only_fields = ['id', 'commissioner', 'is_booked']
+        
+    def get_request_details(self, obj):
+        # Allow request details to be shown if booked OR if user is commissioner viewing their own schedule
+        request = self.context.get('request')
+        
+        if obj.is_booked and obj.request:
+            # Security check: Only show details if:
+            # 1. User is the commissioner who owns the slot
+            # 2. User is the client who made the request
+            # 3. User is an admin
+            if request and (
+                request.user == obj.commissioner or 
+                request.user == obj.request.user or 
+                request.user.is_staff
+            ):
+                return {
+                    'request_code': obj.request.request_code,
+                    'client_name': obj.request.user.get_full_name() or obj.request.user.username,
+                    'affidavit_type': obj.request.affidavit_type.name,
+                    'status': obj.request.status
+                }
+        return None

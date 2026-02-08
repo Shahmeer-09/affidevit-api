@@ -11,6 +11,7 @@ RESTful API endpoints for all user roles:
 import json
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.crypto import get_random_string
 from django.db.models import Count, Q, F
 from django.db import transaction
 from django.http import HttpResponse
@@ -21,15 +22,16 @@ from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny, IsAuthenticated
 
 from .models import (
-    User, AffidavitType, DecisionTreeNode, Request, 
+    User, AffidavitType, DecisionTreeNode, Request,
     Stamp, FrictionReport, ReviewerEdit, RequestEvent, AIRun, PaymentLog,
-    SiteSettings, Ticket, TicketMessage, TicketAttachment
+    SiteSettings, Ticket, TicketMessage, TicketAttachment, CommissionerSlot,
+    ReviewerFeedback, SubmitFeedback
 )
 from .serializers import (
     UserSerializer, UserRegistrationSerializer, CommissionerSerializer,
     CommissionerPublicSerializer, ReviewerSerializer,
     CreateStaffUserSerializer, UpdateStaffUserSerializer,
-    AffidavitTypeSerializer, AffidavitTypeListSerializer, 
+    AffidavitTypeSerializer, AffidavitTypeListSerializer,
     AffidavitTypePolicyUpdateSerializer,
     DecisionTreeNodeSerializer, DecisionTreeNodeChildSerializer,
     DecisionTreeAnswerSerializer,
@@ -38,16 +40,19 @@ from .serializers import (
     StampSerializer, MarkCompleteSerializer,
     FrictionReportSerializer, FrictionReportCreateSerializer,
     ReviewerEditSerializer, ReviewerEditCreateSerializer, ApproveRequestSerializer,
+    ReviewerFeedbackSerializer, ReviewerFeedbackCreateSerializer, SubmitFeedbackSerializer,
     ConfidenceDashboardSerializer, LearningExportSerializer,
     PaymentLogSerializer, CommissionerPaymentSummarySerializer, MarkAsPaidSerializer,
-    TicketSerializer, TicketDetailSerializer, TicketMessageSerializer, TicketAttachmentSerializer
+    TicketSerializer, TicketDetailSerializer, TicketMessageSerializer, TicketAttachmentSerializer,
+    CommissionerSlotSerializer,
+    GuestSignupStartSerializer, GuestSignupVerifySerializer
 )
 from .authentication import (
-    IsCommissioner, IsReviewer, IsAdminUser, 
+    IsCommissioner, IsReviewer, IsAdminUser, IsSuperUser,
     IsOwnerOrAdmin, IsCommissionerOrReviewerOrAdmin
 )
 from .services import process_request, generate_affidavit_pdf
-from .services.ai_service import validate_inputs_before_submission, translate_to_english
+from .services.ai_service import validate_inputs_before_submission, translate_to_english, draft_affidavit
 from .services.notification_service import (
     send_approval_notification, 
     send_clarification_notification,
@@ -65,6 +70,77 @@ from .tasks import (
     generate_pdf_async,
     send_notification_async
 )
+
+
+class ReviewerFeedbackCreateView(generics.CreateAPIView):
+    """Reviewer-only endpoint to add minimal feedback for a request."""
+
+    serializer_class = ReviewerFeedbackCreateSerializer
+    permission_classes = [IsAuthenticated, IsReviewer]
+
+    def create(self, request, *args, **kwargs):
+        request_obj = get_object_or_404(Request, pk=kwargs.get('pk'))
+
+        serializer = self.get_serializer(
+            data={
+                **request.data,
+                'request': request_obj.id,
+            }
+        )
+        serializer.is_valid(raise_exception=True)
+        feedback = serializer.save()
+
+        return Response(
+            ReviewerFeedbackSerializer(feedback, context={'request': request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class AdminReviewerFeedbackListView(generics.ListAPIView):
+    """Admin endpoint to view reviewer feedback logs with filtering and search."""
+
+    serializer_class = ReviewerFeedbackSerializer
+    permission_classes = [IsAdminUser]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['request__request_code', 'reviewer__username', 'reviewer__email', 'message']
+    ordering_fields = ['created_at', 'category']
+    ordering = ['-created_at']
+
+    def get_queryset(self):
+        queryset = ReviewerFeedback.objects.select_related('request', 'reviewer').all()
+
+        category = self.request.query_params.get('category')
+        if category:
+            queryset = queryset.filter(category=category)
+
+        reviewer_id = self.request.query_params.get('reviewer')
+        if reviewer_id:
+            queryset = queryset.filter(reviewer_id=reviewer_id)
+
+        request_code = self.request.query_params.get('request_code')
+        if request_code:
+            queryset = queryset.filter(request__request_code__icontains=request_code.strip())
+
+        start_date = self.request.query_params.get('start_date')
+        end_date = self.request.query_params.get('end_date')
+        if start_date:
+            queryset = queryset.filter(created_at__date__gte=start_date)
+        if end_date:
+            queryset = queryset.filter(created_at__date__lte=end_date)
+
+        return queryset.order_by('-created_at')
+
+
+class SubmitFeedbackView(generics.CreateAPIView):
+    """Generic endpoint for admin/site feedback submissions."""
+
+    serializer_class = SubmitFeedbackSerializer
+    permission_classes = [AllowAny]
+
+    def perform_create(self, serializer):
+        user = self.request.user if self.request.user.is_authenticated else None
+        serializer.save(user=user)
+
 
 
 # =============================================================================
@@ -98,6 +174,170 @@ class UserRegistrationView(generics.CreateAPIView):
             'refresh': str(refresh),
             'access': str(refresh.access_token),
         }, status=status.HTTP_201_CREATED)
+
+
+class GuestAuthView(viewsets.ViewSet):
+    """
+    ViewSet for handling guest signup flows (invisible signup).
+    """
+    permission_classes = [AllowAny]
+
+    @action(detail=False, methods=['post'])
+    def start(self, request):
+        """Start guest signup - Send OTP (Mock)."""
+        serializer = GuestSignupStartSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        # Mock Logic: In real world, generate OTP and send email.
+        # For now, just acknowledge.
+        return Response({
+            "message": "OTP sent to email.",
+            "mock_otp": "123456" # For dev convenience
+        })
+
+    @action(detail=False, methods=['post'])
+    def verify(self, request):
+        """Verify OTP, Create Account, Create Request, Mark Paid."""
+        from rest_framework_simplejwt.tokens import RefreshToken
+        from django.db import IntegrityError
+
+        serializer = GuestSignupVerifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data['email']
+        otp = serializer.validated_data['otp']
+        full_name = serializer.validated_data['full_name']
+        phone_number = serializer.validated_data.get('phone_number', '')
+        affidavit_type_id = serializer.validated_data['affidavit_type_id']
+        answers_json = serializer.validated_data['answers_json']
+        draft_text = serializer.validated_data.get('draft_text', '')
+
+        # 1. Verify OTP (Mock: Accept any 6 digit)
+        if len(otp) != 6:
+             return Response({"otp": "Invalid OTP"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 2. Get or Create User
+        try:
+            user = User.objects.get(email__iexact=email)
+            # Update existing user info if needed
+            if not user.is_active:
+                user.is_active = True
+            # Update name if missing
+            if not user.first_name and full_name:
+                parts = full_name.split(' ', 1)
+                user.first_name = parts[0]
+                if len(parts) > 1:
+                    user.last_name = parts[1]
+            if phone_number and user.phone_number != phone_number:
+                if User.objects.exclude(id=user.id).filter(phone_number=phone_number).exists():
+                    return Response(
+                        {'phone_number': 'This phone number is already in use. Please use a different phone number or sign in.'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if not user.phone_number:
+                    user.phone_number = phone_number
+            try:
+                user.save()
+            except IntegrityError:
+                return Response(
+                    {'detail': 'Could not update user due to a conflicting email/phone. Please try a different email/phone or sign in.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        except User.DoesNotExist:
+            if User.objects.filter(email__iexact=email).exists():
+                return Response(
+                    {'email': 'An account with this email already exists. Please sign in instead.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if phone_number and User.objects.filter(phone_number=phone_number).exists():
+                return Response(
+                    {'phone_number': 'An account with this phone number already exists. Please sign in instead.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # Create new user
+            username = email.split('@')[0]
+            # Ensure unique username
+            counter = 1
+            base_username = username
+            while User.objects.filter(username=username).exists():
+                username = f"{base_username}{counter}"
+                counter += 1
+            
+            parts = full_name.split(' ', 1)
+            first_name = parts[0]
+            last_name = parts[1] if len(parts) > 1 else ''
+
+            try:
+                user = User.objects.create_user(
+                    username=username,
+                    email=email,
+                    password=User.objects.make_random_password() if hasattr(User.objects, 'make_random_password') else get_random_string(12),
+                    first_name=first_name,
+                    last_name=last_name,
+                    phone_number=phone_number,
+                    role=User.Role.PUBLIC,
+                    is_active=True
+                )
+            except IntegrityError:
+                existing_email = User.objects.filter(email__iexact=email).exists()
+                existing_phone = bool(phone_number) and User.objects.filter(phone_number=phone_number).exists()
+                if existing_email:
+                    return Response(
+                        {'email': 'An account with this email already exists. Please sign in instead.'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if existing_phone:
+                    return Response(
+                        {'phone_number': 'An account with this phone number already exists. Please sign in instead.'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                return Response(
+                    {'detail': 'Could not create account due to a conflicting email/phone. Please try again.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # 3. Create Request
+        affidavit_type = get_object_or_404(AffidavitType, id=affidavit_type_id)
+        
+        # Determine initial status based on draft existence
+        initial_status = Request.Status.DRAFT
+        if draft_text and len(draft_text) > 50:
+            initial_status = Request.Status.DRAFT_READY
+            
+        request_obj = Request.objects.create(
+            user=user,
+            affidavit_type=affidavit_type,
+            answers_json=answers_json,
+            draft_text=draft_text if draft_text else '',
+            policy_version_used=affidavit_type.policy_version,
+            prompt_version_used=affidavit_type.prompt_pack_version,
+            template_version_used=affidavit_type.template_version,
+            status=initial_status,
+            is_paid=True,
+            user_paid_at=timezone.now()
+        )
+
+        # 4. Trigger Async AI only if draft is missing
+        if not draft_text or len(draft_text) <= 50:
+            process_request_async.delay(request_obj.id)
+        else:
+            RequestEvent.objects.create(
+                request=request_obj,
+                action=RequestEvent.Action.DRAFT_GENERATED,
+                actor=user,
+                actor_role=user.role,
+                details={'message': 'Draft saved from preview (skipped regeneration)'}
+            )
+
+        # 5. Generate Tokens
+        refresh = RefreshToken.for_user(user)
+
+        return Response({
+            'user': UserSerializer(user).data,
+            'request': RequestDetailSerializer(request_obj, context={'request': request}).data,
+            'refresh': str(refresh),
+            'access': str(refresh.access_token),
+        }, status=status.HTTP_201_CREATED)
+
 
 
 class VerifyOTPView(APIView):
@@ -560,13 +800,35 @@ class ValidateRequestInputView(APIView):
         logger.info(f"[VALIDATE_VIEW] VALIDATION RESULT: {validation_result}")
         logger.info("=" * 80)
         # ===== END DEBUG LOGGING =====
+
+        # STEP 3: If valid, generate draft
+        draft_text = ""
+        if validation_result.get('all_valid', True):
+             # Draft the affidavit
+             logger.info("[VALIDATE_VIEW] Validation passed, generating draft...")
+             try:
+                 draft_result = draft_affidavit(
+                     answers_json=translated_answers,
+                     policy_json=affidavit_type.policy_json,
+                     affidavit_type_name=affidavit_type.name,
+                     scenario_library=affidavit_type.scenario_library,
+                     template_html=affidavit_type.template_html,
+                     disallowed_phrases=[] 
+                 )
+                 draft_text = draft_result.get('draft_html', '')
+                 logger.info(f"[VALIDATE_VIEW] Draft generated successfully (length: {len(draft_text)})")
+             except Exception as e:
+                 logger.error(f"[VALIDATE_VIEW] Failed to generate draft: {e}")
+                 # We don't fail the request if drafting fails, just return empty draft
+                 pass
         
         return Response({
             'success': True,
             'all_valid': validation_result.get('all_valid', True),
             'invalid_fields': validation_result.get('invalid_fields', {}),
             'validation_notes': validation_result.get('validation_notes', []),
-            'field_checks': validation_result.get('field_checks', [])
+            'field_checks': validation_result.get('field_checks', []),
+            'draft_text': draft_text
         })
 
 
@@ -585,7 +847,28 @@ class RequestSubmitView(APIView):
             user=request.user
         )
         
-        # Validate submission
+        # Handle submission from DRAFT_READY -> NEEDS_REVIEW (after appointment booked)
+        # OR if draft already exists (prevent regeneration)
+        if request_obj.status == Request.Status.DRAFT_READY or (request_obj.draft_text and len(request_obj.draft_text) > 50):
+            request_obj.status = Request.Status.NEEDS_REVIEW
+            request_obj.submitted_at = timezone.now() # Update timestamp or keep original? Keeping update to show recent activity
+            request_obj.save()
+            
+            RequestEvent.objects.create(
+                request=request_obj,
+                action=RequestEvent.Action.SUBMITTED,
+                actor=request.user,
+                actor_role=request.user.role,
+                details={'message': 'Submitted for review (Draft already exists)'}
+            )
+            
+            return Response({
+                'status': request_obj.status,
+                'request_code': request_obj.request_code,
+                'message': 'Your request has been submitted for review.'
+            })
+        
+        # Validate submission for initial draft
         serializer = RequestSubmitSerializer(
             instance=request_obj, 
             data={},
@@ -640,18 +923,41 @@ class SelectCommissionerView(APIView):
             user=request.user
         )
         
-        # Only allow selecting commissioner for approved requests
-        if request_obj.status != Request.Status.APPROVED:
-            return Response(
-                {'error': 'Can only select commissioner for approved requests'},
+        # Only allow selecting commissioner for requests NOT yet approved (locked after approval)
+        # Allowed statuses: DRAFT_READY (initial), NEEDS_REVIEW (change)
+        if request_obj.status == Request.Status.APPROVED:
+             return Response(
+                {'error': 'Commissioner selection is locked for approved requests.'},
                 status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Ensure status is valid for selection
+        if request_obj.status not in [Request.Status.DRAFT_READY, Request.Status.NEEDS_REVIEW]:
+             return Response(
+                {'error': 'Request is not ready for commissioner selection.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Require payment before selecting commissioner
+        if not request_obj.is_paid:
+            return Response(
+                {'error': 'Payment required before selecting a commissioner.'},
+                status=status.HTTP_403_FORBIDDEN
             )
         
         commissioner_id = request.data.get('commissioner_id')
         
-        # Allow withdrawing commissioner selection (set to null)
-        if commissioner_id is None:
+        # Allow withdrawing commissioner selection (set to null or 0)
+        if commissioner_id is None or commissioner_id == 0:
             old_commissioner = request_obj.commissioner
+            
+            # Release any booked slot
+            if hasattr(request_obj, 'appointment_slot'):
+                slot = request_obj.appointment_slot
+                slot.is_booked = False
+                slot.request = None
+                slot.save()
+
             request_obj.commissioner = None
             request_obj.save()
             
@@ -769,12 +1075,82 @@ class RequestByCodeView(APIView):
     Story 2.1 - Universal Request Retrieval.
     - Commissioners can only access requests assigned to them (and not completed ones)
     - Admins can access any request for support purposes
+    - Supports lookup by User Last Name via query param `?lastname=Smith`
     """
     
     permission_classes = [IsCommissionerOrReviewerOrAdmin]
     
-    def get(self, request, code):
-        request_obj = get_object_or_404(Request, request_code=code.upper())
+    def get(self, request, code=None):
+        # Handle search by last name if 'code' is a special keyword 'search' or omitted
+        # But this view is defined as /lookup/<str:code>/ in urls.py
+        # So we check if the 'code' param looks like a request code or we need to handle search differently.
+        # However, the user asked to search via user last name.
+        # Since the URL pattern is fixed, we might need a separate endpoint or overload this one.
+        # A better approach for "RequestByCodeView" is to strictly handle codes.
+        # But if the user enters a last name in the frontend search box, we need to handle it.
+        
+        # Let's check if the input `code` matches a request code format (e.g. starts with AFF-)
+        # or if we should treat it as a search term.
+        
+        query = code.strip()
+        
+        # Try finding by exact request code first
+        request_obj = Request.objects.filter(request_code=query.upper()).first()
+        
+        if not request_obj:
+            # If not found by code, try finding by user's name (first, last, full)
+            # Only for commissioners to find their assigned requests
+            if request.user.role == 'commissioner':
+                # Base filter: Assigned to this commissioner OR Unassigned, not completed, and PAID
+                base_qs = Request.objects.filter(
+                    Q(commissioner=request.user) | Q(commissioner__isnull=True),
+                    is_paid=True
+                ).exclude(status=Request.Status.COMPLETED)
+                
+                # Search strategy 1: Direct match on fields (First, Last, Email)
+                q_direct = Q(user__last_name__icontains=query) | \
+                           Q(user__first_name__icontains=query) | \
+                           Q(user__email__icontains=query)
+                
+                requests = base_qs.filter(q_direct).order_by('-created_at')
+                
+                if requests.exists():
+                    request_obj = requests.first()
+                else:
+                    # Search strategy 2: Split terms (e.g. "Ali I" -> "Ali" AND "I")
+                    # This handles "First Last" or "Last First" input
+                    terms = query.split()
+                    if len(terms) > 1:
+                        # Construct a query where EACH term must be present in EITHER first or last name (or email)
+                        q_terms = None
+                        for term in terms:
+                            term_q = Q(user__last_name__icontains=term) | \
+                                     Q(user__first_name__icontains=term) | \
+                                     Q(user__email__icontains=term)
+                            
+                            if q_terms is None:
+                                q_terms = term_q
+                            else:
+                                q_terms &= term_q
+                        
+                        if q_terms:
+                            requests = base_qs.filter(q_terms).order_by('-created_at')
+                            if requests.exists():
+                                request_obj = requests.first()
+
+        if not request_obj:
+            return Response(
+                {'error': f'No request found for "{query}". Please check the code or last name.'},
+                status=404
+            )
+        
+        # Check payment status before proceeding
+        # Users must pay before their affidavit is visible to commissioners
+        if not request_obj.is_paid and request.user.role == 'commissioner':
+            return Response(
+                {'error': 'This request has not been paid for by the user. Please ask them to complete payment first.'},
+                status=403
+            )
         
         # Admins and reviewers can view any request (no assignment check)
         if request.user.role not in ['admin', 'reviewer']:
@@ -1190,16 +1566,17 @@ class CommissionerPDFPreferencesView(APIView):
 class ReviewQueueView(generics.ListAPIView):
     """
     Prioritized review queue (Story 3.1).
-    Shows requests needing review, sorted by oldest first.
+    Shows requests needing review, sorted by newest first (LIFO) or risk score.
     """
     
     serializer_class = RequestReviewerSerializer
     permission_classes = [IsReviewer]
     
     def get_queryset(self):
+        # Sort by newest created first (descending order)
         return Request.objects.filter(
             status=Request.Status.NEEDS_REVIEW
-        ).order_by('created_at')
+        ).order_by('-created_at')
 
 
 class ReviewDetailView(generics.RetrieveAPIView):
@@ -2186,6 +2563,159 @@ class AdminAllPaymentLogsView(generics.ListAPIView):
 
 
 # =============================================================================
+# Commissioner Slot Views
+# =============================================================================
+
+class CommissionerSlotsView(APIView):
+    """
+    List available time slots for a specific commissioner on a given date.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        from django.utils.dateparse import parse_date
+        from django.utils import timezone
+        import datetime
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        
+        commissioner = get_object_or_404(User, pk=pk, role=User.Role.COMMISSIONER)
+        
+        date_str = request.query_params.get('date')
+        if not date_str:
+            return Response(
+                {'error': 'Date parameter is required (YYYY-MM-DD)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        try:
+            target_date = parse_date(date_str)
+            if not target_date:
+                raise ValueError("Invalid date format")
+        except ValueError:
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        # Filter slots for the specific date in COMMISSIONER'S TIMEZONE
+        # Standard Django __date filter uses UTC (or server time), which causes
+        # slots from the previous night (UTC) to appear in today's list for UTC-4 (Trinidad).
+        
+        tz_name = commissioner.availability.get('timezone', 'America/Port_of_Spain')
+        try:
+            local_tz = ZoneInfo(tz_name)
+        except Exception:
+            local_tz = datetime.timezone.utc
+
+        # Create range covering the full day in local time
+        start_local = datetime.datetime.combine(target_date, datetime.time.min).replace(tzinfo=local_tz)
+        # End of day should be up to 23:59:59
+        end_local = datetime.datetime.combine(target_date, datetime.time.max).replace(tzinfo=local_tz)
+        
+        # Convert to UTC for DB querying
+        start_utc = start_local.astimezone(datetime.timezone.utc)
+        end_utc = end_local.astimezone(datetime.timezone.utc)
+
+        slots = CommissionerSlot.objects.filter(
+            commissioner=commissioner,
+            start_time__gte=start_utc,
+            start_time__lte=end_utc
+        ).order_by('start_time')
+        
+        serializer = CommissionerSlotSerializer(slots, many=True)
+        return Response(serializer.data)
+
+
+class CommissionerBookedSlotsView(generics.ListAPIView):
+    """
+    List all booked upcoming slots for the current commissioner.
+    Used for the "My Schedule" page.
+    """
+    permission_classes = [IsCommissioner]
+    serializer_class = CommissionerSlotSerializer
+    
+    def get_queryset(self):
+        # Show all future booked slots, ordered by time
+        return CommissionerSlot.objects.filter(
+            commissioner=self.request.user,
+            is_booked=True,
+            start_time__gte=timezone.now() - timezone.timedelta(hours=24) # Include recent past (24h) for context
+        ).select_related('request', 'request__user', 'request__affidavit_type').order_by('start_time')
+
+
+class BookSlotView(APIView):
+    """
+    Book a specific time slot for an affidavit request.
+    Atomic transaction to prevent double booking.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        slot = get_object_or_404(CommissionerSlot, pk=pk)
+        
+        request_id = request.data.get('request_id')
+        if not request_id:
+            return Response(
+                {'error': 'request_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        request_obj = get_object_or_404(Request, pk=request_id, user=request.user)
+        
+        # Check if already booked
+        if slot.is_booked:
+            return Response(
+                {'error': 'This slot is already booked.'},
+                status=status.HTTP_409_CONFLICT
+            )
+            
+        # Check if request already has a slot, release it if so
+        if hasattr(request_obj, 'appointment_slot'):
+            old_slot = request_obj.appointment_slot
+            old_slot.is_booked = False
+            old_slot.request = None
+            old_slot.save()
+            
+        # Book the new slot
+        slot.is_booked = True
+        slot.request = request_obj
+        slot.save()
+        
+        # Assign commissioner to request
+        request_obj.commissioner = slot.commissioner
+        
+        # Update status to NEEDS_REVIEW if it was DRAFT_READY
+        if request_obj.status == Request.Status.DRAFT_READY:
+            request_obj.status = Request.Status.NEEDS_REVIEW
+            
+        request_obj.save()
+        
+        # Log event
+        RequestEvent.objects.create(
+            request=request_obj,
+            action=RequestEvent.Action.COMMISSIONER_CHANGED,
+            actor=request.user,
+            actor_role=request.user.role,
+            details={
+                'action': 'booked_slot',
+                'slot_id': slot.id,
+                'slot_time': slot.start_time.isoformat(),
+                'commissioner': slot.commissioner.username
+            }
+        )
+        
+        return Response({
+            'success': True,
+            'message': 'Appointment booked successfully',
+            'slot': CommissionerSlotSerializer(slot).data
+        })
+
+
+# =============================================================================
 # Admin Affidavit Type CRUD Views
 # =============================================================================
 
@@ -2197,6 +2727,11 @@ class AdminAffidavitTypeListView(generics.ListCreateAPIView):
     
     permission_classes = [IsAdminUser]
     queryset = AffidavitType.objects.all().order_by('name')
+    
+    def get_permissions(self):
+        if self.request.method == 'POST':
+            return [IsSuperUser()]
+        return [IsAdminUser()]
     
     def get_serializer_class(self):
         from .serializers import AffidavitTypeAdminSerializer
@@ -2210,6 +2745,11 @@ class AdminAffidavitTypeDetailView(generics.RetrieveUpdateDestroyAPIView):
     
     permission_classes = [IsAdminUser]
     queryset = AffidavitType.objects.all()
+    
+    def get_permissions(self):
+        if self.request.method in ['PUT', 'PATCH', 'DELETE']:
+            return [IsSuperUser()]
+        return [IsAdminUser()]
     
     def get_serializer_class(self):
         from .serializers import AffidavitTypeAdminSerializer
@@ -2244,7 +2784,7 @@ class AdminAffidavitTypeDuplicateView(APIView):
     Duplicate an affidavit type with all its settings.
     """
     
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsSuperUser]
     
     def post(self, request, pk):
         from .serializers import AffidavitTypeAdminSerializer
@@ -2702,7 +3242,7 @@ class AdminDecisionTreeNodeListView(generics.ListCreateAPIView):
     POST: Create a new node
     """
     
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsSuperUser]
     
     def get_serializer_class(self):
         from .serializers import AdminDecisionTreeNodeSerializer, AdminDecisionTreeNodeCreateSerializer
@@ -2734,7 +3274,7 @@ class AdminDecisionTreeNodeDetailView(generics.RetrieveUpdateDestroyAPIView):
     Admin endpoint to retrieve, update, or delete a decision tree node.
     """
     
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsSuperUser]
     queryset = DecisionTreeNode.objects.all()
     
     def get_serializer_class(self):
@@ -2750,7 +3290,7 @@ class AdminDecisionTreeQuestionsView(generics.ListAPIView):
     Used for dropdown selection when creating new nodes.
     """
     
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsSuperUser]
     
     def get(self, request):
         from .serializers import AdminDecisionTreeNodeSerializer
@@ -2771,7 +3311,7 @@ class AdminAffidavitTypeDecisionNodesView(APIView):
     Used in the "Discovery" tab of the affidavit type edit page.
     """
     
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsSuperUser]
     
     def get(self, request, pk):
         """Get all paths leading to this affidavit type."""
@@ -3080,5 +3620,3 @@ class TicketViewSet(viewsets.ModelViewSet):
                 print(f"Failed to send status change notification: {e}")
         
         return Response(TicketDetailSerializer(ticket).data)
-
-

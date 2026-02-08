@@ -33,6 +33,8 @@ from .views import (
     # Reviewer
     ReviewQueueView, ReviewDetailView, ApproveRequestView,
     RejectRequestView, OverrideAIFlagView, ReviewerStatsView, RequestClarificationView,
+    ReviewerFeedbackCreateView,
+    SubmitFeedbackView,
     # Admin
     AffidavitTypePolicyView, ConfidenceDashboardView, LearningExportView,
     FrictionDashboardView, PromoteToInstantModeView,
@@ -43,6 +45,7 @@ from .views import (
     AdminReviewerListView, AdminReviewerDetailView,
     AdminCommissionerPaymentSummaryView, AdminCommissionerPaymentHistoryView,
     AdminMarkCommissionerPaidView, AdminAllPaymentLogsView,
+    AdminReviewerFeedbackListView,
     # Admin Affidavit Type CRUD
     AdminAffidavitTypeListView, AdminAffidavitTypeDetailView,
     AdminAffidavitTypeDuplicateView, AdminTypeRequestsView,
@@ -58,7 +61,9 @@ from .views import (
     # Public
     PublicCommissionerListView,
     # Tickets
-    TicketViewSet
+    TicketViewSet,
+    CommissionerSlotsView, BookSlotView, CommissionerBookedSlotsView,
+    GuestAuthView
 )
 
 app_name = 'affidavits'
@@ -69,6 +74,8 @@ urlpatterns = [
     # ==========================================================================
     path('auth/register/', UserRegistrationView.as_view(), name='register'),
     path('auth/register/commissioner/', CommissionerRegistrationView.as_view(), name='register_commissioner'),
+    path('auth/guest-signup/start/', GuestAuthView.as_view({'post': 'start'}), name='guest_signup_start'),
+    path('auth/guest-signup/verify/', GuestAuthView.as_view({'post': 'verify'}), name='guest_signup_verify'),
     path('auth/verify-otp/', VerifyOTPView.as_view(), name='verify_otp'),
     path('auth/token/', CustomTokenObtainPairView.as_view(), name='token_obtain'),
     path('auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
@@ -121,7 +128,10 @@ urlpatterns = [
     path('commissioner/complete/<int:pk>/', MarkCompleteView.as_view(), name='commissioner_complete'),
     path('commissioner/report/', FrictionReportCreateView.as_view(), name='friction_report'),
     path('commissioner/stamps/', CommissionerStampsView.as_view(), name='commissioner_stamps'),
+    path('commissioner/schedule/', CommissionerBookedSlotsView.as_view(), name='commissioner_schedule'),
     path('commissioner/pdf-preferences/', CommissionerPDFPreferencesView.as_view(), name='pdf_preferences'),
+    path('commissioners/<int:pk>/slots/', CommissionerSlotsView.as_view(), name='commissioner_slots'),
+    path('slots/<int:pk>/book/', BookSlotView.as_view(), name='book_slot'),
     
     # ==========================================================================
     # Reviewer Endpoints (Stories 3.1, 3.2, 3.3)
@@ -133,6 +143,7 @@ urlpatterns = [
     path('reviewer/<int:pk>/reject/', RejectRequestView.as_view(), name='review_reject'),
     path('reviewer/<int:pk>/clarify/', RequestClarificationView.as_view(), name='review_clarify'),
     path('reviewer/<int:pk>/override-flag/', OverrideAIFlagView.as_view(), name='override_flag'),
+    path('reviewer/<int:pk>/feedback/', ReviewerFeedbackCreateView.as_view(), name='review_feedback'),
     
     # ==========================================================================
     # Admin Endpoints (Stories 4.1, 4.2, 4.3)
@@ -159,6 +170,8 @@ urlpatterns = [
     path('admin/payment-logs/', AdminAllPaymentLogsView.as_view(), name='admin_all_payment_logs'),
     path('admin/reviewers/', AdminReviewerListView.as_view(), name='admin_reviewer_list'),
     path('admin/reviewers/<int:pk>/', AdminReviewerDetailView.as_view(), name='admin_reviewer_detail'),
+    path('admin/reviewer-feedback/', AdminReviewerFeedbackListView.as_view(), name='admin_reviewer_feedback'),
+    path('admin/feedback/', SubmitFeedbackView.as_view(), name='admin_feedback'),
     
     # ==========================================================================
     # Admin Affidavit Type CRUD Endpoints

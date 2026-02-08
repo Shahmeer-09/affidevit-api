@@ -11,6 +11,7 @@ from django.utils.html import format_html
 from .models import (
     User, AffidavitType, DecisionTreeNode, 
     Request, Stamp, FrictionReport, ReviewerEdit,
+    ReviewerFeedback,
     RequestEvent, AIRun, AIBaseInstruction, PaymentLog
 )
 
@@ -317,7 +318,7 @@ class ReviewerEditAdmin(admin.ModelAdmin):
         'ai_flag_accepted', 'created_at'
     ]
     list_filter = ['issue_type', 'ai_flag_accepted', 'created_at', 'reviewer']
-    search_fields = ['request__request_code', 'issue_description']
+    search_fields = ['request__request_code', 'issue_description', 'original_text', 'edited_text']
     readonly_fields = ['created_at']
     raw_id_fields = ['request', 'reviewer']
     ordering = ['-created_at']
@@ -332,6 +333,28 @@ class ReviewerEditAdmin(admin.ModelAdmin):
                       'issue_description', 'ai_flag_accepted')
         }),
     )
+
+
+@admin.register(ReviewerFeedback)
+class ReviewerFeedbackAdmin(admin.ModelAdmin):
+    """Admin for minimal reviewer feedback notes."""
+
+    list_display = ['id', 'request', 'request_code', 'reviewer', 'category', 'message_preview', 'created_at']
+    list_filter = ['category', 'created_at', 'reviewer']
+    search_fields = ['request__request_code', 'reviewer__username', 'reviewer__email', 'message']
+    readonly_fields = ['created_at']
+    raw_id_fields = ['request', 'reviewer']
+    ordering = ['-created_at']
+    date_hierarchy = 'created_at'
+
+    def request_code(self, obj):
+        return obj.request.request_code
+    request_code.short_description = 'Request Code'
+
+    def message_preview(self, obj):
+        preview = (obj.message or '')[:80]
+        return preview + '...' if len(obj.message or '') > 80 else preview
+    message_preview.short_description = 'Message'
 
 
 @admin.register(RequestEvent)

@@ -12,11 +12,41 @@ import logging
 import time
 from typing import Optional, List, Dict, Tuple
 from django.conf import settings
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 logger = logging.getLogger(__name__)
 
 # Lazy import openai to avoid import errors if not installed
 openai_client = None
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    retry=retry_if_exception_type((ConnectionError, TimeoutError, Exception)),
+    before_sleep=lambda retry_state: logger.warning(f"OpenAI API retry {retry_state.attempt_number}/3 after error: {retry_state.outcome.exception()}")
+)
+def call_openai_with_retry(client, model, messages, **kwargs):
+    """
+    Wrapper for OpenAI API calls with retry logic and exponential back-off.
+    
+    Args:
+        client: OpenAI client instance
+        model: OpenAI model name
+        messages: List of message dictionaries
+        **kwargs: Additional parameters for the API call
+        
+    Returns:
+        OpenAI API response
+        
+    Raises:
+        Exception: If all retries are exhausted
+    """
+    return client.chat.completions.create(
+        model=model,
+        messages=messages,
+        **kwargs
+    )
 
 
 def get_openai_client():
@@ -192,7 +222,8 @@ Output: {"name": "Ali Ahmed"}
 
 Return the translated JSON with the same structure. If a field is already in English, keep it exactly as is."""
 
-        response = client.chat.completions.create(
+        response = call_openai_with_retry(
+            client=client,
             model=settings.OPENAI_DRAFT_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -326,14 +357,17 @@ def draft_affidavit(
 """
             template_format_instructions = """
 **TEMPLATE ADHERENCE RULES (CRITICAL):**
-- Follow the template structure EXACTLY - do not add or remove sections
-- DO NOT add headers like "AFFIDAVIT" or subtitles if not in the template
+- **FOLLOW THE TEMPLATE EXACTLY AS IS.**
+- Do not change, remove, or reorder any static text.
+- Do not add headers like "AFFIDAVIT" or subtitles if not in the template.
+-if there are any numbering for lists follow them as is dont ignore or add bullets 
 - Start the document EXACTLY as the template starts (e.g., "REPUBLIC OF TRINIDAD AND TOBAGO:")
-- For the commissioner/attestation section, use the EXACT format from the template
-- DO NOT modernize or "improve" the commissioner section format
-- Replace ONLY the {{placeholder}} values with actual data
-- Preserve all static text, legal language, and formatting exactly as shown
+- For the commissioner/attestation section, use the EXACT format from the template.
+- DO NOT modernize or "improve" the commissioner section format.
+- Replace ONLY the {{placeholder}} values with actual data.
+- Preserve all static text, legal language, and formatting exactly as shown.
 - **CRITICAL: If the template uses "That I am...", "That I have...", "That this..." paragraph format for statements, preserve that format - do NOT convert them to numbered lists (1. 2. 3.) or ordered lists (<ol>).**
+- **STRICTLY FOLLOW THE TEMPLATE'S SPACING AND STRUCTURE.**
 """
         
         # Check if we have a calculated age from DOB validation
@@ -363,9 +397,10 @@ Do NOT include <html>, <head>, or <body> tags - just the content.
 
 User answers may be informal, fragmented, or grammatically incomplete. Your job is to:
 1. **Rephrase** user answers into proper legal language
-2. **Fix grammar** - don't copy-paste broken sentences
-3. **Make it flow** - integrate user's info naturally into the template
-4. **Preserve meaning** - keep all facts exactly as provided, just phrase them professionally
+2. **Fix grammar and spelling** - correct typos (e.g., "motther" -> "mother")
+3. **Fix capitalization** - ensure proper nouns like names and addresses are capitalized (e.g., "shahmeer" -> "Shahmeer", "main street" -> "Main Street")
+4. **Make it flow** - integrate user's info naturally into the template
+5. **Preserve meaning** - keep all facts exactly as provided, just phrase them professionally
 
 EXAMPLE OF WHAT NOT TO DO:
 ❌ User wrote: "house is old"
@@ -380,7 +415,7 @@ User wrote: "work at hospital" → "employed at the hospital"
 **Transform user input into professional legal language while preserving facts.**
 
 **REQUIREMENTS:**
-1. {"FOLLOW THE TEMPLATE FORMAT EXACTLY as shown above." if template else "Use formal legal language appropriate for an affidavit in Trinidad and Tobago."}
+1. {"FOLLOW THE TEMPLATE FORMAT EXACTLY AS IS - DO NOT DEVIATE." if template else "Use formal legal language appropriate for an affidavit in Trinidad and Tobago."}
 2. Include all standard affidavit sections as per the template or Trinidad and Tobago format:
    - Header starting with "REPUBLIC OF TRINIDAD AND TOBAGO:" (NO extra title before this)
    - "IN THE MATTER OF THE STATUTORY DECLARATION ACT"
@@ -394,6 +429,7 @@ User wrote: "work at hospital" → "employed at the hospital"
 4. Ensure the document is suitable for commissioning.
 5. DO NOT add "SWORN/AFFIRMED before me at" with City/Town, Province/State fields - use the simple commissioner format.
 6. If a calculated age (_calculated_age) is provided, use THAT age in the document, not any user-entered age field.
+7. **DO NOT ADD ANY EXTRA SECTIONS OR TEXT NOT PRESENT IN THE TEMPLATE.**
 
 {f"**Required Sections:** {', '.join(required_sections)}" if required_sections else ""}
 
@@ -412,7 +448,8 @@ Generate the complete affidavit in HTML format:
         logger.info("=" * 80)
         # ===== END PROMPT LOG =====
         
-        response = client.chat.completions.create(
+        response = call_openai_with_retry(
+            client=client,
             model=settings.OPENAI_DRAFT_MODEL,
             messages=[
                 {"role": "system", "content": base_instruction},
@@ -532,27 +569,19 @@ def validate_inputs_before_submission(
 **CRITICAL RULES:**
 1. BE LENIENT on spelling/grammar - The AI drafter will fix those
 2. BE STRICT on future dates, gibberish, and contradictions - these MUST be flagged
-3. DO NOT return "informational notes" - ONLY REAL ERRORS
+3. DO NOT return "informational notes" or "observations" - ONLY REAL ERRORS
 4. If a value is VALID, do NOT include it in any error list
 5. If house_age is given as a date, CALCULATE the age yourself
+6. **IGNORE future date checks for these specific fields:** "current_date", "declaration_day", "declaration_month", "declaration_year", "declaration_date" - these refer to the document date which is TODAY.
 
 **FLAG THESE SERIOUS PROBLEMS:**
 
-1. **FUTURE DATES (CRITICAL - MUST CHECK):**
-   - Check declaration_month + declaration_year + declaration_day combinations
-   - If the date is IN THE FUTURE compared to current date → INVALID
-   - Example: Current date is February 4, 2026. User enters "March 2026" → FUTURE DATE ❌
-   - Example: Current date is February 4, 2026. User enters "February 10, 2026" → FUTURE DATE ❌
-   - Example: User enters "January 2026" → VALID ✅ (in the past)
-   - Check ANY date-related fields (declaration_month, declaration_year, declaration_day, event dates)
-   - Month names: January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, September=9, October=10, November=11, December=12
-
-2. **PURE GIBBERISH (keyboard mashing):**
+1. **PURE GIBBERISH (keyboard mashing):**
    - Examples: "ihdhfihdbhb", "asdfasdfasdf", "fgdgsgsdvchdvudv", "jkljkljkl"
    - Random characters with NO recognizable words
    - Must be COMPLETELY meaningless
 
-3. **TRAILING GIBBERISH (valid start, bad ending) - BE AGGRESSIVE:**
+2. **TRAILING GIBBERISH (valid start, bad ending) - BE AGGRESSIVE:**
    - "15 Queen Street asdfasdf" → INVALID (gibberish at end)
    - "replacing windows hahahah i am happy" → INVALID (irrelevant at end)
    - "fixing the roof khdfbiewbfiwbf" → INVALID (gibberish at end)
@@ -562,22 +591,22 @@ def validate_inputs_before_submission(
    - "text here ......." → INVALID (trailing dots)
    - Look for: random chars, "haha", "lol", "????", "!!!!", ".....", keyboard mashing ANYWHERE in the text
 
-4. **COMPLETELY IRRELEVANT ANSWERS:**
+3. **COMPLETELY IRRELEVANT ANSWERS:**
    - Asked about property, user says "i'm sick" or "i'm sad hahaha" → INVALID
    - Asked about address, user says "i don't like this" → INVALID
    - The answer has NOTHING to do with the question
 
-5. **ACTUAL MATHEMATICAL CONTRADICTIONS:**
+4. **ACTUAL MATHEMATICAL CONTRADICTIONS:**
    - Residence duration > person's age → IMPOSSIBLE
    - Residence duration > house age → IMPOSSIBLE
    - Events before person was born → IMPOSSIBLE
    - ONLY flag when math is truly impossible
 
-6. **IMPOSSIBLE VALUES:**
+5. **IMPOSSIBLE VALUES:**
    - Age 250, Age -5 → INVALID
    - Negative durations → INVALID
 
-7. **ID NUMBER FORMAT (Trinidad & Tobago) - 11 DIGITS WITH DOB:**
+6. **ID NUMBER FORMAT (Trinidad & Tobago) - 11 DIGITS WITH DOB:**
    - Electoral ID MUST be exactly 11 digits in format YYYYMMDDXXX
    - First 8 digits encode date of birth: YYYYMMDD (Year-Month-Day)
    - Last 3 digits are unique sequence number
@@ -671,37 +700,21 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
 
 **CRITICAL INSTRUCTIONS - CHECK THESE IN ORDER:**
 
-1. **FUTURE DATE CHECK (MOST IMPORTANT):**
-   - Look for declaration_month, declaration_year, declaration_day fields
-   - Convert month name to number (March=3, April=4, etc.)
-   - TODAY'S DATE IS VALID - do NOT flag today as future!
-   - Comparison rules:
-     * If year > {current_year} → FUTURE DATE ❌
-     * If year == {current_year} AND month > {current_month} → FUTURE DATE ❌
-     * If year == {current_year} AND month == {current_month} AND day > {current_day} → FUTURE DATE ❌
-     * If year == {current_year} AND month == {current_month} AND day == {current_day} → TODAY = VALID ✅
-   - Examples with current date {current_month_name} {current_day}, {current_year}:
-     * Month="March", Year="2026" → March=3 > {current_month} = FUTURE ❌
-     * Month="February", Year="2026", Day=5 → Same month, but 5 > {current_day} = FUTURE ❌
-     * Month="February", Year="2026", Day=4 → Same month, 4 == {current_day} = TODAY = VALID ✅
-     * Month="February", Year="2026", Day=3 → Same month, 3 < {current_day} = PAST = VALID ✅
-     * Month="January", Year="2026" → January=1 < {current_month} = PAST ✅
-
-2. **TRAILING GIBBERISH CHECK:**
+1. **TRAILING GIBBERISH CHECK:**
    - Scan EVERY text field for gibberish at the END
    - Look for: random characters, "haha", "lol", "????", "!!!!", ".....", keyboard mashing
    - Example: "15 Queen Street asdfg" → Has gibberish "asdfg" at end → INVALID
    - Example: "fixing roof hahaha" → Has "hahaha" at end → INVALID
 
-3. **PURE GIBBERISH CHECK:**
+2. **PURE GIBBERISH CHECK:**
    - Fields that are ENTIRELY meaningless: "asdfasdf", "jkljkl", etc.
 
-4. **CONTRADICTION CHECK:**
+3. **CONTRADICTION CHECK:**
    - Calculate age from date_of_birth if present
-   - Calculate house age from build date if present
+   - Calculate house age from build date
    - ONLY FLAG if residence > age OR residence > house_age
 
-5. **ID FORMAT CHECK (SUPPORTS MULTIPLE ID TYPES):**
+4. **ID FORMAT CHECK (SUPPORTS MULTIPLE ID TYPES):**
    Trinidad & Tobago accepts THREE types of ID documents:
    
    a) **Electoral ID (11 digits):**
@@ -737,7 +750,8 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
 **BE LENIENT** on spelling/grammar - the AI drafter fixes that.
 """
 
-        response = client.chat.completions.create(
+        response = call_openai_with_retry(
+            client=client,
             model=settings.OPENAI_QA_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -802,51 +816,25 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
         fields_to_remove = []
         
         # === MULTI-FIELD DATE VALIDATION ===
-        # Check for declaration_year + declaration_month + declaration_day combinations
-        if 'declaration_year' in answers_json and 'declaration_month' in answers_json and 'declaration_day' in answers_json:
-            try:
-                year_val = answers_json.get('declaration_year', '').strip()
-                month_val = answers_json.get('declaration_month', '').strip().lower()
-                day_val = answers_json.get('declaration_day', '').strip()
-                
-                # Parse year
-                year = int(year_val) if year_val.isdigit() else None
-                
-                # Parse month (name or number)
-                if month_val.isdigit():
-                    month = int(month_val)
-                else:
-                    month = month_names.get(month_val[:3], 0)
-                
-                # Parse day
-                day = int(day_val) if day_val.isdigit() else None
-                
-                if year and month and day:
-                    declaration_date = datetime(year, month, day).date()
-                    is_future = declaration_date > today
-                    
-                    # Check if AI flagged any of these fields
-                    for field in ['declaration_year', 'declaration_month', 'declaration_day']:
-                        ai_flagged = field in invalid_fields
-                        ai_says_future = ai_flagged and any(kw in invalid_fields.get(field, '').lower() for kw in ['future', 'ahead', 'not yet', 'hasn\'t happened'])
-                        
-                        if is_future and not ai_flagged:
-                            # Date IS future but AI missed it - add error
-                            invalid_fields[field] = f'Declaration date {declaration_date.strftime("%B %d, %Y")} is in the future (today is {today.strftime("%B %d, %Y")})'
-                            all_valid = False
-                        elif not is_future and ai_says_future:
-                            # Date is NOT future but AI hallucinated - REMOVE the error
-                            logger.info(f"Python override: Removing AI hallucination for valid date field {field} (combined date: {declaration_date}, today: {today})")
-                            fields_to_remove.append(field)
-            except (ValueError, KeyError) as e:
-                logger.warning(f"Could not parse multi-field date: {e}")
+        # (Removed future date check for declaration dates as per user requirement)
         
+        # Fields to explicitly ignore for future date checks (they are typically today's date)
+        ignore_future_check_fields = ['current_date', 'declaration_day', 'declaration_month', 'declaration_year', 'declaration_date']
+
         for field_name, field_value in answers_json.items():
             if not isinstance(field_value, str):
                 continue
             
             field_lower = field_name.lower()
             value_lower = field_value.lower().strip()
+            
+            # === EXPLICIT IGNORE FOR DECLARATION DATES ===
+            if any(ignore_kw in field_lower for ignore_kw in ignore_future_check_fields):
+                # If AI flagged this field, remove it - we trust these are today's date
+                if field_name in invalid_fields:
+                    logger.info(f"Python override: Removing AI error for {field_name} (declaration/current date field)")
+                    fields_to_remove.append(field_name)
+                continue
             
             # === ID VALIDATION OVERRIDE ===
             # Check if AI flagged an ID field - verify with Python
@@ -1144,7 +1132,7 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
                 continue
             
             # Date validation - check for future dates
-            if any(kw in field_lower for kw in ['date', 'when', 'occurred', 'incident', 'event']) and 'birth' not in field_lower and 'dob' not in field_lower:
+            if any(kw in field_lower for kw in ['date', 'when', 'occurred', 'incident', 'event']) and 'birth' not in field_lower and 'dob' not in field_lower and not any(ign in field_lower for ign in ['declaration', 'current_date']):
                 from datetime import datetime
                 today = datetime.now().date()
                 date_patterns = [
@@ -1323,24 +1311,45 @@ def qa_check(
    - DO NOT flag HTML tags like <p>, <strong>, <br>, <ol>, <li> - these are REQUIRED
    - Only flag if HTML is malformed or broken
 
-2. **DISALLOWED PHRASES - EXACT MATCHING ONLY:**
+2. **IGNORE SPELLING/CAPITALIZATION DIFFERENCES (CRITICAL):**
+   - **DO NOT COMPARE** the draft against user input for spelling, capitalization, or grammar.
+   - **ASSUME THE DRAFT IS CORRECT** and the user input was sloppy.
+   - **NEVER FLAG** "Bacolet Street" vs "bacolet street".
+   - **NEVER FLAG** "Mother" vs "motther".
+   - **NEVER FLAG** "Port of Spain" vs "pos".
+   - **NEVER FLAG** "John Doe" vs "john doe".
+   - The User Input is ONLY provided to check if *facts* are missing. It is NOT a spell-check reference.
+   - If the draft says "Mother" and user said "motther", this is **PERFECT**. DO NOT FLAG.
+   - If the draft says "123 Main St" and user said "123 main street", this is **PERFECT**. DO NOT FLAG.
+
+3. **DISALLOWED PHRASES - EXACT MATCHING ONLY:**
    - You will receive a list of EXACT phrases to avoid (e.g., "I swear", "I promise")
-   - ONLY flag if the draft contains these EXACT phrases or very close variations
-   - "I am aware" is NOT the same as "I swear" - don't flag unrelated text
-   - Be PRECISE: Check for actual matches, not similar-sounding words
+   - ONLY flag if the draft contains these EXACT phrases.
+   - "I am aware" is NOT the same as "I swear" - don't flag unrelated text.
 
-3. **HALLUCINATION CHECK - CROSS-REFERENCE USER DATA:**
-   - You will receive the user's answers
-   - BEFORE flagging hallucination, CHECK if the data exists in user answers
-   - Example: If user provided "city: Muzaffargarh", DO NOT flag it as hallucination
-   - ONLY flag if AI invented facts that are NOT in user answers at all
+4. **HALLUCINATION CHECK - LOOSE FACTUAL CHECK ONLY:**
+   - Only flag if the AI invented a NEW FACT that is completely unrelated to the user input.
+   - Example: User said "Car", Draft says "Toyota Corolla" -> This IS a hallucination (flag it).
+   - Example: User said "Car", Draft says "Vehicle" -> This is NOT a hallucination (synonym).
+   - Example: User said "bacolet st", Draft says "Bacolet Street" -> This is NOT a hallucination (formatting).
 
-4. **TEMPLATE COMPLIANCE - BE SPECIFIC:**
-   - Don't flag "Entire document" - that's useless
-   - If flagging template issues, quote the SPECIFIC section that's wrong
-   - Only flag if sections are missing or structure is significantly different
+5. **TEMPLATE COMPLIANCE - BE SPECIFIC:**
+   - Flag if the AI added headers like "AFFIDAVIT" that are not in the template.
+   - Flag if the AI added extra sections not in the template.
+   - Flag if the AI removed critical legal sections.
 
-5. **LEGAL LANGUAGE - FOCUS ON SUBSTANCE:**
+**DO NOT FLAG:**
+- **ANY** spelling difference between draft and user input.
+- **ANY** capitalization difference between draft and user input.
+- **ANY** rephrasing (e.g., "live there" -> "reside at").
+- HTML tags.
+
+**ONLY FLAG REAL PROBLEMS:**
+- Template violations (wrong structure, extra headers).
+- Legal errors (missing attestation).
+- Made-up facts (names/dates that don't exist in input).
+- Disallowed phrases (exact matches).
+
    - Check if legal terminology is correct
    - Check if declarations are properly worded
    - Don't nitpick minor formatting preferences
@@ -1568,6 +1577,31 @@ def process_request(request_obj) -> dict:
     
     # Save the draft
     request_obj.draft_text = draft_result['draft_text']
+    
+    # Step 2: Run QA Check
+    # We run this for ALL requests to populate the flags, even if instant mode
+    try:
+        qa_result = qa_check(
+            draft_text=request_obj.draft_text,
+            answers_json=final_answers,
+            policy_json=affidavit_type.policy_json,
+            affidavit_type_name=affidavit_type.name,
+            template_html=affidavit_type.template_html,
+            disallowed_phrases=affidavit_type.disallowed_phrases
+        )
+        
+        request_obj.qa_flags_json = qa_result.get('issues', [])
+        request_obj.qa_passed = qa_result.get('status') == 'approved'
+        
+        # Log QA results
+        logger.info(f"[PROCESS_REQUEST] QA Check Result: {qa_result.get('status')}")
+        logger.info(f"[PROCESS_REQUEST] QA Issues Found: {len(request_obj.qa_flags_json)}")
+        
+    except Exception as e:
+        logger.error(f"[PROCESS_REQUEST] QA Check failed: {e}")
+        # Don't fail the request if QA fails, just log it
+        request_obj.qa_flags_json = []
+        request_obj.qa_passed = True
     
     # All requests go to human review (no QA flagging - reviewer reads completely)
     if request_obj.affidavit_type.is_instant_mode:
