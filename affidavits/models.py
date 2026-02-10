@@ -464,6 +464,25 @@ class AffidavitType(models.Model):
     )
     # Example: ["I think", "maybe", "approximately", "I believe"]
     
+    # Validation rules (per-affidavit custom validation logic)
+    validation_rules = models.JSONField(
+        default=list,
+        help_text="Custom validation rules for this affidavit type (field comparisons, required_if, etc.)"
+    )
+    # Example structure:
+    # [
+    #   {
+    #     "id": "rule-1",
+    #     "type": "comparison",
+    #     "primary_field": "age",
+    #     "secondary_field": "residence_duration",
+    #     "operator": "gte",
+    #     "compare_as": "number",
+    #     "target_field": "residence_duration",
+    #     "message": "You cannot have lived somewhere longer than your age."
+    #   }
+    # ]
+    
     # Legacy field for backward compatibility
     is_instant_mode = models.BooleanField(
         default=False,

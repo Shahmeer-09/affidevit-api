@@ -36,7 +36,7 @@ from .views import (
     ReviewerFeedbackCreateView,
     SubmitFeedbackView,
     # Admin
-    AffidavitTypePolicyView, ConfidenceDashboardView, LearningExportView,
+    AffidavitTypePolicyView, ValidationRulesView, ConfidenceDashboardView, LearningExportView,
     FrictionDashboardView, PromoteToInstantModeView,
     FullConfidenceDashboardView, TypeTrendView, WeeklyLearningReportView,
     CostDashboardView, LearningSuggestionsView,
@@ -149,6 +149,7 @@ urlpatterns = [
     # Admin Endpoints (Stories 4.1, 4.2, 4.3)
     # ==========================================================================
     path('admin/affidavit-types/<int:pk>/policy/', AffidavitTypePolicyView.as_view(), name='policy_update'),
+    path('admin/affidavit-types/<int:pk>/validation-rules/', ValidationRulesView.as_view(), name='validation_rules'),
     path('admin/affidavit-types/<int:pk>/promote/', PromoteToInstantModeView.as_view(), name='promote_instant'),
     path('admin/dashboard/', ConfidenceDashboardView.as_view(), name='confidence_dashboard'),
     path('admin/dashboard/full/', FullConfidenceDashboardView.as_view(), name='full_confidence_dashboard'),

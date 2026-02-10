@@ -408,9 +408,9 @@ EXAMPLE OF WHAT NOT TO DO:
 ✅ Correct: "making improvements to my old house on land..." OR "making improvements to the house, which is old, on land..."
 
 EXAMPLE OF WHAT TO DO:
-User wrote: "live there 5 year" → "resided there for 5 years"
-User wrote: "car broke" → "the vehicle was damaged"
-User wrote: "work at hospital" → "employed at the hospital"
+User wrote: "live there 5 year" = "resided there for 5 years"
+User wrote: "car broke" = "the vehicle was damaged"
+User wrote: "work at hospital" = "employed at the hospital"
 
 **Transform user input into professional legal language while preserving facts.**
 
@@ -534,10 +534,391 @@ def analyze_input_suitability(
     }
 
 
+def apply_validation_rules(answers_json: dict, rules: list) -> tuple:
+    """
+    Apply custom validation rules to user answers.
+    
+    Args:
+        answers_json: User's intake form answers
+        rules: List of validation rule objects from affidavit type settings
+        
+    Returns:
+        tuple: (invalid_fields dict, validation_notes list)
+    """
+    import re
+    from datetime import datetime, date as dt_date
+    
+    invalid_fields = {}
+    validation_notes = []
+    
+    if not rules:
+        return invalid_fields, validation_notes
+    
+    # Helper function to extract numeric value from text
+    def extract_number(value_str: str, field_name: str = '') -> Optional[float]:
+        """Extract numeric value from text, handling phrases like 'over 3 years', 'since 1990'."""
+        if not value_str:
+            return None
+        
+        value_str = str(value_str).lower().strip()
+        
+        # Try "since YYYY" pattern
+        since_match = re.search(r'since\s+(\d{4})', value_str)
+        if since_match:
+            return float(dt_date.today().year - int(since_match.group(1)))
+        
+        # Try "built in YYYY" pattern
+        built_match = re.search(r'(?:built\s+in|from)\s+(\d{4})', value_str)
+        if built_match:
+            return float(dt_date.today().year - int(built_match.group(1)))
+        
+        # Try "X years/yrs" pattern
+        years_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:years?|yrs?)', value_str)
+        if years_match:
+            return float(years_match.group(1))
+        
+        # Fall back to any number
+        num_match = re.search(r'(\d+(?:\.\d+)?)', value_str)
+        if num_match:
+            return float(num_match.group(1))
+        
+        return None
+    
+    # Helper function to extract date value
+    def extract_date(value_str: str) -> Optional[dt_date]:
+        """Extract date from various formats."""
+        if not value_str:
+            return None
+        
+        value_str = str(value_str).strip()
+        
+        # Try YYYY-MM-DD
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', value_str):
+            try:
+                return datetime.strptime(value_str, '%Y-%m-%d').date()
+            except ValueError:
+                pass
+        
+        # Try DD/MM/YYYY
+        if re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', value_str):
+            try:
+                return datetime.strptime(value_str, '%d/%m/%Y').date()
+            except ValueError:
+                pass
+        
+        return None
+    
+    def evaluate_comparison_clause(clause: dict, default_compare_as: str = 'number') -> Optional[bool]:
+        """Evaluate a single left_field OP right_field clause. Returns True/False, or None if cannot evaluate."""
+        left_field = clause.get('left_field') or clause.get('primary_field')
+        right_field = clause.get('right_field') or clause.get('secondary_field')
+        operator = clause.get('operator', 'gte')
+        compare_as = clause.get('compare_as') or default_compare_as
+
+        if not left_field or not right_field:
+            return None
+        if left_field not in answers_json or right_field not in answers_json:
+            return None
+
+        left_value = answers_json.get(left_field)
+        right_value = answers_json.get(right_field)
+
+        if compare_as == 'number':
+            left_num = extract_number(str(left_value), left_field)
+            right_num = extract_number(str(right_value), right_field)
+            if left_num is None or right_num is None:
+                return None
+            if operator == 'gte':
+                return left_num >= right_num
+            if operator == 'lte':
+                return left_num <= right_num
+            if operator == 'gt':
+                return left_num > right_num
+            if operator == 'lt':
+                return left_num < right_num
+            if operator == 'eq':
+                return left_num == right_num
+            if operator == 'ne':
+                return left_num != right_num
+            return None
+
+        if compare_as == 'date':
+            left_date = extract_date(str(left_value))
+            right_date = extract_date(str(right_value))
+            if left_date is None or right_date is None:
+                return None
+            if operator == 'gte':
+                return left_date >= right_date
+            if operator == 'lte':
+                return left_date <= right_date
+            if operator == 'gt':
+                return left_date > right_date
+            if operator == 'lt':
+                return left_date < right_date
+            if operator == 'eq':
+                return left_date == right_date
+            if operator == 'ne':
+                return left_date != right_date
+            return None
+
+        if compare_as == 'string':
+            left_s = str(left_value).strip().lower()
+            right_s = str(right_value).strip().lower()
+            if operator == 'eq':
+                return left_s == right_s
+            if operator == 'ne':
+                return left_s != right_s
+            if operator == 'contains':
+                return right_s in left_s
+            return None
+
+        return None
+
+    def combine_results(current: bool, next_value: bool, join_with: str) -> bool:
+        join_with = str(join_with or 'AND').strip().upper()
+        if join_with == 'OR':
+            return current or next_value
+        return current and next_value
+
+    # Process each rule
+    for rule in rules:
+        rule_type = rule.get('type', '')
+        message = rule.get('message', 'Validation rule failed')
+
+        # Handle different rule types
+        if rule_type == 'comparison':
+            # Backwards compatible single-pair comparison
+            comparisons = rule.get('comparisons')
+            negate = bool(rule.get('negate', False))
+
+            if isinstance(comparisons, list) and comparisons:
+                # Advanced chained comparisons
+                default_compare_as = rule.get('compare_as', 'number')
+                combined_result: Optional[bool] = None
+                fields_involved = []
+
+                for idx, clause in enumerate(comparisons):
+                    if not isinstance(clause, dict):
+                        continue
+                    left_field = clause.get('left_field')
+                    right_field = clause.get('right_field')
+                    if left_field and left_field not in fields_involved:
+                        fields_involved.append(left_field)
+                    if right_field and right_field not in fields_involved:
+                        fields_involved.append(right_field)
+
+                    clause_result = evaluate_comparison_clause(clause, default_compare_as=default_compare_as)
+                    if clause_result is None:
+                        continue
+
+                    if combined_result is None:
+                        combined_result = clause_result
+                    else:
+                        join_with = clause.get('join_with', 'AND')
+                        combined_result = combine_results(combined_result, clause_result, join_with)
+
+                # If we couldn't evaluate any clauses, skip
+                if combined_result is None:
+                    continue
+
+                if negate:
+                    combined_result = not combined_result
+
+                rule_failed = not combined_result
+                target_field = rule.get('target_field')
+                if not target_field:
+                    first_clause = comparisons[0] if isinstance(comparisons[0], dict) else {}
+                    target_field = first_clause.get('left_field') or rule.get('primary_field', '')
+
+                if rule_failed and target_field:
+                    invalid_fields[target_field] = message
+                    validation_notes.append({
+                        'type': 'rule_violation',
+                        'rule_type': 'comparison_chain',
+                        'field': target_field,
+                        'fields_involved': fields_involved,
+                        'issue': message,
+                        'suggestion': 'Please check the related fields for consistency.'
+                    })
+
+            else:
+                primary_field = rule.get('primary_field', '')
+                secondary_field = rule.get('secondary_field', '')
+                target_field = rule.get('target_field', primary_field)
+                operator = rule.get('operator', 'gte')
+                compare_as = rule.get('compare_as', 'number')
+
+                if not primary_field or not secondary_field:
+                    continue
+                if primary_field not in answers_json or secondary_field not in answers_json:
+                    continue
+
+                single_clause = {
+                    'left_field': primary_field,
+                    'right_field': secondary_field,
+                    'operator': operator,
+                    'compare_as': compare_as,
+                }
+                clause_result = evaluate_comparison_clause(single_clause, default_compare_as=compare_as)
+                if clause_result is None:
+                    continue
+                if negate:
+                    clause_result = not clause_result
+                if not clause_result:
+                    invalid_fields[target_field] = message
+                    validation_notes.append({
+                        'type': 'rule_violation',
+                        'rule_type': 'comparison',
+                        'field': target_field,
+                        'fields_involved': [primary_field, secondary_field],
+                        'issue': message,
+                        'suggestion': f'Please check the values for {primary_field} and {secondary_field}.'
+                    })
+
+        elif rule_type == 'required_if':
+            condition_field = rule.get('condition_field', '')
+            condition_value = rule.get('condition_value', '')
+            required_field = rule.get('required_field') or rule.get('primary_field', '')
+            
+            if condition_field not in answers_json:
+                continue
+            
+            condition_actual = str(answers_json.get(condition_field, '')).strip().lower()
+            condition_expected = str(condition_value).strip().lower()
+            
+            # If condition is met, check if required field is filled
+            if condition_actual == condition_expected:
+                required_actual = str(answers_json.get(required_field, '')).strip()
+                if not required_actual:
+                    invalid_fields[required_field] = message
+                    validation_notes.append({
+                        'type': 'rule_violation',
+                        'rule_type': 'required_if',
+                        'field': required_field,
+                        'fields_involved': [condition_field, required_field],
+                        'issue': message,
+                        'suggestion': f'This field is required when {condition_field} is "{condition_value}".'
+                    })
+
+        elif rule_type == 'disallow_contains':
+            field_name = rule.get('field') or rule.get('primary_field', '')
+            pattern = rule.get('pattern', '')
+            mode = rule.get('mode', 'contains')
+            case_sensitive = bool(rule.get('case_sensitive', False))
+            target_field = rule.get('target_field', field_name)
+
+            if not field_name or not pattern:
+                continue
+            if field_name not in answers_json:
+                continue
+
+            field_value = str(answers_json.get(field_name, '') or '')
+            haystack = field_value if case_sensitive else field_value.lower()
+            needle = pattern if case_sensitive else str(pattern).lower()
+
+            match_found = False
+            if mode == 'regex':
+                try:
+                    flags = 0 if case_sensitive else re.IGNORECASE
+                    match_found = re.search(pattern, field_value, flags=flags) is not None
+                except re.error:
+                    continue
+            else:
+                match_found = needle in haystack
+
+            if match_found and target_field:
+                invalid_fields[target_field] = message
+                validation_notes.append({
+                    'type': 'rule_violation',
+                    'rule_type': 'disallow_contains',
+                    'field': target_field,
+                    'fields_involved': [field_name],
+                    'issue': message,
+                    'suggestion': 'Please remove the disallowed text and try again.'
+                })
+    
+    return invalid_fields, validation_notes
+
+
+def generate_rule_summary_for_ai(rules: list) -> str:
+    """
+    Generate a human-readable summary of validation rules for the AI prompt.
+    
+    Args:
+        rules: List of validation rule objects
+        
+    Returns:
+        str: Formatted rule summary for AI
+    """
+    if not rules:
+        return ""
+    
+    def op_to_text(op: str) -> str:
+        mapping = {
+            'gte': 'greater than or equal to',
+            'lte': 'less than or equal to',
+            'gt': 'greater than',
+            'lt': 'less than',
+            'eq': 'equal to',
+            'ne': 'not equal to',
+        }
+        return mapping.get(op, op)
+
+    summary_lines = ["\n**AFFIDAVIT-SPECIFIC VALIDATION RULES:**"]
+    
+    for idx, rule in enumerate(rules, 1):
+        rule_type = rule.get('type', '')
+        
+        if rule_type == 'comparison':
+            negate = bool(rule.get('negate', False))
+            comparisons = rule.get('comparisons')
+            if isinstance(comparisons, list) and comparisons:
+                parts = []
+                for c_idx, clause in enumerate(comparisons):
+                    if not isinstance(clause, dict):
+                        continue
+                    left_field = clause.get('left_field', '')
+                    right_field = clause.get('right_field', '')
+                    operator = clause.get('operator', 'gte')
+                    compare_as = clause.get('compare_as') or rule.get('compare_as', 'number')
+                    clause_text = f"{left_field} must be {op_to_text(operator)} {right_field} (as {compare_as})"
+                    if c_idx == 0:
+                        parts.append(clause_text)
+                    else:
+                        join_with = str(clause.get('join_with', 'AND')).strip().upper()
+                        parts.append(f"{join_with} {clause_text}")
+                chain_text = " ".join(parts).strip()
+                if negate:
+                    chain_text = f"NOT ({chain_text})"
+                summary_lines.append(f"{idx}. {chain_text}. Error: \"{rule.get('message', '')}\"")
+            else:
+                primary_field = rule.get('primary_field', '')
+                secondary_field = rule.get('secondary_field', '')
+                operator = rule.get('operator', 'gte')
+                compare_as = rule.get('compare_as', 'number')
+                base_text = f"{primary_field} must be {op_to_text(operator)} {secondary_field} (as {compare_as})"
+                if negate:
+                    base_text = f"NOT ({base_text})"
+                summary_lines.append(f"{idx}. {base_text}. Error: \"{rule.get('message', '')}\"")
+        
+        elif rule_type == 'required_if':
+            condition_field = rule.get('condition_field', '')
+            condition_value = rule.get('condition_value', '')
+            required_field = rule.get('required_field', '')
+            message = rule.get('message', '')
+            
+            summary_lines.append(f"{idx}. If {condition_field} is \"{condition_value}\", then {required_field} is required. Error: \"{message}\"")
+    
+    summary_lines.append("\nWhen a rule is violated, return a field error with the specified message.")
+    
+    return "\n".join(summary_lines)
+
+
 def validate_inputs_before_submission(
     answers_json: dict,
     template_html: str,
-    affidavit_type_name: str
+    affidavit_type_name: str,
+    validation_rules: list = None
 ) -> dict:
     """
     Quick validation check BEFORE allowing user to submit.
@@ -564,15 +945,27 @@ def validate_inputs_before_submission(
         if not template_html:
             return {'all_valid': True, 'invalid_fields': {}, 'validation_notes': []}
         
-        system_prompt = """You are a strict field validator for legal documents in Trinidad and Tobago. Your job is to catch serious issues - gibberish, future dates, irrelevant answers, and logical contradictions. Return your response as JSON.
+        # Generate rule summary for AI if validation rules are provided
+        rule_summary = generate_rule_summary_for_ai(validation_rules or [])
+        
+        system_prompt = f"""You are a strict field validator for legal documents in Trinidad and Tobago. Your job is to catch serious issues - gibberish, future dates, irrelevant answers, and invalid ID formats. Return your response as JSON.
 
 **CRITICAL RULES:**
 1. BE LENIENT on spelling/grammar - The AI drafter will fix those
-2. BE STRICT on future dates, gibberish, and contradictions - these MUST be flagged
+2. BE STRICT on future dates, gibberish, and invalid IDs - these MUST be flagged
 3. DO NOT return "informational notes" or "observations" - ONLY REAL ERRORS
 4. If a value is VALID, do NOT include it in any error list
 5. If house_age is given as a date, CALCULATE the age yourself
 6. **IGNORE future date checks for these specific fields:** "current_date", "declaration_day", "declaration_month", "declaration_year", "declaration_date" - these refer to the document date which is TODAY.
+7. **ACCEPT TEXT PHRASES FOR ALL FIELDS** - Fields may be "Short Text" type. Users can write phrases like "for over 3 years", "about twenty-five years old", "since 1990", "more than 10 years" etc. NEVER flag a field just because it contains words instead of a pure number. The drafter will normalize formatting.
+   - "for over 3 years" = extract 3 = VALID
+   - "about 25 years" = extract 25 = VALID
+   - "since 1990" = calculate current_year - 1990 = VALID
+   - "more than a decade" = extract ~10 = VALID
+   - "twenty-five (25) years old" = extract 25 = VALID
+   - Do not reject values just because they contain words
+8. **DO NOT ENFORCE DATA FORMATS** - If a field asks for duration/age/years, accept BOTH pure numbers ("3") AND text phrases ("for over 3 years"). The drafter will normalize the format.
+{rule_summary}
 
 **FLAG THESE SERIOUS PROBLEMS:**
 
@@ -582,40 +975,37 @@ def validate_inputs_before_submission(
    - Must be COMPLETELY meaningless
 
 2. **TRAILING GIBBERISH (valid start, bad ending) - BE AGGRESSIVE:**
-   - "15 Queen Street asdfasdf" → INVALID (gibberish at end)
-   - "replacing windows hahahah i am happy" → INVALID (irrelevant at end)
-   - "fixing the roof khdfbiewbfiwbf" → INVALID (gibberish at end)
-   - "my property is 100sqm lololol" → INVALID (nonsense at end)
-   - "valid address ????" → INVALID (junk at end)
-   - "something !!!!!!!!" → INVALID (excessive punctuation)
-   - "text here ......." → INVALID (trailing dots)
+   - "15 Queen Street asdfasdf" = INVALID (gibberish at end)
+   - "replacing windows hahahah i am happy" = INVALID (irrelevant at end)
+   - "fixing the roof khdfbiewbfiwbf" = INVALID (gibberish at end)
+   - "my property is 100sqm lololol" = INVALID (nonsense at end)
+   - "valid address ????" = INVALID (junk at end)
+   - "something !!!!!!!!" = INVALID (excessive punctuation)
+   - "text here ......." = INVALID (trailing dots)
    - Look for: random chars, "haha", "lol", "????", "!!!!", ".....", keyboard mashing ANYWHERE in the text
 
 3. **COMPLETELY IRRELEVANT ANSWERS:**
-   - Asked about property, user says "i'm sick" or "i'm sad hahaha" → INVALID
-   - Asked about address, user says "i don't like this" → INVALID
-   - The answer has NOTHING to do with the question
+   - The answer has NOTHING to do with the question being asked
+   - User enters jokes, complaints, or off-topic content instead of answering
 
-4. **ACTUAL MATHEMATICAL CONTRADICTIONS:**
-   - Residence duration > person's age → IMPOSSIBLE
-   - Residence duration > house age → IMPOSSIBLE
-   - Events before person was born → IMPOSSIBLE
-   - ONLY flag when math is truly impossible
+4. **DATE REASONABLENESS (NO CROSS-FIELD CONTRADICTIONS):**
+   - Flag truly impossible single-field values (e.g., date_of_birth in the future)
+   - Do NOT attempt cross-field numeric contradiction checking; those are enforced by server-side validation rules.
 
 5. **IMPOSSIBLE VALUES:**
-   - Age 250, Age -5 → INVALID
-   - Negative durations → INVALID
+   - Unreasonable ages (e.g., 250, -5) = INVALID
+   - Negative durations or amounts = INVALID
 
 6. **ID NUMBER FORMAT (Trinidad & Tobago) - 11 DIGITS WITH DOB:**
    - Electoral ID MUST be exactly 11 digits in format YYYYMMDDXXX
    - First 8 digits encode date of birth: YYYYMMDD (Year-Month-Day)
    - Last 3 digits are unique sequence number
    - Extract ONLY the digits from input (ignore spaces, dashes)
-   - Count digits: if count == 11 → Check if valid format ✅
-   - Count digits: if count != 11 → INVALID ❌
-   - Example: "19741104044" → 11 digits, DOB=1974-11-04 → VALID ✅
-   - Example: "1974-11-04-044" → 11 digits → VALID ✅  
-   - Example: "123456789" → 9 digits → INVALID ❌ (old format)
+   - Count digits: if count == 11 = Check if valid format
+   - Count digits: if count != 11 = INVALID
+   - Example: "19741104044" = 11 digits, DOB=1974-11-04 = VALID
+   - Example: "1974-11-04-044" = 11 digits = VALID
+   - Example: "123456789" = 9 digits = INVALID (old format)
    
    **CRITICAL - CROSS-VALIDATE WITH DATE OF BIRTH:**
    - If BOTH electoral_id AND date_of_birth fields are provided:
@@ -624,9 +1014,9 @@ def validate_inputs_before_submission(
      * Compare with the date_of_birth field value
      * ONLY FLAG if they are DIFFERENT (mismatch)
      * DO NOT FLAG if they MATCH - matching is CORRECT!
-   - Example: electoral_id="19741104044" + date_of_birth="1974-11-04" → MATCH → DO NOT FLAG ✅ (this is correct!)
-   - Example: electoral_id="19900614044" + date_of_birth="1990-06-14" → MATCH → DO NOT FLAG ✅ (this is correct!)
-   - Example: electoral_id="19741104044" + date_of_birth="1980-05-15" → MISMATCH → FLAG ERROR ❌
+   - Example: electoral_id="19741104044" + date_of_birth="1974-11-04" = MATCH = DO NOT FLAG (this is correct!)
+   - Example: electoral_id="19900614044" + date_of_birth="1990-06-14" = MATCH = DO NOT FLAG (this is correct!)
+   - Example: electoral_id="19741104044" + date_of_birth="1980-05-15" = MISMATCH = FLAG ERROR
    - ONLY return error when dates are DIFFERENT, NEVER when they match!
    - Error message (only for mismatch): "Your Electoral ID indicates birth date 1974-11-04, but you entered 1980-05-15 as Date of Birth"
 
@@ -635,27 +1025,19 @@ def validate_inputs_before_submission(
 ✅ Spelling errors, informal language, incomplete but meaningful, vague but relevant answers
 
 **OUTPUT FORMAT - INCLUDE HELPFUL SUGGESTIONS:**
-{
+{{
     "all_valid": boolean,
-    "contradictions_found": [
-        {
-            "type": "age_vs_residence" | "house_vs_residence" | "date_contradiction" | "other",
-            "fields_involved": ["field1", "field2"],
-            "explanation": "You said you're 30 years old but have lived here for 45 years. This is impossible - you cannot live somewhere longer than you've been alive.",
-            "suggestion": "Please check: either your age/date of birth or your residence duration needs to be corrected. If you're 30, you could have lived there at most 30 years."
-        }
-    ],
     "field_checks": [
-        {
+        {{
             "field": "field_name",
             "value": "what user entered",
             "is_valid": true/false,
             "issue": "Clear explanation of what's wrong - null if valid",
             "suggestion": "Helpful suggestion of what they SHOULD enter - null if valid. Be specific and give examples.",
             "correct_format": "Show the correct format if applicable (e.g., '123456789' for ID)"
-        }
+        }}
     ]
-}
+}}
 
 **IMPORTANT - ONLY RETURN ACTUAL ERRORS:**
 - If something is VALID, set all_valid=true and return EMPTY arrays
@@ -703,39 +1085,39 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
 1. **TRAILING GIBBERISH CHECK:**
    - Scan EVERY text field for gibberish at the END
    - Look for: random characters, "haha", "lol", "????", "!!!!", ".....", keyboard mashing
-   - Example: "15 Queen Street asdfg" → Has gibberish "asdfg" at end → INVALID
-   - Example: "fixing roof hahaha" → Has "hahaha" at end → INVALID
+   - Example: "15 Queen Street asdfg" = Has gibberish "asdfg" at end = INVALID
+   - Example: "fixing roof hahaha" = Has "hahaha" at end = INVALID
 
 2. **PURE GIBBERISH CHECK:**
    - Fields that are ENTIRELY meaningless: "asdfasdf", "jkljkl", etc.
 
 3. **CONTRADICTION CHECK:**
-   - Calculate age from date_of_birth if present
-   - Calculate house age from build date
-   - ONLY FLAG if residence > age OR residence > house_age
+   - Look for any numeric fields that logically contradict each other
+   - Extract numbers from text phrases (e.g., "for over 3 years" = 3, "since 1990" = current_year - 1990)
+   - ONLY FLAG if the math is truly impossible (e.g., a duration exceeds a person's age)
 
 4. **ID FORMAT CHECK (SUPPORTS MULTIPLE ID TYPES):**
    Trinidad & Tobago accepts THREE types of ID documents:
    
    a) **Electoral ID (11 digits):**
       - Extract ONLY digits (remove spaces, dashes)
-      - If digit count == 11 → VALID
+      - If digit count == 11 = VALID
       - First 8 digits are DOB (YYYYMMDD), last 3 are sequence
-      - Example: "19900909098" → 11 digits → VALID
-      - Example: "1990 09 09 098" → 11 digits → VALID
+      - Example: "19900909098" = 11 digits = VALID
+      - Example: "1990 09 09 098" = 11 digits = VALID
    
    b) **Driver's Permit (8 digits):**
       - Extract ONLY digits
-      - If digit count == 8 → VALID
-      - Example: "12345678" → 8 digits → VALID
+      - If digit count == 8 = VALID
+      - Example: "12345678" = 8 digits = VALID
    
    c) **Passport (2 letters + 6 digits):**
       - Format: Two uppercase letters followed by 6 digits
-      - Examples: "TA123456", "TB987654", "TC456789" → VALID
+      - Examples: "TA123456", "TB987654", "TC456789" = VALID
    
    **VALIDATION RULES:**
-   - If format matches ANY of the above → VALID, DO NOT FLAG
-   - If format matches NONE → INVALID, flag with helpful message
+   - If format matches ANY of the above = VALID, DO NOT FLAG
+   - If format matches NONE = INVALID, flag with helpful message
    - For Electoral ID, cross-validate DOB with date_of_birth field if present
    
    **CROSS-VALIDATE ELECTORAL ID WITH DATE OF BIRTH (only for 11-digit IDs):**
@@ -743,8 +1125,8 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
      * Extract digits 1-4 (year), 5-6 (month), 7-8 (day) from electoral_id
      * Compare with date_of_birth field value
      * ONLY flag if they are DIFFERENT!
-   - Example: electoral_id="19900614044" + date_of_birth="1990-06-14" → MATCH → VALID ✅
-   - Example: electoral_id="19741104044" + date_of_birth="1980-05-15" → MISMATCH → FLAG ❌
+   - Example: electoral_id="19900614044" + date_of_birth="1990-06-14" = MATCH = VALID
+   - Example: electoral_id="19741104044" + date_of_birth="1980-05-15" = MISMATCH = FLAG
 
 **BE STRICT** on future dates and gibberish - these MUST be caught.
 **BE LENIENT** on spelling/grammar - the AI drafter fixes that.
@@ -768,24 +1150,11 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
         invalid_fields = {}
         validation_notes = []
         
-        # Add contradictions to validation notes with high priority
-        for contradiction in result.get('contradictions_found', []):
-            for field in contradiction.get('fields_involved', []):
-                if field not in invalid_fields:
-                    invalid_fields[field] = contradiction.get('explanation', 'Logical contradiction detected')
-            validation_notes.append({
-                'type': 'contradiction',
-                'contradiction_type': contradiction.get('type', 'other'),
-                'fields': contradiction.get('fields_involved', []),
-                'issue': contradiction.get('explanation', 'Logical contradiction detected'),
-                'suggestion': contradiction.get('suggestion', 'Please review the related fields for consistency')
-            })
-        
         # Add individual field issues
         for check in result.get('field_checks', []):
             if not check.get('is_valid', True):
                 field_name = check.get('field', 'unknown')
-                if field_name not in invalid_fields:  # Don't overwrite contradiction messages
+                if field_name not in invalid_fields:
                     invalid_fields[field_name] = check.get('issue', 'Invalid value')
                 validation_notes.append({
                     'type': 'field_error',
@@ -1009,6 +1378,18 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
         # Recalculate all_valid after removing hallucinations
         all_valid = len(invalid_fields) == 0
         
+        # Apply custom validation rules (per-affidavit rules)
+        if validation_rules:
+            rule_invalid_fields, rule_notes = apply_validation_rules(answers_json, validation_rules)
+            # Merge rule violations into invalid_fields (don't overwrite existing errors)
+            for field, message in rule_invalid_fields.items():
+                if field not in invalid_fields:
+                    invalid_fields[field] = message
+            # Merge rule notes
+            validation_notes.extend(rule_notes)
+            # Recalculate all_valid
+            all_valid = len(invalid_fields) == 0
+        
         logger.info(f"Pre-submission validation for {affidavit_type_name}: "
                    f"all_valid={all_valid}, invalid_fields={list(invalid_fields.keys())}")
         
@@ -1028,72 +1409,14 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
         
         import re
         
-        # First, try to detect basic contradictions
-        age = None
-        residence_duration = None
-        house_age = None
-        date_of_birth = None
+        # Apply per-affidavit custom validation rules FIRST (replaces all hardcoded contradiction checks)
+        # This is the generic rule engine that handles any field comparisons defined in affidavit settings
+        if validation_rules:
+            rule_invalid_fields, rule_notes = apply_validation_rules(answers_json, validation_rules)
+            fallback_invalid_fields.update(rule_invalid_fields)
+            fallback_notes.extend(rule_notes)
         
-        # Extract numeric values for contradiction checking
-        for field_name, field_value in answers_json.items():
-            field_lower = field_name.lower()
-            value_str = str(field_value).lower().strip()
-            
-            # Try to extract age
-            if 'date_of_birth' in field_lower or 'dob' in field_lower:
-                try:
-                    from datetime import datetime, date as dt_date
-                    dob = datetime.strptime(str(field_value), '%Y-%m-%d').date()
-                    today = dt_date.today()
-                    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
-                    date_of_birth = field_value
-                except:
-                    pass
-            elif 'age' in field_lower and not 'house' in field_lower:
-                try:
-                    age = int(re.search(r'\d+', str(field_value)).group())
-                except:
-                    pass
-            
-            # Try to extract residence duration
-            if 'residence' in field_lower or 'living' in field_lower or 'resided' in field_lower:
-                try:
-                    match = re.search(r'(\d+)\s*(?:years?|yrs?)', value_str)
-                    if match:
-                        residence_duration = int(match.group(1))
-                except:
-                    pass
-            
-            # Try to extract house age
-            if 'house_age' in field_lower or 'property_age' in field_lower:
-                try:
-                    match = re.search(r'(\d+)\s*(?:years?|yrs?)', value_str)
-                    if match:
-                        house_age = int(match.group(1))
-                except:
-                    pass
-        
-        # Check for contradictions
-        if age is not None and residence_duration is not None:
-            if residence_duration > age:
-                fallback_invalid_fields['residence_duration'] = f'You cannot have lived somewhere for {residence_duration} years if you are only {age} years old'
-                fallback_notes.append({
-                    'type': 'contradiction',
-                    'fields': ['date_of_birth' if date_of_birth else 'age', 'residence_duration'],
-                    'issue': f'Contradiction: You said you\'re {age} years old but have lived here for {residence_duration} years. This is impossible.',
-                    'suggestion': f'Please correct either your age/date of birth or residence duration. If you\'re {age}, you could have lived there at most {age} years.'
-                })
-        
-        if house_age is not None and residence_duration is not None:
-            if residence_duration > house_age:
-                fallback_invalid_fields['house_age'] = f'You cannot have lived in a house for {residence_duration} years if it is only {house_age} years old'
-                fallback_notes.append({
-                    'type': 'contradiction',
-                    'fields': ['house_age', 'residence_duration'],
-                    'issue': f'Contradiction: You said the house is {house_age} years old but you\'ve lived there for {residence_duration} years. The house didn\'t exist!',
-                    'suggestion': f'Please check: if the house is {house_age} years old, you could have lived there at most {house_age} years.'
-                })
-        
+        # Generic checks that apply to ALL affidavit types (gibberish, future dates, ID format)
         for field_name, field_value in answers_json.items():
             if not isinstance(field_value, str) or len(field_value.strip()) == 0:
                 continue
@@ -1417,11 +1740,11 @@ If the USER ANSWERS above contain "PREVIOUS_CLARIFICATIONS":
 - The user has CORRECTED original contradictory data after being asked for clarification
 - PARSE the "User Answer" in the clarification to extract the FINAL CORRECT values
 - When checking for hallucinations, use CLARIFIED values as the source of truth, NOT original fields
-- Example: If original had age=22, years=25, but clarification says "I am 25 and lived for 3 years":
-  → The AI should use age=25 in draft (this is CORRECT, not a hallucination)
-  → The AI should use years=3 in draft (this is CORRECT, not a hallucination)
-- DO NOT flag these as hallucinations - the AI correctly used the user's clarified corrections
-- Only flag if AI used values that contradict BOTH the original data AND the clarifications
+ - Example: If original had age=22, years=25, but clarification says "I am 25 and lived for 3 years":
+   = The AI should use age=25 in draft (this is CORRECT, not a hallucination)
+   = The AI should use years=3 in draft (this is CORRECT, not a hallucination)
+ - DO NOT flag these as hallucinations - the AI correctly used the user's clarified corrections
+ - Only flag if AI used values that contradict BOTH the original data AND the clarifications
 
 **SYSTEM INSTRUCTIONS (AI must follow these):**
 {system_instructions if system_instructions else "Standard professional legal document generation"}

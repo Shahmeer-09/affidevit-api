@@ -792,7 +792,8 @@ class ValidateRequestInputView(APIView):
         validation_result = validate_inputs_before_submission(
             answers_json=translated_answers,
             template_html=affidavit_type.template_html,
-            affidavit_type_name=affidavit_type.name
+            affidavit_type_name=affidavit_type.name,
+            validation_rules=affidavit_type.validation_rules or []
         )
         
         # ===== DEBUG LOGGING =====
@@ -1950,6 +1951,99 @@ class AffidavitTypePolicyView(generics.UpdateAPIView):
     serializer_class = AffidavitTypePolicyUpdateSerializer
     permission_classes = [IsAdminUser]
     queryset = AffidavitType.objects.all()
+
+
+class ValidationRulesView(APIView):
+    """
+    GET/PUT validation rules for a specific affidavit type.
+    Rules are stored as a JSON list on AffidavitType.validation_rules.
+    """
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, pk):
+        try:
+            affidavit_type = AffidavitType.objects.get(pk=pk)
+        except AffidavitType.DoesNotExist:
+            return Response({'error': 'Affidavit type not found'}, status=404)
+        return Response({
+            'affidavit_type_id': affidavit_type.id,
+            'affidavit_type_name': affidavit_type.name,
+            'validation_rules': affidavit_type.validation_rules or []
+        })
+
+    def put(self, request, pk):
+        try:
+            affidavit_type = AffidavitType.objects.get(pk=pk)
+        except AffidavitType.DoesNotExist:
+            return Response({'error': 'Affidavit type not found'}, status=404)
+
+        rules = request.data.get('validation_rules', [])
+        if not isinstance(rules, list):
+            return Response({'error': 'validation_rules must be a list'}, status=400)
+
+        # Basic validation of each rule
+        valid_types = {'comparison', 'required_if', 'disallow_contains'}
+        valid_operators = {'gte', 'lte', 'gt', 'lt', 'eq', 'ne'}
+        valid_compare_as = {'number', 'date', 'string'}
+        valid_join_with = {'AND', 'OR'}
+        valid_contains_mode = {'contains', 'regex'}
+
+        for idx, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                return Response({'error': f'Rule at index {idx} must be an object'}, status=400)
+            rule_type = rule.get('type', '')
+            if rule_type not in valid_types:
+                return Response({'error': f'Rule at index {idx} has invalid type "{rule_type}". Valid: {list(valid_types)}'}, status=400)
+            if not rule.get('message'):
+                return Response({'error': f'Rule at index {idx} is missing a message'}, status=400)
+
+            if rule_type == 'comparison':
+                comparisons = rule.get('comparisons')
+                if comparisons is not None:
+                    if not isinstance(comparisons, list) or len(comparisons) == 0:
+                        return Response({'error': f'Comparison rule at index {idx} comparisons must be a non-empty list'}, status=400)
+                    for c_idx, clause in enumerate(comparisons):
+                        if not isinstance(clause, dict):
+                            return Response({'error': f'Comparison rule at index {idx}, clause {c_idx} must be an object'}, status=400)
+                        if not clause.get('left_field') or not clause.get('right_field'):
+                            return Response({'error': f'Comparison rule at index {idx}, clause {c_idx} requires left_field and right_field'}, status=400)
+                        if clause.get('operator', 'gte') not in valid_operators:
+                            return Response({'error': f'Comparison rule at index {idx}, clause {c_idx} has invalid operator'}, status=400)
+                        compare_as = clause.get('compare_as', rule.get('compare_as', 'number'))
+                        if compare_as not in valid_compare_as:
+                            return Response({'error': f'Comparison rule at index {idx}, clause {c_idx} has invalid compare_as'}, status=400)
+                        if c_idx > 0:
+                            join_with = str(clause.get('join_with', 'AND')).strip().upper()
+                            if join_with not in valid_join_with:
+                                return Response({'error': f'Comparison rule at index {idx}, clause {c_idx} has invalid join_with (use AND/OR)'}, status=400)
+                else:
+                    if not rule.get('primary_field') or not rule.get('secondary_field'):
+                        return Response({'error': f'Comparison rule at index {idx} requires primary_field and secondary_field'}, status=400)
+                    if rule.get('operator', 'gte') not in valid_operators:
+                        return Response({'error': f'Rule at index {idx} has invalid operator'}, status=400)
+                    if rule.get('compare_as', 'number') not in valid_compare_as:
+                        return Response({'error': f'Rule at index {idx} has invalid compare_as'}, status=400)
+
+            elif rule_type == 'required_if':
+                if not rule.get('condition_field') or not rule.get('required_field'):
+                    return Response({'error': f'Required_if rule at index {idx} requires condition_field and required_field'}, status=400)
+
+            elif rule_type == 'disallow_contains':
+                if not rule.get('field') and not rule.get('primary_field'):
+                    return Response({'error': f'Disallow_contains rule at index {idx} requires field'}, status=400)
+                if not rule.get('pattern'):
+                    return Response({'error': f'Disallow_contains rule at index {idx} requires pattern'}, status=400)
+                mode = rule.get('mode', 'contains')
+                if mode not in valid_contains_mode:
+                    return Response({'error': f'Disallow_contains rule at index {idx} has invalid mode (use contains/regex)'}, status=400)
+
+        affidavit_type.validation_rules = rules
+        affidavit_type.save(update_fields=['validation_rules', 'updated_at'])
+
+        return Response({
+            'affidavit_type_id': affidavit_type.id,
+            'validation_rules': affidavit_type.validation_rules
+        })
 
 
 class ConfidenceDashboardView(APIView):

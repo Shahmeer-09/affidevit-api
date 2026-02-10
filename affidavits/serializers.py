@@ -506,6 +506,7 @@ class AffidavitTypeSerializer(serializers.ModelSerializer):
             'tier', 'default_mode', 'confidence_status', 'enabled_on_homepage',
             'policy_version', 'prompt_pack_version', 'template_version',
             'min_volume_threshold', 'intake_schema', 'scenario_library',
+            'validation_rules',
             'is_active', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'min_volume_threshold', 'created_at', 'updated_at']
@@ -587,6 +588,7 @@ class AffidavitTypeAdminSerializer(serializers.ModelSerializer):
             'min_volume_threshold', 
             'intake_schema', 'scenario_library', 'policy_json',
             'template_html', 'template_documents', 'disallowed_phrases',
+            'validation_rules',
             'questions_count', 'template_documents_count',
             'created_at', 'updated_at'
         ]
