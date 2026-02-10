@@ -556,11 +556,33 @@ def apply_validation_rules(answers_json: dict, rules: list) -> tuple:
     
     # Helper function to extract numeric value from text
     def extract_number(value_str: str, field_name: str = '') -> Optional[float]:
-        """Extract numeric value from text, handling phrases like 'over 3 years', 'since 1990'."""
+        """Extract numeric value from text, handling phrases like 'over 3 years', 'since 1990'.
+
+        Special case: for DOB/birth date fields, convert date strings to age-in-years so they can be
+        used in numeric comparison rules (e.g., residence_duration <= age).
+        """
         if not value_str:
             return None
         
         value_str = str(value_str).lower().strip()
+
+        field_lower = str(field_name or '').lower().strip()
+        if any(kw in field_lower for kw in ['date_of_birth', 'dob', 'birth_date', 'birthdate']):
+            try:
+                # YYYY-MM-DD
+                if re.match(r'^\d{4}-\d{2}-\d{2}$', value_str):
+                    dob = datetime.strptime(value_str, '%Y-%m-%d').date()
+                    today = dt_date.today()
+                    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+                    return float(age)
+                # DD/MM/YYYY
+                if re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', value_str):
+                    dob = datetime.strptime(value_str, '%d/%m/%Y').date()
+                    today = dt_date.today()
+                    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+                    return float(age)
+            except ValueError:
+                pass
         
         # Try "since YYYY" pattern
         since_match = re.search(r'since\s+(\d{4})', value_str)
@@ -1091,12 +1113,7 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
 2. **PURE GIBBERISH CHECK:**
    - Fields that are ENTIRELY meaningless: "asdfasdf", "jkljkl", etc.
 
-3. **CONTRADICTION CHECK:**
-   - Look for any numeric fields that logically contradict each other
-   - Extract numbers from text phrases (e.g., "for over 3 years" = 3, "since 1990" = current_year - 1990)
-   - ONLY FLAG if the math is truly impossible (e.g., a duration exceeds a person's age)
-
-4. **ID FORMAT CHECK (SUPPORTS MULTIPLE ID TYPES):**
+3. **ID FORMAT CHECK (SUPPORTS MULTIPLE ID TYPES):**
    Trinidad & Tobago accepts THREE types of ID documents:
    
    a) **Electoral ID (11 digits):**
@@ -1149,21 +1166,54 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
         # Transform into simple format for frontend
         invalid_fields = {}
         validation_notes = []
-        
-        # Add individual field issues
+
+        def _ai_check_is_allowed(check: dict) -> bool:
+            """Allow only general, non-hallucination-prone AI validations.
+
+            Cross-field numeric contradictions are enforced by server-side validation rules.
+            """
+            if not isinstance(check, dict):
+                return False
+            if check.get('is_valid', True):
+                return False
+
+            field_name = str(check.get('field', '') or '').lower()
+            issue = str(check.get('issue', '') or '').lower()
+            suggestion = str(check.get('suggestion', '') or '').lower()
+            text = f"{issue} {suggestion}"
+
+            # ID-related checks (format or DOB mismatch)
+            if any(k in field_name for k in ['electoral', 'national_id', 'id_number', 'passport', 'permit', 'driver']):
+                return True
+            if any(k in text for k in ['electoral id', 'passport', 'permit', 'driver', 'id format', 'digits', '11 digits', '8 digits', 'date of birth', 'dob', 'birth date', 'mismatch']):
+                return True
+
+            # Future/invalid date checks
+            if any(k in text for k in ['future date', 'in the future', 'after today', 'cannot be in the future']):
+                return True
+
+            # Gibberish / irrelevant checks
+            if any(k in text for k in ['gibberish', 'keyboard', 'mashing', 'nonsense', 'irrelevant', 'off-topic', 'not related']):
+                return True
+
+            return False
+
+        filtered_ai_field_checks = []
         for check in result.get('field_checks', []):
-            if not check.get('is_valid', True):
-                field_name = check.get('field', 'unknown')
-                if field_name not in invalid_fields:
-                    invalid_fields[field_name] = check.get('issue', 'Invalid value')
-                validation_notes.append({
-                    'type': 'field_error',
-                    'field': field_name,
-                    'value': check.get('value', ''),
-                    'issue': check.get('issue', 'Invalid value'),
-                    'suggestion': check.get('suggestion', ''),
-                    'correct_format': check.get('correct_format', '')
-                })
+            if not _ai_check_is_allowed(check):
+                continue
+            filtered_ai_field_checks.append(check)
+            field_name = check.get('field', 'unknown')
+            if field_name not in invalid_fields:
+                invalid_fields[field_name] = check.get('issue', 'Invalid value')
+            validation_notes.append({
+                'type': 'field_error',
+                'field': field_name,
+                'value': check.get('value', ''),
+                'issue': check.get('issue', 'Invalid value'),
+                'suggestion': check.get('suggestion', ''),
+                'correct_format': check.get('correct_format', '')
+            })
         
         all_valid = result.get('all_valid', len(invalid_fields) == 0)
         
@@ -1374,6 +1424,16 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
                 del invalid_fields[field_name]
             # Also remove from validation_notes
             validation_notes[:] = [note for note in validation_notes if note.get('field') != field_name]
+
+        # Also remove from returned AI field_checks (so UI doesn't show stale AI errors)
+        filtered_field_checks = []
+        for check in filtered_ai_field_checks:
+            try:
+                if check.get('field') in fields_to_remove:
+                    continue
+                filtered_field_checks.append(check)
+            except AttributeError:
+                continue
         
         # Recalculate all_valid after removing hallucinations
         all_valid = len(invalid_fields) == 0
@@ -1397,7 +1457,7 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
             'all_valid': all_valid,
             'invalid_fields': invalid_fields,
             'validation_notes': validation_notes,
-            'field_checks': result.get('field_checks', [])
+            'field_checks': filtered_field_checks
         }
         
     except Exception as e:
