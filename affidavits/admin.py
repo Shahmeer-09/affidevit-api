@@ -12,7 +12,8 @@ from .models import (
     User, AffidavitType, DecisionTreeNode, 
     Request, Stamp, FrictionReport, ReviewerEdit,
     ReviewerFeedback,
-    RequestEvent, AIRun, AIBaseInstruction, PaymentLog
+    RequestEvent, AIRun, AIBaseInstruction, PaymentLog,
+    CommissionerSlot
 )
 
 
@@ -375,6 +376,18 @@ class RequestEventAdmin(admin.ModelAdmin):
     
     def has_add_permission(self, request):
         return False
+
+
+@admin.register(CommissionerSlot)
+class CommissionerSlotAdmin(admin.ModelAdmin):
+    """Admin for commissioner availability slots."""
+
+    list_display = ['commissioner', 'start_time', 'is_booked', 'request']
+    list_filter = ['is_booked', 'start_time']
+    search_fields = ['commissioner__username', 'commissioner__email', 'request__request_code']
+    raw_id_fields = ['commissioner', 'request']
+    ordering = ['-start_time']
+    date_hierarchy = 'start_time'
     
     def has_change_permission(self, request, obj=None):
         return False

@@ -298,10 +298,23 @@ class GuestAuthView(viewsets.ViewSet):
         # 3. Create Request
         affidavit_type = get_object_or_404(AffidavitType, id=affidavit_type_id)
         
-        # Determine initial status based on draft existence
+        has_draft = bool(draft_text and len(draft_text) > 50)
+        is_instant = affidavit_type.default_mode == AffidavitType.DefaultMode.INSTANT or affidavit_type.is_instant_mode
+        is_review_first = affidavit_type.default_mode == AffidavitType.DefaultMode.REVIEW_FIRST and not affidavit_type.is_instant_mode
+
         initial_status = Request.Status.DRAFT
-        if draft_text and len(draft_text) > 50:
-            initial_status = Request.Status.DRAFT_READY
+        submitted_at = None
+        approved_at = None
+
+        if has_draft:
+            if is_review_first:
+                initial_status = Request.Status.NEEDS_REVIEW
+                submitted_at = timezone.now()
+            elif is_instant:
+                initial_status = Request.Status.APPROVED
+                approved_at = timezone.now()
+            else:
+                initial_status = Request.Status.DRAFT_READY
             
         request_obj = Request.objects.create(
             user=user,
@@ -312,12 +325,14 @@ class GuestAuthView(viewsets.ViewSet):
             prompt_version_used=affidavit_type.prompt_pack_version,
             template_version_used=affidavit_type.template_version,
             status=initial_status,
+            submitted_at=submitted_at,
+            approved_at=approved_at,
             is_paid=True,
             user_paid_at=timezone.now()
         )
 
         # 4. Trigger Async AI only if draft is missing
-        if not draft_text or len(draft_text) <= 50:
+        if not has_draft:
             process_request_async.delay(request_obj.id)
         else:
             RequestEvent.objects.create(
@@ -327,6 +342,22 @@ class GuestAuthView(viewsets.ViewSet):
                 actor_role=user.role,
                 details={'message': 'Draft saved from preview (skipped regeneration)'}
             )
+            if initial_status == Request.Status.NEEDS_REVIEW:
+                RequestEvent.objects.create(
+                    request=request_obj,
+                    action=RequestEvent.Action.SUBMITTED,
+                    actor=user,
+                    actor_role=user.role,
+                    details={'message': 'Submitted for reviewer approval'}
+                )
+            if initial_status == Request.Status.APPROVED:
+                RequestEvent.objects.create(
+                    request=request_obj,
+                    action=RequestEvent.Action.APPROVED,
+                    actor=user,
+                    actor_role=user.role,
+                    details={'message': 'Auto-approved (instant mode)'}
+                )
 
         # 5. Generate Tokens
         refresh = RefreshToken.for_user(user)
@@ -924,16 +955,15 @@ class SelectCommissionerView(APIView):
             user=request.user
         )
         
-        # Only allow selecting commissioner for requests NOT yet approved (locked after approval)
-        # Allowed statuses: DRAFT_READY (initial), NEEDS_REVIEW (change)
-        if request_obj.status == Request.Status.APPROVED:
-             return Response(
-                {'error': 'Commissioner selection is locked for approved requests.'},
+        # Lock selection only after notarization is completed
+        if request_obj.status == Request.Status.COMPLETED:
+            return Response(
+                {'error': 'Commissioner selection is locked for completed requests.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-        
+
         # Ensure status is valid for selection
-        if request_obj.status not in [Request.Status.DRAFT_READY, Request.Status.NEEDS_REVIEW]:
+        if request_obj.status not in [Request.Status.DRAFT_READY, Request.Status.NEEDS_REVIEW, Request.Status.APPROVED]:
              return Response(
                 {'error': 'Request is not ready for commissioner selection.'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -2737,7 +2767,7 @@ class CommissionerBookedSlotsView(generics.ListAPIView):
             commissioner=self.request.user,
             is_booked=True,
             start_time__gte=timezone.now() - timezone.timedelta(hours=24) # Include recent past (24h) for context
-        ).select_related('request', 'request__user', 'request__affidavit_type').order_by('start_time')
+        ).select_related('request', 'request__user', 'request__affidavit_type').order_by('-start_time')
 
 
 class BookSlotView(APIView):

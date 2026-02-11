@@ -85,13 +85,24 @@ def generate_slots_for_commissioner(commissioner: User, days: int = 14, cleanup:
         start_of_day_local = datetime.datetime.combine(today_local, datetime.time.min).replace(tzinfo=commissioner_tz)
         cleanup_start_utc = start_of_day_local.astimezone(datetime.timezone.utc)
         
-        deleted_count, _ = CommissionerSlot.objects.filter(
+        # Remove past unbooked slots (no request) before today
+        past_deleted, _ = CommissionerSlot.objects.filter(
+            commissioner=commissioner,
+            is_booked=False,
+            request__isnull=True,
+            start_time__lt=cleanup_start_utc
+        ).delete()
+        
+        # Remove unbooked slots from today forward so we can regenerate a clean window
+        future_deleted, _ = CommissionerSlot.objects.filter(
             commissioner=commissioner,
             is_booked=False,
             request__isnull=True,
             start_time__gte=cleanup_start_utc
         ).delete()
-        logger.info(f"Cleaned up {deleted_count} stale slots for {commissioner.username} starting from {cleanup_start_utc}")
+        logger.info(
+            f"Cleaned up {past_deleted} past and {future_deleted} future/today slots for {commissioner.username} starting from {cleanup_start_utc}"
+        )
 
     # Use commissioner's timezone so slot dates align with their local day
     today = timezone.now().astimezone(commissioner_tz).date()
