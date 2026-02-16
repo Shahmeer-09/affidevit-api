@@ -414,3 +414,78 @@ def send_ticket_reply_notification(ticket_obj, message_obj) -> dict:
         
     return result
 
+
+def send_otp_email(email: str, otp_code: str, user_name: str = None) -> dict:
+    """
+    Send OTP verification code via email.
+    
+    Args:
+        email: Recipient email address
+        otp_code: 6-digit OTP code
+        user_name: User's name for personalization
+        
+    Returns:
+        dict: {'success': bool, 'error': str or None}
+    """
+    context = {
+        'user_name': user_name or 'there',
+        'otp_code': otp_code,
+    }
+    
+    result = send_email_with_template(
+        subject=f"Your Verification Code: {otp_code}",
+        template_name='otp_verification.html',
+        context=context,
+        recipient_email=email
+    )
+    
+    if result['success']:
+        logger.info(f"Sent OTP email to {email}")
+    else:
+        logger.error(f"Failed to send OTP email to {email}: {result.get('error')}")
+        
+    return result
+
+
+def send_welcome_email(
+    email: str, 
+    temp_password: str, 
+    reset_link: str, 
+    user_name: str = None,
+    phone_number: str = None
+) -> dict:
+    """
+    Send welcome email with temporary password and password reset link.
+    
+    Args:
+        email: Recipient email address
+        temp_password: Temporary password
+        reset_link: Link to password reset page
+        user_name: User's name for personalization
+        phone_number: User's phone number (optional)
+        
+    Returns:
+        dict: {'success': bool, 'error': str or None}
+    """
+    context = {
+        'user_name': user_name or 'there',
+        'temp_password': temp_password,
+        'reset_link': reset_link,
+        'email': email,
+        'phone_number': phone_number,
+    }
+    
+    result = send_email_with_template(
+        subject="Welcome to Affidavit Express - Your Account Details",
+        template_name='welcome_account.html',
+        context=context,
+        recipient_email=email
+    )
+    
+    if result['success']:
+        logger.info(f"Sent welcome email to {email}")
+    else:
+        logger.error(f"Failed to send welcome email to {email}: {result.get('error')}")
+        
+    return result
+

@@ -58,8 +58,11 @@ from .services.notification_service import (
     send_clarification_notification,
     send_completion_notification,
     send_ticket_created_notification,
-    send_ticket_reply_notification
+    send_ticket_reply_notification,
+    send_otp_email,
+    send_welcome_email
 )
+from .services.twilio_service import TwilioService
 from .services.dashboard_service import (
     get_dashboard_data,
     get_weekly_learning_report,
@@ -184,14 +187,50 @@ class GuestAuthView(viewsets.ViewSet):
 
     @action(detail=False, methods=['post'])
     def start(self, request):
-        """Start guest signup - Send OTP (Mock)."""
+        """Start guest signup - Generate and send OTP via WhatsApp/SMS + Email."""
+        import random
+        
         serializer = GuestSignupStartSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        # Mock Logic: In real world, generate OTP and send email.
-        # For now, just acknowledge.
+        
+        email = serializer.validated_data['email']
+        full_name = serializer.validated_data['full_name']
+        phone_number = serializer.validated_data.get('phone_number', '')
+        
+        # Generate 6-digit OTP
+        otp_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+        
+        # Store OTP temporarily (we'll verify it in the verify endpoint)
+        # Use cache or session - for now we'll store in a temp user or cache
+        from django.core.cache import cache
+        cache_key = f"otp_{email}"
+        cache.set(cache_key, {
+            'otp': otp_code,
+            'full_name': full_name,
+            'phone_number': phone_number,
+            'created_at': timezone.now().isoformat()
+        }, timeout=600)  # 10 minutes expiry
+        
+        # Send OTP via Email (always)
+        email_result = send_otp_email(
+            email=email,
+            otp_code=otp_code,
+            user_name=full_name
+        )
+        
+        # Send OTP via WhatsApp/SMS if phone number provided
+        sms_result = {'success': False, 'channel': None, 'error': 'No phone number provided'}
+        if phone_number:
+            sms_result = TwilioService.send_otp_message(
+                phone_number=phone_number,
+                otp_code=otp_code
+            )
+        
         return Response({
-            "message": "OTP sent to email.",
-            "mock_otp": "123456" # For dev convenience
+            "message": "Verification code sent successfully.",
+            "email_sent": email_result.get('success', False),
+            "sms_sent": sms_result.get('success', False),
+            "sms_channel": sms_result.get('channel'),  # 'whatsapp' or 'sms'
         })
 
     @action(detail=False, methods=['post'])
@@ -211,11 +250,28 @@ class GuestAuthView(viewsets.ViewSet):
         answers_json = serializer.validated_data['answers_json']
         draft_text = serializer.validated_data.get('draft_text', '')
 
-        # 1. Verify OTP (Mock: Accept any 6 digit)
-        if len(otp) != 6:
-             return Response({"otp": "Invalid OTP"}, status=status.HTTP_400_BAD_REQUEST)
+        # 1. Verify OTP from cache
+        from django.core.cache import cache
+        cache_key = f"otp_{email}"
+        cached_data = cache.get(cache_key)
+        
+        if not cached_data:
+            return Response({"otp": "OTP expired or not found. Please request a new code."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        if cached_data.get('otp') != otp:
+            return Response({"otp": "Invalid OTP code."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # OTP verified - clear from cache
+        cache.delete(cache_key)
+        
+        # Use cached phone_number if not provided in verify request
+        if not phone_number and cached_data.get('phone_number'):
+            phone_number = cached_data.get('phone_number')
 
         # 2. Get or Create User
+        is_new_user = False
+        temp_password = None
+        
         try:
             user = User.objects.get(email__iexact=email)
             # Update existing user info if needed
@@ -266,11 +322,15 @@ class GuestAuthView(viewsets.ViewSet):
             first_name = parts[0]
             last_name = parts[1] if len(parts) > 1 else ''
 
+            # Generate temporary password
+            temp_password = get_random_string(12)
+            is_new_user = True
+
             try:
                 user = User.objects.create_user(
                     username=username,
                     email=email,
-                    password=User.objects.make_random_password() if hasattr(User.objects, 'make_random_password') else get_random_string(12),
+                    password=temp_password,
                     first_name=first_name,
                     last_name=last_name,
                     phone_number=phone_number,
@@ -298,23 +358,10 @@ class GuestAuthView(viewsets.ViewSet):
         # 3. Create Request
         affidavit_type = get_object_or_404(AffidavitType, id=affidavit_type_id)
         
-        has_draft = bool(draft_text and len(draft_text) > 50)
-        is_instant = affidavit_type.default_mode == AffidavitType.DefaultMode.INSTANT or affidavit_type.is_instant_mode
-        is_review_first = affidavit_type.default_mode == AffidavitType.DefaultMode.REVIEW_FIRST and not affidavit_type.is_instant_mode
-
+        # Determine initial status based on draft existence
         initial_status = Request.Status.DRAFT
-        submitted_at = None
-        approved_at = None
-
-        if has_draft:
-            if is_review_first:
-                initial_status = Request.Status.NEEDS_REVIEW
-                submitted_at = timezone.now()
-            elif is_instant:
-                initial_status = Request.Status.APPROVED
-                approved_at = timezone.now()
-            else:
-                initial_status = Request.Status.DRAFT_READY
+        if draft_text and len(draft_text) > 50:
+            initial_status = Request.Status.DRAFT_READY
             
         request_obj = Request.objects.create(
             user=user,
@@ -325,14 +372,12 @@ class GuestAuthView(viewsets.ViewSet):
             prompt_version_used=affidavit_type.prompt_pack_version,
             template_version_used=affidavit_type.template_version,
             status=initial_status,
-            submitted_at=submitted_at,
-            approved_at=approved_at,
             is_paid=True,
             user_paid_at=timezone.now()
         )
 
         # 4. Trigger Async AI only if draft is missing
-        if not has_draft:
+        if not draft_text or len(draft_text) <= 50:
             process_request_async.delay(request_obj.id)
         else:
             RequestEvent.objects.create(
@@ -342,24 +387,32 @@ class GuestAuthView(viewsets.ViewSet):
                 actor_role=user.role,
                 details={'message': 'Draft saved from preview (skipped regeneration)'}
             )
-            if initial_status == Request.Status.NEEDS_REVIEW:
-                RequestEvent.objects.create(
-                    request=request_obj,
-                    action=RequestEvent.Action.SUBMITTED,
-                    actor=user,
-                    actor_role=user.role,
-                    details={'message': 'Submitted for reviewer approval'}
-                )
-            if initial_status == Request.Status.APPROVED:
-                RequestEvent.objects.create(
-                    request=request_obj,
-                    action=RequestEvent.Action.APPROVED,
-                    actor=user,
-                    actor_role=user.role,
-                    details={'message': 'Auto-approved (instant mode)'}
+
+        # 5. Send Welcome Message for new users
+        if is_new_user and temp_password:
+            # Build password reset link
+            from django.conf import settings
+            site_url = getattr(settings, 'SITE_URL', 'http://localhost:3000')
+            reset_link = f"{site_url}/reset-password?email={email}"
+            
+            # Send welcome email with temp password
+            send_welcome_email(
+                email=email,
+                temp_password=temp_password,
+                reset_link=reset_link,
+                user_name=full_name,
+                phone_number=phone_number
+            )
+            
+            # Send welcome message via WhatsApp/SMS if phone number provided
+            if phone_number:
+                TwilioService.send_welcome_message(
+                    phone_number=phone_number,
+                    temp_password=temp_password,
+                    reset_link=reset_link
                 )
 
-        # 5. Generate Tokens
+        # 6. Generate Tokens
         refresh = RefreshToken.for_user(user)
 
         return Response({
@@ -367,6 +420,7 @@ class GuestAuthView(viewsets.ViewSet):
             'request': RequestDetailSerializer(request_obj, context={'request': request}).data,
             'refresh': str(refresh),
             'access': str(refresh.access_token),
+            'is_new_user': is_new_user,
         }, status=status.HTTP_201_CREATED)
 
 
@@ -955,15 +1009,16 @@ class SelectCommissionerView(APIView):
             user=request.user
         )
         
-        # Lock selection only after notarization is completed
-        if request_obj.status == Request.Status.COMPLETED:
-            return Response(
-                {'error': 'Commissioner selection is locked for completed requests.'},
+        # Only allow selecting commissioner for requests NOT yet approved (locked after approval)
+        # Allowed statuses: DRAFT_READY (initial), NEEDS_REVIEW (change)
+        if request_obj.status == Request.Status.APPROVED:
+             return Response(
+                {'error': 'Commissioner selection is locked for approved requests.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
-
+        
         # Ensure status is valid for selection
-        if request_obj.status not in [Request.Status.DRAFT_READY, Request.Status.NEEDS_REVIEW, Request.Status.APPROVED]:
+        if request_obj.status not in [Request.Status.DRAFT_READY, Request.Status.NEEDS_REVIEW]:
              return Response(
                 {'error': 'Request is not ready for commissioner selection.'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -2767,7 +2822,7 @@ class CommissionerBookedSlotsView(generics.ListAPIView):
             commissioner=self.request.user,
             is_booked=True,
             start_time__gte=timezone.now() - timezone.timedelta(hours=24) # Include recent past (24h) for context
-        ).select_related('request', 'request__user', 'request__affidavit_type').order_by('-start_time')
+        ).select_related('request', 'request__user', 'request__affidavit_type').order_by('start_time')
 
 
 class BookSlotView(APIView):

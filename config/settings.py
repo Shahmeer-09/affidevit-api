@@ -122,7 +122,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'America/Port_of_Spain'
+TIME_ZONE = 'UTC'
 
 USE_I18N = True
 
@@ -247,10 +247,6 @@ CELERY_BEAT_SCHEDULE = {
     'generate-weekly-learning-report': {
         'task': 'affidavits.tasks.generate_weekly_learning_report',
         'schedule': 604800.0,  # Weekly (7 days)
-    },
-    'generate-daily-slots': {
-        'task': 'affidavits.tasks.generate_daily_slots',
-        'schedule': 86400.0,  # Daily (24 hours)
     },
 }
 

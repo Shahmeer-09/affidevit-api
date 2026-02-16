@@ -312,6 +312,19 @@ class User(AbstractUser):
         help_text="Office/business address for commissioner"
     )
     
+    # OTP verification fields
+    otp_code = models.CharField(
+        max_length=6,
+        blank=True,
+        null=True,
+        help_text="Current OTP code for verification"
+    )
+    otp_created_at = models.DateTimeField(
+        blank=True,
+        null=True,
+        help_text="Time when the current OTP was generated"
+    )
+    
     class Meta:
         db_table = 'users'
         verbose_name = 'User'

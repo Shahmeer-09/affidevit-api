@@ -1,0 +1,74 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Welcome to Affidavit Express{% endblock %}
+
+{% block header %}
+<div class="email-header">
+    <h1>Welcome to Affidavit Express!</h1>
+    <div class="subtitle">Your account has been created</div>
+</div>
+{% endblock %}
+
+{% block body %}
+<div class="greeting">Hello {{ user_name|default:"there" }},</div>
+
+<div class="success-box">
+    <div class="title">🎉 Account Created Successfully</div>
+    <div class="text">Your Affidavit Express account is ready to use.</div>
+</div>
+
+<div class="content">
+    <p>We've created a temporary password for your account. For security reasons, please change it as soon as possible.</p>
+</div>
+
+<div class="request-code">
+    <div class="label">Your Temporary Password</div>
+    <div class="code">{{ temp_password }}</div>
+</div>
+
+<div class="warning-box">
+    <div class="title">🔐 Important Security Notice</div>
+    <div class="text">Please change your password immediately using the button below. This temporary password should not be used long-term.</div>
+</div>
+
+<div style="text-align: center;">
+    <a href="{{ reset_link }}" class="cta-button">Change Your Password</a>
+</div>
+
+<div class="content" style="margin-top: 30px;">
+    <p>Or copy and paste this link into your browser:</p>
+    <p style="word-break: break-all; color: #2563eb; font-size: 14px;">{{ reset_link }}</p>
+</div>
+
+<div class="info-box">
+    <div class="label">Account Details</div>
+    <div class="value">
+        <p style="margin: 5px 0;"><strong>Email:</strong> {{ email }}</p>
+        {% if phone_number %}
+        <p style="margin: 5px 0;"><strong>Phone:</strong> {{ phone_number }}</p>
+        {% endif %}
+    </div>
+</div>
+
+<div class="content">
+    <p><strong>What's Next?</strong></p>
+    <div class="steps">
+        <div class="step">
+            <div class="step-number">1</div>
+            <div class="step-content">Change your password using the link above</div>
+        </div>
+        <div class="step">
+            <div class="step-number">2</div>
+            <div class="step-content">Log in to your account</div>
+        </div>
+        <div class="step">
+            <div class="step-number">3</div>
+            <div class="step-content">Complete or track your affidavit requests</div>
+        </div>
+    </div>
+</div>
+
+<div class="content">
+    <p>If you have any questions, our support team is here to help.</p>
+</div>
+{% endblock %}

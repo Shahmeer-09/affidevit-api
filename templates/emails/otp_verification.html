@@ -1,0 +1,43 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Verification Code - Affidavit Express{% endblock %}
+
+{% block header %}
+<div class="email-header">
+    <h1>Verification Code</h1>
+    <div class="subtitle">Confirm your identity</div>
+</div>
+{% endblock %}
+
+{% block body %}
+<div class="greeting">Hello {{ user_name|default:"there" }},</div>
+
+<div class="content">
+    <p>You requested a verification code to access your Affidavit Express account. Please use the code below to complete your verification:</p>
+</div>
+
+<div class="request-code">
+    <div class="label">Your Verification Code</div>
+    <div class="code">{{ otp_code }}</div>
+</div>
+
+<div class="warning-box">
+    <div class="title">⏰ Code Expires Soon</div>
+    <div class="text">This code will expire in <strong>10 minutes</strong>. Do not share this code with anyone.</div>
+</div>
+
+<div class="content">
+    <p>If you didn't request this code, please ignore this email or contact our support team if you have concerns about your account security.</p>
+</div>
+
+<div class="info-box">
+    <div class="label">Security Tips</div>
+    <div class="value">
+        <ul style="margin: 0; padding-left: 20px; color: #4b5563;">
+            <li>Never share your verification code with anyone</li>
+            <li>Affidavit Express will never ask for your code via phone</li>
+            <li>If you didn't request this, your account is still secure</li>
+        </ul>
+    </div>
+</div>
+{% endblock %}
