@@ -226,7 +226,14 @@ class UserRegistrationView(generics.CreateAPIView):
             otp_code=otp_code,
             user_name=user.first_name or user.username,
         )
-        
+
+        # Send OTP via WhatsApp/SMS if phone number provided
+        if user.phone_number:
+            TwilioService.send_otp_message(
+                phone_number=user.phone_number,
+                otp_code=otp_code
+            )
+
         return Response({
             'message': 'Registration successful. Please check your email for a verification code.',
             'otp_sent': True,
@@ -646,6 +653,13 @@ class CommissionerRegistrationView(APIView):
             otp_code=otp_code,
             user_name=user.first_name or user.username,
         )
+
+        # Send OTP via WhatsApp/SMS if phone number provided
+        if user.phone_number:
+            TwilioService.send_otp_message(
+                phone_number=user.phone_number,
+                otp_code=otp_code
+            )
 
         return Response({
             'message': 'Registration submitted. Please verify your email, then wait for admin approval.',
