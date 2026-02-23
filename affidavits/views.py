@@ -2933,14 +2933,19 @@ INSTRUCTIONS:
         full_template_text = _re.sub(r'<[^>]+>', ' ', full_template)
         full_template_text = _re.sub(r'\s+', ' ', full_template_text).strip()[:4000]
 
+        # Pre-compute conditional blocks (backslashes not allowed inside f-string expressions in Python < 3.12)
+        template_snippet_block = ("TEMPLATE SNIPPET (The text around the insertion point):\n" + context_html[:1000]) if context_html else ""
+        full_template_block = ("FULL TEMPLATE (read this to detect contradictions anywhere in the document):\n" + full_template_text) if full_template_text else ""
+        docs_block = ("REFERENCE DOCUMENTS (Style guide/Context):\n" + docs_context) if docs_context else ""
+
         prompt = f"""You are an expert legal document drafter assisting in creating dynamic affidavit templates.
 
 Your goal is to suggest a smart field definition that seamlessly integrates into the existing sentence structure, WITHOUT creating any logical contradictions.
 
 FIELD REQUEST: "{description}"
-{"" if not context_html else "TEMPLATE SNIPPET (The text around the insertion point):\n" + context_html[:1000]}
-{"" if not full_template_text else "FULL TEMPLATE (read this to detect contradictions anywhere in the document):\n" + full_template_text}
-{"" if not docs_context else "REFERENCE DOCUMENTS (Style guide/Context):\n" + docs_context}
+{template_snippet_block}
+{full_template_block}
+{docs_block}
 EXISTING FIELD IDs (do not reuse): {existing_context}
 
 UNDERSTANDING THE MARKERS:
