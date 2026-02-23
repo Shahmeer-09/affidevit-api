@@ -67,7 +67,10 @@ def process_request_async(self, request_id: int):
             affidavit_type_name=affidavit_type.name,
             scenario_library=affidavit_type.scenario_library,
             template_html=affidavit_type.template_html,
-            disallowed_phrases=affidavit_type.disallowed_phrases
+            disallowed_phrases=affidavit_type.disallowed_phrases,
+            placeholder_mapping=affidavit_type.placeholder_mapping,
+            intake_schema=affidavit_type.intake_schema,
+            affidavit_type_id=affidavit_type.id,
         )
         draft_latency = int((time.time() - start_time) * 1000)
         
@@ -153,13 +156,17 @@ def process_request_async(self, request_id: int):
         request.qa_flags_json = qa_result.get('issues') or []
         request.clarification_question = qa_result.get('clarification_question') or ''
         
-        # Determine next status based on QA result
+        # Determine next status based on QA result and affidavit type mode
+        is_review_first = (request.affidavit_type.default_mode == 'review_first') or not request.affidavit_type.is_instant_mode
         if qa_status == 'approved':
-            if request.affidavit_type.default_mode == 'instant' or request.affidavit_type.is_instant_mode:
+            if request.affidavit_type.is_instant_mode and not is_review_first:
                 request.status = Request.Status.APPROVED
                 request.final_text = request.draft_text
+            elif is_review_first:
+                # Review-first mode: always send to human reviewer regardless of QA
+                request.status = Request.Status.NEEDS_REVIEW
             else:
-                # User needs to schedule appointment and pay before review
+                # Non-instant, non-review-first: draft ready for payment then commissioner
                 request.status = Request.Status.DRAFT_READY
         elif qa_status == 'needs_clarification':
             request.status = Request.Status.NEEDS_CLARIFICATION
@@ -179,6 +186,20 @@ def process_request_async(self, request_id: int):
                 'status': request.status
             }
         )
+
+        # Notify user and reviewers when request enters review queue from AI processing
+        if request.status == Request.Status.NEEDS_REVIEW:
+            try:
+                from affidavits.services.notification_service import (
+                    send_request_in_review_notification,
+                    send_review_queue_notification_to_reviewers,
+                )
+                send_request_in_review_notification(request)
+                send_review_queue_notification_to_reviewers(request)
+            except Exception as notify_exc:
+                logger.warning(
+                    f"Failed to send review notifications for {request.request_code}: {notify_exc}"
+                )
         
         logger.info(f"Request {request.request_code} processed successfully. Status: {request.status}")
         
@@ -402,7 +423,8 @@ def generate_policy_async(self, affidavit_type_id, html_examples, additional_con
             html_examples=html_examples,
             affidavit_type_name=affidavit_type.name,
             additional_context=additional_context,
-            existing_questions=existing_questions or []
+            existing_questions=existing_questions or [],
+            affidavit_type_id=affidavit_type.id,
         )
         
         if result['success']:

@@ -4,6 +4,8 @@ Affidavit Express - Serializers
 DRF serializers for all models with validation and nested representations.
 """
 
+import os
+
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.utils import timezone
@@ -89,18 +91,11 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
                 'password_confirm': 'Passwords do not match.'
             })
         
-        # Check for unique email
+        # Check for unique email (case-insensitive)
         email = attrs.get('email')
-        if email and User.objects.filter(email=email).exists():
+        if email and User.objects.filter(email__iexact=email).exists():
             raise serializers.ValidationError({
                 'email': 'A user with this email already exists.'
-            })
-        
-        # Check for unique phone number
-        phone_number = attrs.get('phone_number')
-        if phone_number and User.objects.filter(phone_number=phone_number).exists():
-            raise serializers.ValidationError({
-                'phone_number': 'A user with this phone number already exists.'
             })
         
         return attrs
@@ -129,14 +124,68 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         return user
 
 
+def _parse_expiry_date(value):
+    """
+    Parse a commission expiry date accepting both:
+      - DD-MMM-YYYY (e.g. 15-Sep-2026)   ← user-facing format
+      - YYYY-MM-DD  (e.g. 2026-09-15)    ← native date-picker fallback
+    Returns a Python date object or None if blank/null.
+    """
+    import re
+    from datetime import date, datetime
+
+    if value is None or value == '':
+        return None
+    if hasattr(value, 'year'):
+        return value  # already a date object
+
+    value_str = str(value).strip()
+
+    MONTH_MAP = {
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+        'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+    }
+
+    # Try DD-MMM-YYYY
+    m = re.match(r'^(\d{1,2})-([A-Za-z]{3})-(\d{4})$', value_str)
+    if m:
+        day = int(m.group(1))
+        month = MONTH_MAP.get(m.group(2).lower())
+        year = int(m.group(3))
+        if month is None:
+            raise serializers.ValidationError(
+                'Invalid month abbreviation. Use DD-MMM-YYYY format (e.g. 15-Sep-2026).'
+            )
+        try:
+            return date(year, month, day)
+        except ValueError:
+            raise serializers.ValidationError(
+                'Invalid date value. Use DD-MMM-YYYY format (e.g. 15-Sep-2026).'
+            )
+
+    # Fallback: try YYYY-MM-DD
+    m2 = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', value_str)
+    if m2:
+        try:
+            return datetime.strptime(value_str, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+
+    raise serializers.ValidationError(
+        'Commission expiry date must be in DD-MMM-YYYY format (e.g. 15-Sep-2026).'
+    )
+
+
 class CommissionerRegistrationSerializer(serializers.ModelSerializer):
     """Serializer for commissioner self-registration with all required details."""
-    
+
     password = serializers.CharField(write_only=True, min_length=8)
     password_confirm = serializers.CharField(write_only=True)
     profile_image = serializers.ImageField(required=False, allow_null=True)
     availability = serializers.JSONField(required=False, default=dict)
-    
+    # Accept DD-MMM-YYYY (e.g. 15-Sep-2026) OR YYYY-MM-DD (native date picker fallback)
+    commission_expiry = serializers.CharField(required=False, allow_blank=True, allow_null=True, default=None)
+
     class Meta:
         model = User
         fields = [
@@ -149,41 +198,38 @@ class CommissionerRegistrationSerializer(serializers.ModelSerializer):
             'bank_name', 'bank_branch', 'bank_account_number',
             'bank_account_name', 'payment_preference', 'payout_rate',
         ]
-    
+
+    def validate_commission_expiry(self, value):
+        """Accept DD-MMM-YYYY or YYYY-MM-DD formats for commission expiry date."""
+        return _parse_expiry_date(value)
+
     def validate(self, attrs):
         if attrs['password'] != attrs.pop('password_confirm'):
             raise serializers.ValidationError({
                 'password_confirm': 'Passwords do not match.'
             })
-        
-        # Check for unique email
+
+        # Check for unique email (case-insensitive)
         email = attrs.get('email')
-        if email and User.objects.filter(email=email).exists():
+        if email and User.objects.filter(email__iexact=email).exists():
             raise serializers.ValidationError({
                 'email': 'A user with this email already exists.'
             })
-        
-        # Check for unique phone number
-        phone_number = attrs.get('phone_number')
-        if phone_number and User.objects.filter(phone_number=phone_number).exists():
-            raise serializers.ValidationError({
-                'phone_number': 'A user with this phone number already exists.'
-            })
-        
+
         # Check for unique commission number
         commission_number = attrs.get('commission_number')
         if commission_number and User.objects.filter(commission_number=commission_number).exists():
             raise serializers.ValidationError({
                 'commission_number': 'This commission number is already registered.'
             })
-        
+
         # Check for unique bank account number
         bank_account_number = attrs.get('bank_account_number')
         if bank_account_number and User.objects.filter(bank_account_number=bank_account_number).exists():
             raise serializers.ValidationError({
                 'bank_account_number': 'This bank account number is already registered.'
             })
-        
+
         # Validate availability JSON structure if provided
         availability = attrs.get('availability', {})
         if availability:
@@ -191,7 +237,7 @@ class CommissionerRegistrationSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({
                     'availability': 'Availability must be a JSON object.'
                 })
-            
+
             # Validate recurring schedule if present
             recurring = availability.get('recurring', {})
             valid_days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
@@ -209,24 +255,24 @@ class CommissionerRegistrationSerializer(serializers.ModelSerializer):
                         raise serializers.ValidationError({
                             'availability': f'Each slot must have "start" and "end" times.'
                         })
-        
+
         return attrs
-    
+
     def create(self, validated_data):
         # Auto-generate username from email
         email = validated_data['email']
         base_username = email.split('@')[0]
         username = base_username
-        
+
         # Ensure unique username
         counter = 1
         while User.objects.filter(username=username).exists():
             username = f"{base_username}{counter}"
             counter += 1
-        
+
         # Extract profile image separately (handled by DRF's file upload)
         profile_image = validated_data.pop('profile_image', None)
-        
+
         user = User.objects.create_user(
             username=username,
             email=validated_data['email'],
@@ -249,12 +295,12 @@ class CommissionerRegistrationSerializer(serializers.ModelSerializer):
             payment_preference=validated_data.get('payment_preference', 'bank_transfer'),
             is_featured=False,  # Admin must approve to feature
         )
-        
+
         # Set profile image if provided
         if profile_image:
             user.profile_image = profile_image
             user.save()
-        
+
         return user
 
 
@@ -337,6 +383,11 @@ class CreateStaffUserSerializer(serializers.ModelSerializer):
     
     password = serializers.CharField(write_only=True, min_length=8)
     role = serializers.ChoiceField(choices=['commissioner', 'reviewer'])
+    # Accept DD-MMM-YYYY (e.g. 15-Sep-2026) OR YYYY-MM-DD (native date picker fallback)
+    commission_expiry = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+    def validate_commission_expiry(self, value):
+        return _parse_expiry_date(value)
     
     class Meta:
         model = User
@@ -368,6 +419,11 @@ class UpdateStaffUserSerializer(serializers.ModelSerializer):
     """Serializer for admin to update commissioners or reviewers."""
     
     password = serializers.CharField(write_only=True, min_length=8, required=False)
+    # Accept DD-MMM-YYYY (e.g. 15-Sep-2026) OR YYYY-MM-DD (native date picker fallback)
+    commission_expiry = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+    def validate_commission_expiry(self, value):
+        return _parse_expiry_date(value)
     
     class Meta:
         model = User
@@ -588,7 +644,7 @@ class AffidavitTypeAdminSerializer(serializers.ModelSerializer):
             'min_volume_threshold', 
             'intake_schema', 'scenario_library', 'policy_json',
             'template_html', 'template_documents', 'disallowed_phrases',
-            'validation_rules',
+            'validation_rules', 'placeholder_mapping',
             'questions_count', 'template_documents_count',
             'created_at', 'updated_at'
         ]
@@ -643,6 +699,47 @@ class AffidavitTypeAdminSerializer(serializers.ModelSerializer):
                     )
         
         return value
+
+    def update(self, instance, validated_data):
+        """
+        Override update to auto-sync placeholder_mapping when
+        intake_schema OR template_html changes.
+        """
+        from .services.policy_generator_service import (
+            sync_mapping_after_question_change,
+            auto_generate_placeholder_mapping,
+        )
+
+        new_schema = validated_data.get('intake_schema')
+        new_template = validated_data.get('template_html')
+        explicit_mapping = 'placeholder_mapping' in validated_data
+
+        # Case 1: intake_schema changed → sync mappings (remove stale, add new)
+        if new_schema is not None:
+            old_schema = instance.intake_schema or []
+            synced_mapping = sync_mapping_after_question_change(
+                template_html=new_template or instance.template_html or '',
+                old_schema=old_schema,
+                new_schema=new_schema,
+                placeholder_mapping=instance.placeholder_mapping or {},
+            )
+            if not explicit_mapping:
+                validated_data['placeholder_mapping'] = synced_mapping
+
+        # Case 2: template_html changed → re-generate mapping for new placeholders
+        if new_template is not None and new_template != (instance.template_html or ''):
+            final_schema = new_schema if new_schema is not None else (instance.intake_schema or [])
+            base_mapping = validated_data.get('placeholder_mapping', instance.placeholder_mapping or {})
+            generated = auto_generate_placeholder_mapping(new_template, final_schema)
+            # Merge: keep existing manual overrides, fill in new auto-mappings
+            merged = dict(base_mapping)
+            for ph, qid in generated.items():
+                if ph not in merged:
+                    merged[ph] = qid
+            if not explicit_mapping:
+                validated_data['placeholder_mapping'] = merged
+
+        return super().update(instance, validated_data)
 
 
 # =============================================================================
@@ -801,18 +898,20 @@ class GuestSignupStartSerializer(serializers.Serializer):
     """Serializer for starting guest signup (sending OTP)."""
     email = serializers.EmailField()
     full_name = serializers.CharField(max_length=150)
-    phone_number = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    phone_number = serializers.CharField(max_length=50, required=False, allow_blank=True)
 
     def validate(self, attrs):
         email = attrs.get('email')
         phone_number = (attrs.get('phone_number') or '').strip()
+
+        allow_duplicate_phones = (os.getenv('ALLOW_DUPLICATE_PHONE_NUMBERS') or '').strip().lower() == 'true'
 
         errors = {}
 
         if email and User.objects.filter(email__iexact=email).exists():
             errors['email'] = 'An account with this email already exists. Please sign in instead.'
 
-        if phone_number and User.objects.filter(phone_number=phone_number).exists():
+        if (not allow_duplicate_phones) and phone_number and User.objects.filter(phone_number=phone_number).exists():
             errors['phone_number'] = 'An account with this phone number already exists. Please sign in instead.'
 
         if errors:
@@ -827,7 +926,7 @@ class GuestSignupVerifySerializer(serializers.Serializer):
     email = serializers.EmailField()
     otp = serializers.CharField(max_length=6)
     full_name = serializers.CharField(max_length=150)
-    phone_number = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    phone_number = serializers.CharField(max_length=50, required=False, allow_blank=True)
     affidavit_type_id = serializers.IntegerField()
     answers_json = serializers.JSONField()
     draft_text = serializers.CharField(required=False, allow_blank=True)
@@ -842,21 +941,24 @@ class RequestCreateSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Request
-        fields = ['id', 'request_code', 'affidavit_type', 'answers_json', 'status']
+        fields = ['id', 'request_code', 'affidavit_type', 'answers_json', 'draft_text', 'status']
         read_only_fields = ['id', 'request_code', 'status']
     
     def create(self, validated_data):
         user = self.context['request'].user
         affidavit_type = validated_data['affidavit_type']
+        draft_text = validated_data.get('draft_text', '') or ''
+        has_ready_draft = len(draft_text) > 50
         
         request_obj = Request.objects.create(
             user=user,
             affidavit_type=affidavit_type,
             answers_json=validated_data.get('answers_json', {}),
+            draft_text=draft_text,
             policy_version_used=affidavit_type.policy_version,
             prompt_version_used=affidavit_type.prompt_pack_version,
             template_version_used=affidavit_type.template_version,
-            status=Request.Status.DRAFT
+            status=Request.Status.DRAFT_READY if has_ready_draft else Request.Status.DRAFT
         )
         return request_obj
 
@@ -868,7 +970,7 @@ class RequestPatchSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = Request
-        fields = ['answers_json', 'commissioner_id']
+        fields = ['answers_json', 'draft_text', 'commissioner_id']
     
     def validate_commissioner_id(self, value):
         """Validate commissioner exists and has the right role."""
@@ -904,13 +1006,63 @@ class RequestPatchSerializer(serializers.ModelSerializer):
         if commissioner_id:
             from .models import User
             instance.commissioner = User.objects.get(id=commissioner_id)
-        
-        return super().update(instance, validated_data)
+
+        draft_text = validated_data.get('draft_text')
+        if (
+            isinstance(draft_text, str)
+            and len(draft_text) > 50
+            and instance.status == Request.Status.DRAFT
+        ):
+            instance.status = Request.Status.DRAFT_READY
+
+        instance = super().update(instance, validated_data)
+
+        if commissioner_id:
+            instance.save(update_fields=['commissioner'])
+        return instance
 
 
 class RequestSubmitSerializer(serializers.Serializer):
     """Serializer for submitting a request for AI drafting."""
-    
+
+    # ------------------------------------------------------------------
+    # Helper: mirror frontend shouldShowQuestion() so conditional fields
+    # that are hidden are never flagged as "missing".
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_field_visible(field: dict, answers: dict, schema: list) -> bool:
+        """Return True if the field should be shown given current answers."""
+        show_if = field.get('show_if')
+        if not show_if:
+            return True
+
+        parent_field_id = show_if.get('field', '')
+        required_value = show_if.get('value')
+
+        # Resolve parent answer — try direct key first, then scan schema
+        parent_answer = answers.get(parent_field_id)
+        if parent_answer is None:
+            for q in schema:
+                qid = q.get('id') or q.get('field_name', '')
+                if qid == parent_field_id or q.get('field_name') == parent_field_id:
+                    parent_answer = answers.get(qid)
+                    break
+
+        # If no required value specified, field shows when parent has *any* value
+        if not required_value or required_value == '':
+            return parent_answer is not None and parent_answer != '' and parent_answer is not False
+
+        # Array answer — check intersection
+        if isinstance(parent_answer, list):
+            check_values = required_value if isinstance(required_value, list) else [required_value]
+            return any(v in parent_answer for v in check_values)
+
+        # required_value is array — check membership
+        if isinstance(required_value, list):
+            return parent_answer in required_value
+
+        return parent_answer == required_value
+
     def validate(self, attrs):
         request_obj = self.instance
         if request_obj.status not in [
@@ -931,6 +1083,10 @@ class RequestSubmitSerializer(serializers.Serializer):
             field_id = field.get('id') or field.get('field_name')
             field_label = field.get('label', field_id)
             
+            # Skip fields hidden by show_if conditions
+            if not self._is_field_visible(field, answers, intake_schema):
+                continue
+
             # Check if field is required and has a value
             if field.get('required', False):
                 answer = answers.get(field_id)
@@ -942,7 +1098,19 @@ class RequestSubmitSerializer(serializers.Serializer):
             raise serializers.ValidationError({
                 'answers_json': f"Missing required fields: {', '.join(missing_fields)}"
             })
-        
+
+        # Enforce complex validation rules from the Validation tab (runs
+        # pure Python — no OpenAI call, no extra cost).
+        from .services.ai_service import apply_validation_rules
+        rules = request_obj.affidavit_type.validation_rules or []
+        if rules:
+            invalid_fields, _ = apply_validation_rules(answers, rules)
+            if invalid_fields:
+                raise serializers.ValidationError({
+                    field_id: reason
+                    for field_id, reason in invalid_fields.items()
+                })
+
         return attrs
 
 
@@ -993,6 +1161,7 @@ class RequestDetailSerializer(serializers.ModelSerializer):
         read_only=True, 
         allow_null=True
     )
+    appointment_slot = serializers.SerializerMethodField()
     
     class Meta:
         model = Request
@@ -1006,7 +1175,7 @@ class RequestDetailSerializer(serializers.ModelSerializer):
             'user_edits_json', 'time_to_complete_seconds', 'pdf_url',
             'locked_by', 'locked_at', 'is_locked', 'lock_holder_name',
             'pdf_file', 'is_paid', 'user_paid_at', 'created_at', 'updated_at', 'submitted_at',
-            'approved_at', 'completed_at', 'appointment_date'
+            'approved_at', 'completed_at', 'appointment_date', 'appointment_slot'
         ]
         read_only_fields = [
             'id', 'request_code', 'policy_version_used', 
@@ -1041,6 +1210,20 @@ class RequestDetailSerializer(serializers.ModelSerializer):
     def get_lock_holder_name(self, obj):
         if obj.locked_by and not obj.is_lock_expired():
             return obj.locked_by.get_full_name() or obj.locked_by.username
+        return None
+    
+    def get_appointment_slot(self, obj):
+        if hasattr(obj, 'appointment_slot') and obj.appointment_slot:
+            slot = obj.appointment_slot
+            return {
+                'id': slot.id,
+                'commissioner': slot.commissioner_id,
+                'start_time': slot.start_time.isoformat() if slot.start_time else None,
+                'is_booked': slot.is_booked,
+                'appointment_status': slot.appointment_status,
+                'decision_at': slot.decision_at.isoformat() if slot.decision_at else None,
+                'decision_reason': slot.decision_reason or '',
+            }
         return None
 
 
@@ -1212,32 +1395,44 @@ class ReviewerFeedbackSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ReviewerFeedback
-        fields = ['id', 'request', 'request_code', 'reviewer', 'reviewer_name', 'category', 'message', 'created_at']
-        read_only_fields = ['id', 'reviewer', 'created_at']
+        fields = [
+            'id', 'request', 'request_code', 'reviewer', 'reviewer_name',
+            'category', 'feedback_target', 'message',
+            'original_snippet', 'revised_snippet', 'summary',
+            'is_active', 'times_seen', 'created_at',
+        ]
+        read_only_fields = ['id', 'reviewer', 'is_active', 'times_seen', 'created_at']
 
     def get_reviewer_name(self, obj):
         return obj.reviewer.get_full_name() or obj.reviewer.username
 
 
 class ReviewerFeedbackCreateSerializer(serializers.ModelSerializer):
-    """Serializer for creating minimal reviewer feedback."""
+    """Serializer for creating reviewer feedback (manual notes or auto-detected diffs)."""
 
     class Meta:
         model = ReviewerFeedback
-        fields = ['request', 'category', 'message']
+        fields = ['request', 'category', 'message', 'feedback_target', 'original_snippet', 'revised_snippet']
 
-    def validate_message(self, value: str):
-        message = (value or '').strip()
-        if len(message) < 10:
-            raise serializers.ValidationError('Please provide minimal feedback (at least 10 characters).')
-        if len(message) > 300:
-            raise serializers.ValidationError('Please keep feedback minimal (max 300 characters).')
-        return message
+    def validate(self, attrs):
+        message = (attrs.get('message') or '').strip()
+        orig = (attrs.get('original_snippet') or '').strip()
+        rev = (attrs.get('revised_snippet') or '').strip()
+        # Must have either a message or both snippets
+        if not message and not (orig and rev):
+            raise serializers.ValidationError(
+                'Provide either a feedback message or both original_snippet and revised_snippet.'
+            )
+        if message and (len(message) < 10 or len(message) > 300):
+            raise serializers.ValidationError('Feedback message must be 10–300 characters.')
+        return attrs
 
     def create(self, validated_data):
         reviewer = self.context['request'].user
+        request_obj = validated_data['request']
         return ReviewerFeedback.objects.create(
             reviewer=reviewer,
+            affidavit_type=request_obj.affidavit_type,
             **validated_data
         )
 
@@ -1262,7 +1457,44 @@ class ApproveRequestSerializer(serializers.Serializer):
         required=False
     )
     issue_description = serializers.CharField(required=False, allow_blank=True)
+    feedback_entries = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        default=list,
+        help_text='Optional manual feedback notes: [{category, message, feedback_target}]'
+    )
+    auto_feedback_pairs = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        default=list,
+        help_text='Auto-detected diff pairs from reviewer edit: [{original_snippet, revised_snippet, feedback_target}]'
+    )
     
+    def validate_feedback_entries(self, value):
+        valid_cats = {c[0] for c in ReviewerFeedback.Category.choices}
+        valid_targets = {t[0] for t in ReviewerFeedback.FeedbackTarget.choices}
+        for entry in value:
+            if not entry.get('message', '').strip():
+                raise serializers.ValidationError('Each feedback entry must have a message.')
+            msg = entry['message'].strip()
+            if len(msg) < 10 or len(msg) > 300:
+                raise serializers.ValidationError('Each feedback message must be 10–300 characters.')
+            cat = entry.get('category', 'other')
+            if cat not in valid_cats:
+                raise serializers.ValidationError(f'Invalid category: {cat}')
+            target = entry.get('feedback_target', 'drafter')
+            if target not in valid_targets:
+                raise serializers.ValidationError(f'Invalid feedback_target: {target}')
+        return value
+
+    def validate_auto_feedback_pairs(self, value):
+        valid_targets = {t[0] for t in ReviewerFeedback.FeedbackTarget.choices} | {'skip'}
+        for pair in value:
+            target = pair.get('feedback_target', 'drafter')
+            if target not in valid_targets:
+                raise serializers.ValidationError(f'Invalid feedback_target: {target}')
+        return value
+
     def validate(self, attrs):
         request_obj = self.context.get('request_obj')
         
@@ -1530,8 +1762,8 @@ class CommissionerSlotSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = CommissionerSlot
-        fields = ['id', 'commissioner', 'start_time', 'is_booked', 'request_details']
-        read_only_fields = ['id', 'commissioner', 'is_booked']
+        fields = ['id', 'commissioner', 'start_time', 'is_booked', 'appointment_status', 'decision_at', 'decision_reason', 'request_details']
+        read_only_fields = ['id', 'commissioner', 'is_booked', 'appointment_status', 'decision_at', 'decision_reason']
         
     def get_request_details(self, obj):
         # Allow request details to be shown if booked OR if user is commissioner viewing their own schedule

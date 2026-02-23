@@ -36,7 +36,8 @@ from .views import (
     ReviewerFeedbackCreateView,
     SubmitFeedbackView,
     # Admin
-    AffidavitTypePolicyView, ValidationRulesView, ConfidenceDashboardView, LearningExportView,
+    AffidavitTypePolicyView, ValidationRulesView, PlaceholderMappingView, TemplateLivePreviewView, AIDraftPreviewView, 
+    FieldSuggestionsView, AtomicFieldInsertionView, ConfidenceDashboardView, LearningExportView,
     FrictionDashboardView, PromoteToInstantModeView,
     FullConfidenceDashboardView, TypeTrendView, WeeklyLearningReportView,
     CostDashboardView, LearningSuggestionsView,
@@ -45,14 +46,16 @@ from .views import (
     AdminReviewerListView, AdminReviewerDetailView,
     AdminCommissionerPaymentSummaryView, AdminCommissionerPaymentHistoryView,
     AdminMarkCommissionerPaidView, AdminAllPaymentLogsView,
+    AdminGenerateSlotsView,
     AdminReviewerFeedbackListView,
     # Admin Affidavit Type CRUD
     AdminAffidavitTypeListView, AdminAffidavitTypeDetailView,
     AdminAffidavitTypeDuplicateView, AdminTypeRequestsView,
+    ValidateAffidavitConfigView,
     # Admin Document Upload & Policy Generation
     AdminDocumentUploadView, AdminDocumentListView,
     AdminGeneratePolicyView, AdminPolicyTaskStatusView, AdminDisallowedPhrasesView,
-    AdminAIBaseInstructionView,
+    AdminAIBaseInstructionView, RefineTemplateView, RefineInstructionView,
     # Admin Decision Tree
     AdminDecisionTreeNodeListView, AdminDecisionTreeNodeDetailView,
     AdminDecisionTreeQuestionsView, AdminAffidavitTypeDecisionNodesView,
@@ -63,6 +66,7 @@ from .views import (
     # Tickets
     TicketViewSet,
     CommissionerSlotsView, BookSlotView, CommissionerBookedSlotsView,
+    CommissionerAcceptSlotView, CommissionerRejectSlotView, CommissionerCancelSlotView,
     GuestAuthView
 )
 
@@ -132,6 +136,9 @@ urlpatterns = [
     path('commissioner/pdf-preferences/', CommissionerPDFPreferencesView.as_view(), name='pdf_preferences'),
     path('commissioners/<int:pk>/slots/', CommissionerSlotsView.as_view(), name='commissioner_slots'),
     path('slots/<int:pk>/book/', BookSlotView.as_view(), name='book_slot'),
+    path('slots/<int:pk>/accept/', CommissionerAcceptSlotView.as_view(), name='slot_accept'),
+    path('slots/<int:pk>/reject/', CommissionerRejectSlotView.as_view(), name='slot_reject'),
+    path('slots/<int:pk>/cancel/', CommissionerCancelSlotView.as_view(), name='slot_cancel'),
     
     # ==========================================================================
     # Reviewer Endpoints (Stories 3.1, 3.2, 3.3)
@@ -150,6 +157,11 @@ urlpatterns = [
     # ==========================================================================
     path('admin/affidavit-types/<int:pk>/policy/', AffidavitTypePolicyView.as_view(), name='policy_update'),
     path('admin/affidavit-types/<int:pk>/validation-rules/', ValidationRulesView.as_view(), name='validation_rules'),
+    path('admin/affidavit-types/<int:pk>/placeholder-mapping/', PlaceholderMappingView.as_view(), name='placeholder_mapping'),
+    path('admin/affidavit-types/<int:pk>/template-preview/', TemplateLivePreviewView.as_view(), name='template_preview'),
+    path('admin/affidavit-types/<int:pk>/ai-draft-preview/', AIDraftPreviewView.as_view(), name='ai_draft_preview'),
+    path('admin/affidavit-types/<int:pk>/field-suggestions/', FieldSuggestionsView.as_view(), name='field_suggestions'),
+    path('admin/affidavit-types/<int:pk>/insert-field/', AtomicFieldInsertionView.as_view(), name='insert_field'),
     path('admin/affidavit-types/<int:pk>/promote/', PromoteToInstantModeView.as_view(), name='promote_instant'),
     path('admin/dashboard/', ConfidenceDashboardView.as_view(), name='confidence_dashboard'),
     path('admin/dashboard/full/', FullConfidenceDashboardView.as_view(), name='full_confidence_dashboard'),
@@ -168,6 +180,7 @@ urlpatterns = [
     path('admin/commissioners/<int:pk>/payment-summary/', AdminCommissionerPaymentSummaryView.as_view(), name='admin_commissioner_payment_summary'),
     path('admin/commissioners/<int:pk>/payment-history/', AdminCommissionerPaymentHistoryView.as_view(), name='admin_commissioner_payment_history'),
     path('admin/commissioners/<int:pk>/mark-paid/', AdminMarkCommissionerPaidView.as_view(), name='admin_commissioner_mark_paid'),
+    path('admin/commissioners/<int:pk>/generate-slots/', AdminGenerateSlotsView.as_view(), name='admin_commissioner_generate_slots'),
     path('admin/payment-logs/', AdminAllPaymentLogsView.as_view(), name='admin_all_payment_logs'),
     path('admin/reviewers/', AdminReviewerListView.as_view(), name='admin_reviewer_list'),
     path('admin/reviewers/<int:pk>/', AdminReviewerDetailView.as_view(), name='admin_reviewer_detail'),
@@ -181,6 +194,7 @@ urlpatterns = [
     path('admin/types/<int:pk>/', AdminAffidavitTypeDetailView.as_view(), name='admin_type_detail'),
     path('admin/types/<int:pk>/duplicate/', AdminAffidavitTypeDuplicateView.as_view(), name='admin_type_duplicate'),
     path('admin/types/<int:pk>/requests/', AdminTypeRequestsView.as_view(), name='admin_type_requests'),
+    path('admin/affidavit-types/<int:pk>/validate-config/', ValidateAffidavitConfigView.as_view(), name='validate_config'),
     
     # ==========================================================================
     # Admin Document Upload & Policy Generation Endpoints
@@ -189,6 +203,8 @@ urlpatterns = [
     path('admin/types/<int:pk>/documents/', AdminDocumentListView.as_view(), name='admin_documents_list'),
     path('admin/types/<int:pk>/generate-policy/', AdminGeneratePolicyView.as_view(), name='admin_generate_policy'),
     path('admin/policy-task/<str:task_id>/', AdminPolicyTaskStatusView.as_view(), name='admin_policy_task_status'),
+    path('admin/types/<int:pk>/refine-template/', RefineTemplateView.as_view(), name='admin_refine_template'),
+    path('admin/types/<int:pk>/refine-instruction/', RefineInstructionView.as_view(), name='admin_refine_instruction'),
     path('admin/types/<int:pk>/disallowed-phrases/', AdminDisallowedPhrasesView.as_view(), name='admin_disallowed_phrases'),
     path('admin/ai-instruction/', AdminAIBaseInstructionView.as_view(), name='admin_ai_instruction'),
     

@@ -7,7 +7,7 @@ This package contains service modules for:
 - notification_service: Email notifications
 """
 
-from .ai_service import draft_affidavit, qa_check, process_request
+from .ai_service import draft_affidavit, qa_check, process_request, pre_fill_template
 from .pdf_service import generate_affidavit_pdf
 from .notification_service import send_approval_notification
 

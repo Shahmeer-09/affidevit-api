@@ -1,0 +1,1 @@
+# Affidavits constants module

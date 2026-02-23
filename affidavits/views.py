@@ -9,10 +9,12 @@ RESTful API endpoints for all user roles:
 """
 
 import json
+import os
+from datetime import timedelta
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.crypto import get_random_string
-from django.db.models import Count, Q, F
+from django.db.models import Count, Q, F, Avg
 from django.db import transaction
 from django.http import HttpResponse
 from rest_framework import viewsets, generics, status, filters
@@ -52,7 +54,7 @@ from .authentication import (
     IsOwnerOrAdmin, IsCommissionerOrReviewerOrAdmin
 )
 from .services import process_request, generate_affidavit_pdf
-from .services.ai_service import validate_inputs_before_submission, translate_to_english, draft_affidavit
+from .services.ai_service import validate_inputs_before_submission, translate_to_english, draft_affidavit, refine_template_section, refine_user_instruction
 from .services.notification_service import (
     send_approval_notification, 
     send_clarification_notification,
@@ -73,6 +75,51 @@ from .tasks import (
     generate_pdf_async,
     send_notification_async
 )
+
+
+# ---------------------------------------------------------------------------
+# Helper: filter answers to only include visible (non-hidden) fields
+# ---------------------------------------------------------------------------
+
+def _is_field_visible(field: dict, answers: dict, schema: list) -> bool:
+    """Return True if a field should be shown given current answers (mirrors frontend shouldShowQuestion)."""
+    show_if = field.get('show_if')
+    if not show_if:
+        return True
+
+    parent_id = show_if.get('field', '')
+    required_value = show_if.get('value')
+
+    parent_answer = answers.get(parent_id)
+    if parent_answer is None:
+        for q in schema:
+            qid = q.get('id') or q.get('field_name', '')
+            if qid == parent_id or q.get('field_name') == parent_id:
+                parent_answer = answers.get(qid)
+                break
+
+    if not required_value or required_value == '':
+        return parent_answer is not None and parent_answer != '' and parent_answer is not False
+
+    if isinstance(parent_answer, list):
+        check = required_value if isinstance(required_value, list) else [required_value]
+        return any(v in parent_answer for v in check)
+
+    if isinstance(required_value, list):
+        return parent_answer in required_value
+
+    return parent_answer == required_value
+
+
+def _filter_visible_answers(answers: dict, intake_schema: list) -> dict:
+    """Return a copy of answers containing only keys for visible fields."""
+    visible_ids = set()
+    for field in intake_schema:
+        fid = field.get('id') or field.get('field_name', '')
+        if _is_field_visible(field, answers, intake_schema):
+            visible_ids.add(fid)
+    # Always keep internal keys (start with _)
+    return {k: v for k, v in answers.items() if k in visible_ids or k.startswith('_')}
 
 
 class ReviewerFeedbackCreateView(generics.CreateAPIView):
@@ -158,24 +205,32 @@ class UserRegistrationView(generics.CreateAPIView):
     permission_classes = [AllowAny]
     
     def create(self, request, *args, **kwargs):
+        import random
+        from django.utils import timezone
         from rest_framework_simplejwt.tokens import RefreshToken
         
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
         
-        # OTP verification disabled for now - activate user immediately
-        user.is_active = True
+        # Generate 6-digit OTP, store on user model, keep user inactive until verified
+        otp_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+        user.otp_code = otp_code
+        user.otp_created_at = timezone.now()
+        user.is_active = False
         user.save()
         
-        # Generate tokens and log user in directly
-        refresh = RefreshToken.for_user(user)
+        # Send OTP via email
+        send_otp_email(
+            email=user.email,
+            otp_code=otp_code,
+            user_name=user.first_name or user.username,
+        )
         
         return Response({
-            'message': 'Registration successful.',
-            'user': UserSerializer(user).data,
-            'refresh': str(refresh),
-            'access': str(refresh.access_token),
+            'message': 'Registration successful. Please check your email for a verification code.',
+            'otp_sent': True,
+            'user_id': str(user.id),
         }, status=status.HTTP_201_CREATED)
 
 
@@ -200,17 +255,39 @@ class GuestAuthView(viewsets.ViewSet):
         # Generate 6-digit OTP
         otp_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
         
-        # Store OTP temporarily (we'll verify it in the verify endpoint)
-        # Use cache or session - for now we'll store in a temp user or cache
-        from django.core.cache import cache
-        cache_key = f"otp_{email}"
-        cache.set(cache_key, {
-            'otp': otp_code,
-            'full_name': full_name,
-            'phone_number': phone_number,
-            'created_at': timezone.now().isoformat()
-        }, timeout=600)  # 10 minutes expiry
-        
+        # Store OTP on the User model (reliable — no cache required).
+        # Create an inactive placeholder user if they don't already exist.
+        parts = full_name.split(' ', 1)
+        first_name = parts[0]
+        last_name = parts[1] if len(parts) > 1 else ''
+
+        user_qs = User.objects.filter(email__iexact=email)
+        if user_qs.exists():
+            user = user_qs.order_by('-is_active', '-date_joined').first()
+        else:
+            from django.utils.crypto import get_random_string as _grs
+            base_username = email.split('@')[0]
+            username = base_username
+            counter = 1
+            while User.objects.filter(username=username).exists():
+                username = f"{base_username}{counter}"
+                counter += 1
+            user = User.objects.create_user(
+                username=username,
+                email=email,
+                password=_grs(16),
+                first_name=first_name,
+                last_name=last_name,
+                phone_number=phone_number,
+                role=User.Role.PUBLIC,
+                is_active=False,  # activated after OTP verified
+            )
+
+        # Write OTP onto the user record
+        user.otp_code = otp_code
+        user.otp_created_at = timezone.now()
+        user.save(update_fields=['otp_code', 'otp_created_at'])
+
         # Send OTP via Email (always)
         email_result = send_otp_email(
             email=email,
@@ -250,27 +327,47 @@ class GuestAuthView(viewsets.ViewSet):
         answers_json = serializer.validated_data['answers_json']
         draft_text = serializer.validated_data.get('draft_text', '')
 
-        # 1. Verify OTP from cache
-        from django.core.cache import cache
-        cache_key = f"otp_{email}"
-        cached_data = cache.get(cache_key)
-        
-        if not cached_data:
+        # 1. Verify OTP from User model (stored in start step)
+        from django.utils import timezone as tz
+        try:
+            user_qs = User.objects.filter(email__iexact=email)
+            if not user_qs.exists():
+                return Response({"otp": "OTP expired or not found. Please request a new code."}, status=status.HTTP_400_BAD_REQUEST)
+            cached_user = user_qs.order_by('-is_active', '-date_joined').first()
+
+            if not cached_user.otp_code:
+                return Response({"otp": "OTP expired or not found. Please request a new code."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Check 10-minute expiry
+            if cached_user.otp_created_at:
+                age_seconds = (tz.now() - cached_user.otp_created_at).total_seconds()
+                if age_seconds > 600:
+                    cached_user.otp_code = ''
+                    cached_user.otp_created_at = None
+                    cached_user.save(update_fields=['otp_code', 'otp_created_at'])
+                    return Response({"otp": "OTP has expired. Please request a new code."}, status=status.HTTP_400_BAD_REQUEST)
+
+            if cached_user.otp_code != otp:
+                return Response({"otp": "Invalid OTP code."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # OTP verified — clear it
+            cached_user.otp_code = ''
+            cached_user.otp_created_at = None
+            cached_user.save(update_fields=['otp_code', 'otp_created_at'])
+
+            # Use phone from the user record if not provided in this request
+            if not phone_number and cached_user.phone_number:
+                phone_number = cached_user.phone_number
+
+        except Exception as e:
+            logger.error(f"Guest OTP verification error: {e}")
             return Response({"otp": "OTP expired or not found. Please request a new code."}, status=status.HTTP_400_BAD_REQUEST)
-        
-        if cached_data.get('otp') != otp:
-            return Response({"otp": "Invalid OTP code."}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # OTP verified - clear from cache
-        cache.delete(cache_key)
-        
-        # Use cached phone_number if not provided in verify request
-        if not phone_number and cached_data.get('phone_number'):
-            phone_number = cached_data.get('phone_number')
 
         # 2. Get or Create User
         is_new_user = False
         temp_password = None
+
+        allow_duplicate_phones = (os.getenv('ALLOW_DUPLICATE_PHONE_NUMBERS') or '').strip().lower() == 'true'
         
         try:
             user = User.objects.get(email__iexact=email)
@@ -284,7 +381,7 @@ class GuestAuthView(viewsets.ViewSet):
                 if len(parts) > 1:
                     user.last_name = parts[1]
             if phone_number and user.phone_number != phone_number:
-                if User.objects.exclude(id=user.id).filter(phone_number=phone_number).exists():
+                if (not allow_duplicate_phones) and User.objects.exclude(id=user.id).filter(phone_number=phone_number).exists():
                     return Response(
                         {'phone_number': 'This phone number is already in use. Please use a different phone number or sign in.'},
                         status=status.HTTP_400_BAD_REQUEST,
@@ -304,7 +401,7 @@ class GuestAuthView(viewsets.ViewSet):
                     {'email': 'An account with this email already exists. Please sign in instead.'},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            if phone_number and User.objects.filter(phone_number=phone_number).exists():
+            if (not allow_duplicate_phones) and phone_number and User.objects.filter(phone_number=phone_number).exists():
                 return Response(
                     {'phone_number': 'An account with this phone number already exists. Please sign in instead.'},
                     status=status.HTTP_400_BAD_REQUEST,
@@ -339,7 +436,7 @@ class GuestAuthView(viewsets.ViewSet):
                 )
             except IntegrityError:
                 existing_email = User.objects.filter(email__iexact=email).exists()
-                existing_phone = bool(phone_number) and User.objects.filter(phone_number=phone_number).exists()
+                existing_phone = (not allow_duplicate_phones) and bool(phone_number) and User.objects.filter(phone_number=phone_number).exists()
                 if existing_email:
                     return Response(
                         {'email': 'An account with this email already exists. Please sign in instead.'},
@@ -358,10 +455,10 @@ class GuestAuthView(viewsets.ViewSet):
         # 3. Create Request
         affidavit_type = get_object_or_404(AffidavitType, id=affidavit_type_id)
         
-        # Determine initial status based on draft existence
+        # OTP verification only creates/authenticates the user and request.
+        # Payment and affidavit processing happen in later explicit steps.
+        has_draft = bool(draft_text and len(draft_text) > 50)
         initial_status = Request.Status.DRAFT
-        if draft_text and len(draft_text) > 50:
-            initial_status = Request.Status.DRAFT_READY
             
         request_obj = Request.objects.create(
             user=user,
@@ -372,21 +469,9 @@ class GuestAuthView(viewsets.ViewSet):
             prompt_version_used=affidavit_type.prompt_pack_version,
             template_version_used=affidavit_type.template_version,
             status=initial_status,
-            is_paid=True,
-            user_paid_at=timezone.now()
+            is_paid=False,
+            user_paid_at=None,
         )
-
-        # 4. Trigger Async AI only if draft is missing
-        if not draft_text or len(draft_text) <= 50:
-            process_request_async.delay(request_obj.id)
-        else:
-            RequestEvent.objects.create(
-                request=request_obj,
-                action=RequestEvent.Action.DRAFT_GENERATED,
-                actor=user,
-                actor_role=user.role,
-                details={'message': 'Draft saved from preview (skipped regeneration)'}
-            )
 
         # 5. Send Welcome Message for new users
         if is_new_user and temp_password:
@@ -414,6 +499,9 @@ class GuestAuthView(viewsets.ViewSet):
 
         # 6. Generate Tokens
         refresh = RefreshToken.for_user(user)
+        
+        # 7. Next step is payment for the new flow
+        next_step = 'payment_required'
 
         return Response({
             'user': UserSerializer(user).data,
@@ -421,18 +509,20 @@ class GuestAuthView(viewsets.ViewSet):
             'refresh': str(refresh),
             'access': str(refresh.access_token),
             'is_new_user': is_new_user,
+            'next_step': next_step,
         }, status=status.HTTP_201_CREATED)
 
 
 
 class VerifyOTPView(APIView):
     """
-    Verify OTP for phone number verification.
+    Verify OTP for email or phone number verification.
+    Checks model-stored OTP first (email flow), then falls back to Twilio (phone flow).
     """
     permission_classes = [AllowAny]
     
     def post(self, request):
-        from .services.twilio_service import TwilioService
+        from django.utils import timezone
         from rest_framework_simplejwt.tokens import RefreshToken
         
         user_id = request.data.get('user_id')
@@ -446,19 +536,60 @@ class VerifyOTPView(APIView):
             
         user = get_object_or_404(User, pk=user_id)
         
+        # --- Email OTP path (stored on user model) ---
+        if user.otp_code:
+            # OTP valid for 10 minutes
+            if user.otp_created_at:
+                age_seconds = (timezone.now() - user.otp_created_at).total_seconds()
+                if age_seconds > 600:
+                    return Response(
+                        {'error': 'Verification code has expired. Please register again to get a new code.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            
+            if user.otp_code != code:
+                return Response(
+                    {'error': 'Invalid verification code.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Correct code — clear OTP
+            user.otp_code = ''
+            user.otp_created_at = None
+
+            # Commissioners stay inactive pending admin approval; only PUBLIC users get activated
+            if user.role == User.Role.COMMISSIONER:
+                user.save()
+                return Response({
+                    'success': True,
+                    'message': 'Email verified. Your application is pending admin approval. You will be notified once approved.',
+                })
+
+            user.is_active = True
+            user.save()
+
+            refresh = RefreshToken.for_user(user)
+            return Response({
+                'success': True,
+                'message': 'Email verified successfully.',
+                'user': UserSerializer(user).data,
+                'refresh': str(refresh),
+                'access': str(refresh.access_token),
+            })
+        
+        # --- Phone OTP fallback (Twilio Verify) ---
         if not user.phone_number:
             return Response(
-                {'error': 'User has no phone number'},
+                {'error': 'No verification code found for this account. Please register again.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
             
-        # Verify code
+        from .services.twilio_service import TwilioService
         result = TwilioService.check_verification_token(user.phone_number, code)
         
         if result['success']:
             user.is_phone_verified = True
             
-            # If user is a public user, activate them and log them in
             if user.role == User.Role.PUBLIC:
                 user.is_active = True
                 user.save()
@@ -466,13 +597,12 @@ class VerifyOTPView(APIView):
                 refresh = RefreshToken.for_user(user)
                 return Response({
                     'success': True,
-                    'message': 'Phone verified successfully',
+                    'message': 'Phone verified successfully.',
                     'user': UserSerializer(user).data,
                     'refresh': str(refresh),
                     'access': str(refresh.access_token),
                 })
             else:
-                # For commissioners, just mark verified but keep inactive (admin approval needed)
                 user.save()
                 return Response({
                     'success': True,
@@ -496,17 +626,31 @@ class CommissionerRegistrationView(APIView):
     def post(self, request):
         from .serializers import CommissionerRegistrationSerializer, CommissionerSerializer
         
+        import random
+        from django.utils import timezone
+
         serializer = CommissionerRegistrationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
-        
-        # Commissioner remains inactive until admin approval (no OTP needed)
+
+        # Generate OTP for email verification; keep inactive until both OTP verified + admin approval
+        otp_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+        user.otp_code = otp_code
+        user.otp_created_at = timezone.now()
         user.is_active = False
         user.save()
-        
+
+        # Send OTP via email
+        send_otp_email(
+            email=user.email,
+            otp_code=otp_code,
+            user_name=user.first_name or user.username,
+        )
+
         return Response({
-            'message': 'Registration successful. Please wait for admin approval.',
-            'user_id': user.id,
+            'message': 'Registration submitted. Please verify your email, then wait for admin approval.',
+            'otp_sent': True,
+            'user_id': str(user.id),
         }, status=status.HTTP_201_CREATED)
 
 
@@ -863,8 +1007,12 @@ class ValidateRequestInputView(APIView):
         logger.info("=" * 80)
         # ===== END DEBUG LOGGING =====
         
+        # STEP 0: Strip out answers for fields hidden by show_if conditions
+        intake_schema = affidavit_type.intake_schema or []
+        visible_answers = _filter_visible_answers(answers_json, intake_schema)
+
         # STEP 1: Translate non-English content to English BEFORE validation
-        translated_answers = translate_to_english(answers_json)
+        translated_answers = translate_to_english(visible_answers)
         
         # ===== DEBUG LOGGING =====
         logger.info("=" * 80)
@@ -887,34 +1035,13 @@ class ValidateRequestInputView(APIView):
         logger.info("=" * 80)
         # ===== END DEBUG LOGGING =====
 
-        # STEP 3: If valid, generate draft
-        draft_text = ""
-        if validation_result.get('all_valid', True):
-             # Draft the affidavit
-             logger.info("[VALIDATE_VIEW] Validation passed, generating draft...")
-             try:
-                 draft_result = draft_affidavit(
-                     answers_json=translated_answers,
-                     policy_json=affidavit_type.policy_json,
-                     affidavit_type_name=affidavit_type.name,
-                     scenario_library=affidavit_type.scenario_library,
-                     template_html=affidavit_type.template_html,
-                     disallowed_phrases=[] 
-                 )
-                 draft_text = draft_result.get('draft_html', '')
-                 logger.info(f"[VALIDATE_VIEW] Draft generated successfully (length: {len(draft_text)})")
-             except Exception as e:
-                 logger.error(f"[VALIDATE_VIEW] Failed to generate draft: {e}")
-                 # We don't fail the request if drafting fails, just return empty draft
-                 pass
-        
+        # STEP 3: Return validation result (draft generated separately via submit/Celery)
         return Response({
             'success': True,
             'all_valid': validation_result.get('all_valid', True),
             'invalid_fields': validation_result.get('invalid_fields', {}),
             'validation_notes': validation_result.get('validation_notes', []),
             'field_checks': validation_result.get('field_checks', []),
-            'draft_text': draft_text
         })
 
 
@@ -932,6 +1059,13 @@ class RequestSubmitView(APIView):
             pk=pk, 
             user=request.user
         )
+
+        # Require payment before AI processing
+        if not request_obj.is_paid:
+            return Response(
+                {'error': 'Payment is required before processing can begin.'},
+                status=status.HTTP_402_PAYMENT_REQUIRED
+            )
         
         # Handle submission from DRAFT_READY -> NEEDS_REVIEW (after appointment booked)
         # OR if draft already exists (prevent regeneration)
@@ -947,6 +1081,20 @@ class RequestSubmitView(APIView):
                 actor_role=request.user.role,
                 details={'message': 'Submitted for review (Draft already exists)'}
             )
+
+            # Notify user and reviewers that request entered review queue
+            try:
+                from .services.notification_service import (
+                    send_request_in_review_notification,
+                    send_review_queue_notification_to_reviewers,
+                )
+
+                send_request_in_review_notification(request_obj)
+                send_review_queue_notification_to_reviewers(request_obj)
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Failed to send in-review notifications for {request_obj.request_code}: {e}")
             
             return Response({
                 'status': request_obj.status,
@@ -1008,17 +1156,24 @@ class SelectCommissionerView(APIView):
             pk=pk, 
             user=request.user
         )
-        
-        # Only allow selecting commissioner for requests NOT yet approved (locked after approval)
-        # Allowed statuses: DRAFT_READY (initial), NEEDS_REVIEW (change)
-        if request_obj.status == Request.Status.APPROVED:
-             return Response(
-                {'error': 'Commissioner selection is locked for approved requests.'},
-                status=status.HTTP_400_BAD_REQUEST
+
+        # Lock commissioner changes once an appointment has been accepted by commissioner.
+        if (
+            hasattr(request_obj, 'appointment_slot')
+            and request_obj.appointment_slot.appointment_status
+            == CommissionerSlot.AppointmentStatus.ACCEPTED
+        ):
+            return Response(
+                {'error': 'Commissioner selection is locked after appointment confirmation.'},
+                status=status.HTTP_400_BAD_REQUEST,
             )
         
         # Ensure status is valid for selection
-        if request_obj.status not in [Request.Status.DRAFT_READY, Request.Status.NEEDS_REVIEW]:
+        if request_obj.status not in [
+            Request.Status.DRAFT_READY,
+            Request.Status.NEEDS_REVIEW,
+            Request.Status.APPROVED,
+        ]:
              return Response(
                 {'error': 'Request is not ready for commissioner selection.'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -1059,6 +1214,14 @@ class SelectCommissionerView(APIView):
                     'previous_commissioner_name': old_commissioner.get_full_name() if old_commissioner else None
                 }
             )
+            
+            # Notify previous commissioner about withdrawal
+            if old_commissioner:
+                from .services.notification_service import send_user_withdrawn_notification
+                try:
+                    send_user_withdrawn_notification(request_obj, slot if hasattr(request_obj, 'appointment_slot') else None, old_commissioner)
+                except Exception as e:
+                    logger.warning(f"Failed to send withdrawal notification: {e}")
             
             serializer = RequestDetailSerializer(request_obj)
             return Response(serializer.data)
@@ -1115,8 +1278,10 @@ class MarkPaidView(APIView):
         
         # Only allow payment for certain statuses
         allowed_statuses = [
+            Request.Status.DRAFT,
+            Request.Status.SUBMITTED,
             Request.Status.DRAFT_READY,
-            Request.Status.NEEDS_REVIEW, 
+            Request.Status.NEEDS_REVIEW,
             Request.Status.APPROVED,
             Request.Status.COMPLETED
         ]
@@ -1138,7 +1303,7 @@ class MarkPaidView(APIView):
         request_obj.user_paid_at = timezone.now()
         request_obj.save(update_fields=['is_paid', 'user_paid_at'])
         
-        # Log the event
+        # Log the payment event
         RequestEvent.objects.create(
             request=request_obj,
             action=RequestEvent.Action.PAYMENT_CONFIRMED,
@@ -1147,11 +1312,106 @@ class MarkPaidView(APIView):
             details={'action': 'payment_completed', 'amount': '50.00', 'currency': 'TTD'}
         )
         
+        # Check affidavit type mode for post-payment routing
+        affidavit_type = request_obj.affidavit_type
+        is_review_mode = (affidavit_type.default_mode == 'review_first') or not affidavit_type.is_instant_mode
+
+        # Determine if this is the user's very first paid request.
+        # First-time users always see the Thank You page and click the button to trigger AI.
+        # Returning users skip Thank You and AI triggers immediately.
+        has_previous_paid = Request.objects.filter(
+            user=request.user,
+            is_paid=True
+        ).exclude(pk=request_obj.pk).exists()
+        is_first_time = not has_previous_paid
+
+        # If first-time user — don't trigger AI yet regardless of affidavit mode.
+        # ThankYouPage button calls /submit/ which starts generation.
+        if is_first_time:
+            next_step = 'thank_you'
+            message = 'Payment confirmed. Click Continue to generate your affidavit.'
+
+        # If review-first mode and status is DRAFT_READY, submit for review
+        elif is_review_mode and request_obj.status == Request.Status.DRAFT_READY:
+            request_obj.status = Request.Status.NEEDS_REVIEW
+            request_obj.submitted_at = timezone.now()
+            request_obj.save(update_fields=['status', 'submitted_at'])
+            
+            RequestEvent.objects.create(
+                request=request_obj,
+                action=RequestEvent.Action.SUBMITTED,
+                actor=request.user,
+                actor_role=request.user.role,
+                details={'message': 'Submitted for review after payment (review-mode affidavit type)'}
+            )
+            
+            # Notify user and reviewers
+            try:
+                from .services.notification_service import (
+                    send_request_in_review_notification,
+                    send_review_queue_notification_to_reviewers,
+                )
+                send_request_in_review_notification(request_obj)
+                send_review_queue_notification_to_reviewers(request_obj)
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Failed to send review notifications for {request_obj.request_code}: {e}")
+            
+            next_step = 'review_queue'
+            message = 'Payment confirmed. Your request has been submitted for review.'
+        
+        elif affidavit_type.default_mode == 'review_first' and request_obj.status == Request.Status.DRAFT:
+            # Returning user, review_first, DRAFT — auto-queue AI now
+            request_obj.status = Request.Status.SUBMITTED
+            request_obj.submitted_at = timezone.now()
+            request_obj.save(update_fields=['status', 'submitted_at'])
+
+            RequestEvent.objects.create(
+                request=request_obj,
+                action=RequestEvent.Action.SUBMITTED,
+                actor=request.user,
+                actor_role=request.user.role,
+                details={'message': 'Auto-submitted for AI processing after payment (review_first, returning user)'}
+            )
+
+            from .tasks import process_request_async
+            process_request_async.delay(request_obj.id)
+
+            next_step = 'review_queue'
+            message = 'Payment confirmed. Your affidavit is being prepared and will be sent for professional review.'
+
+        else:
+            if request_obj.status == Request.Status.DRAFT:
+                # Returning user, standard/instant — auto-trigger AI immediately
+                request_obj.status = Request.Status.SUBMITTED
+                request_obj.submitted_at = timezone.now()
+                request_obj.save(update_fields=['status', 'submitted_at'])
+
+                RequestEvent.objects.create(
+                    request=request_obj,
+                    action=RequestEvent.Action.SUBMITTED,
+                    actor=request.user,
+                    actor_role=request.user.role,
+                    details={'message': 'Auto-submitted for AI generation after payment (returning user)'}
+                )
+
+                from .tasks import process_request_async
+                process_request_async.delay(request_obj.id)
+
+                next_step = 'scheduling'
+                message = 'Payment confirmed. Your affidavit is being generated.'
+            else:
+                # Already past DRAFT (APPROVED, COMPLETED, etc.)
+                next_step = 'select_commissioner'
+                message = 'Payment confirmed successfully'
+        
         serializer = RequestDetailSerializer(request_obj)
         return Response({
             'success': True,
-            'message': 'Payment confirmed successfully',
-            'request': serializer.data
+            'message': message,
+            'request': serializer.data,
+            'next_step': next_step,
         })
 
 
@@ -1569,13 +1829,20 @@ class MarkCompleteView(APIView):
         request_obj.release_lock()
         request_obj.save()
         
-        # Send completion notification
+        # Send completion notification to user
         send_completion_notification(request_obj, stamp)
+        
+        # Generate payout message for commissioner
+        from .services.notification_service import send_commissioner_payout_added_message
+        payout_message = send_commissioner_payout_added_message(
+            commissioner, payout_amount, request_obj.request_code
+        )
         
         return Response({
             'success': True,
             'message': 'Request marked as completed',
-            'stamp': StampSerializer(stamp).data
+            'stamp': StampSerializer(stamp).data,
+            'payout_message': payout_message
         })
 
 
@@ -1734,6 +2001,16 @@ class ApproveRequestView(APIView):
             request_obj.final_text = request_obj.draft_text
             request_obj.draft_edited_significantly = False
         
+        # Save feedback entries (learning loop)
+        feedback_entries = serializer.validated_data.get('feedback_entries', [])
+        auto_feedback_pairs = serializer.validated_data.get('auto_feedback_pairs', [])
+        if feedback_entries or auto_feedback_pairs:
+            from .services.feedback_service import save_feedback_entries, save_auto_feedback_pairs
+            if feedback_entries:
+                save_feedback_entries(request_obj, reviewer, feedback_entries)
+            if auto_feedback_pairs:
+                save_auto_feedback_pairs(request_obj, reviewer, auto_feedback_pairs)
+        
         # Update status
         request_obj.status = Request.Status.APPROVED
         request_obj.approved_at = timezone.now()
@@ -1754,8 +2031,15 @@ class ApproveRequestView(APIView):
         # Generate PDF async
         generate_pdf_async.delay(request_obj.id)
         
-        # Send notification async
+        # Send notification async (email)
         send_notification_async.delay('approval', request_obj.id)
+        
+        # Send SMS/WhatsApp notification
+        from .services.notification_service import send_request_approved_sms
+        try:
+            send_request_approved_sms(request_obj)
+        except Exception as e:
+            logger.warning(f"Failed to send approval SMS notification: {e}")
         
         return Response({
             'success': True,
@@ -1814,6 +2098,13 @@ class RejectRequestView(APIView):
                 'rejected_at': timezone.now().isoformat()
             }
         )
+        
+        # Send rejection notification to user
+        from .services.notification_service import send_request_rejected_notification
+        try:
+            send_request_rejected_notification(request_obj, reason)
+        except Exception as e:
+            logger.warning(f"Failed to send rejection notification: {e}")
         
         return Response({
             'success': True,
@@ -1898,44 +2189,40 @@ class ReviewerStatsView(APIView):
     Get reviewer statistics for dashboard.
     Returns counts and metrics for the current reviewer.
     """
-    
+
     permission_classes = [IsReviewer]
-    
+
     def get(self, request):
-        from django.db.models import Count, Avg
-        from datetime import timedelta
-        
-        today_start = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
         reviewer = request.user
-        
-        # Get pending review count
+        today_start = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
         pending_count = Request.objects.filter(
             status=Request.Status.NEEDS_REVIEW
         ).count()
-        
+
         # Get today's stats from RequestEvent
         today_events = RequestEvent.objects.filter(
             actor=reviewer,
             created_at__gte=today_start
         )
-        
+
         # Count reviews by action type
         approved_today = today_events.filter(
             action=RequestEvent.Action.APPROVED
         ).count()
-        
+
         rejected_today = today_events.filter(
             action=RequestEvent.Action.REJECTED
         ).count()
-        
+
         # Clarification requests (status changed to needs_clarification)
         clarification_today = Request.objects.filter(
             status=Request.Status.NEEDS_CLARIFICATION,
             updated_at__gte=today_start
         ).count()
-        
+
         reviewed_today = approved_today + rejected_today + clarification_today
-        
+
         # Calculate average review time (from created_at to approved_at)
         avg_time = Request.objects.filter(
             status=Request.Status.APPROVED,
@@ -1945,11 +2232,11 @@ class ReviewerStatsView(APIView):
         ).aggregate(
             avg_time=Avg('review_time')
         )['avg_time']
-        
+
         avg_minutes = 0
         if avg_time:
             avg_minutes = round(avg_time.total_seconds() / 60, 1)
-        
+
         # Calculate approval rate (last 7 days)
         week_ago = timezone.now() - timedelta(days=7)
         week_approved = Request.objects.filter(
@@ -1960,9 +2247,9 @@ class ReviewerStatsView(APIView):
             status__in=[Request.Status.APPROVED, Request.Status.REJECTED],
             updated_at__gte=week_ago
         ).count()
-        
+
         approval_rate = round((week_approved / week_total * 100), 1) if week_total > 0 else 100
-        
+
         return Response({
             'pending_count': pending_count,
             'reviewed_today': reviewed_today,
@@ -2128,6 +2415,762 @@ class ValidationRulesView(APIView):
         return Response({
             'affidavit_type_id': affidavit_type.id,
             'validation_rules': affidavit_type.validation_rules
+        })
+
+
+class PlaceholderMappingView(APIView):
+    """
+    Template-First Intake Builder: Placeholder ↔ Question Mapping.
+    
+    GET  - Extract placeholders from template_html, compare against intake_schema,
+           return audit report with mapped/unmapped/orphaned status.
+    PUT  - Save placeholder_mapping and optionally auto-create missing questions.
+    """
+    permission_classes = [IsAdminUser]
+
+    # Auto-computed placeholders that don't need a question
+    AUTO_COMPUTED = {'calculated_age', 'current_date', 'current_year', 'current_month', 'current_day'}
+    # Questions that feed an auto-computed field — exempt from orphan flagging
+    # when their derived auto placeholder appears in the template.
+    AUTO_COMPUTED_SOURCES = {'calculated_age': 'date_of_birth'}
+
+    @staticmethod
+    def _extract_placeholders(template_html: str) -> list:
+        """Extract unique {{placeholder}} tokens from template HTML, preserving order."""
+        import re
+        return list(dict.fromkeys(re.findall(r'\{\{(\w+)\}\}', template_html or '')))
+
+    def _build_audit(self, affidavit_type):
+        """Build the full audit report comparing placeholders vs questions."""
+        placeholders = self._extract_placeholders(affidavit_type.template_html)
+        questions = affidavit_type.intake_schema or []
+        mapping = affidavit_type.placeholder_mapping or {}
+
+        # Build question lookup by id and field_name
+        q_by_id = {}
+        for q in questions:
+            qid = q.get('id', '')
+            q_by_id[qid] = q
+            fname = q.get('field_name', '')
+            if fname and fname != qid:
+                q_by_id[fname] = q
+
+        # Build audit entries for each placeholder
+        entries = []
+        mapped_question_ids = set()
+        for ph in placeholders:
+            is_auto = ph in self.AUTO_COMPUTED
+            mapped_qid = mapping.get(ph, '')
+
+            # Try to resolve: explicit mapping → same-name question → auto
+            resolved_q = None
+            if mapped_qid:
+                resolved_q = q_by_id.get(mapped_qid)
+            if not resolved_q and not is_auto:
+                resolved_q = q_by_id.get(ph)
+
+            if is_auto:
+                status = 'auto'
+                entry = {
+                    'placeholder': ph,
+                    'status': status,
+                    'mapped_question_id': None,
+                    'question_label': None,
+                    'question_type': None,
+                    'note': 'Auto-computed by system',
+                }
+            elif resolved_q:
+                status = 'mapped'
+                qid = resolved_q.get('id', '')
+                mapped_question_ids.add(qid)
+                entry = {
+                    'placeholder': ph,
+                    'status': status,
+                    'mapped_question_id': qid,
+                    'question_label': resolved_q.get('label', ''),
+                    'question_type': resolved_q.get('type', 'text'),
+                    'note': None,
+                }
+            else:
+                status = 'unmapped'
+                entry = {
+                    'placeholder': ph,
+                    'status': status,
+                    'mapped_question_id': None,
+                    'question_label': None,
+                    'question_type': None,
+                    'note': 'No intake question collects this data',
+                }
+            entries.append(entry)
+
+        # Find orphaned questions (exist in intake_schema but no placeholder uses them)
+        all_question_ids = {q.get('id', '') for q in questions}
+        used_question_ids = mapped_question_ids | {
+            ph for ph in placeholders if ph in all_question_ids
+        }
+        # Also exempt source questions whose auto-computed derivative is used in the template
+        for auto_ph, source_qid in self.AUTO_COMPUTED_SOURCES.items():
+            if auto_ph in placeholders:
+                used_question_ids.add(source_qid)
+        orphaned = []
+        for q in questions:
+            qid = q.get('id', '')
+            if qid and qid not in used_question_ids:
+                orphaned.append({
+                    'question_id': qid,
+                    'question_label': q.get('label', ''),
+                    'question_type': q.get('type', 'text'),
+                    'note': 'Question exists but no template placeholder uses it',
+                })
+
+        # Summary counts
+        mapped_count = sum(1 for e in entries if e['status'] == 'mapped')
+        unmapped_count = sum(1 for e in entries if e['status'] == 'unmapped')
+        auto_count = sum(1 for e in entries if e['status'] == 'auto')
+
+        return {
+            'affidavit_type_id': affidavit_type.id,
+            'affidavit_type_name': affidavit_type.name,
+            'total_placeholders': len(placeholders),
+            'summary': {
+                'mapped': mapped_count,
+                'unmapped': unmapped_count,
+                'auto_computed': auto_count,
+                'orphaned_questions': len(orphaned),
+            },
+            'entries': entries,
+            'orphaned_questions': orphaned,
+            'placeholder_mapping': mapping,
+            'questions': [
+                {'id': q.get('id', ''), 'label': q.get('label', ''), 'type': q.get('type', 'text')}
+                for q in questions
+            ],
+        }
+
+    def get(self, request, pk):
+        try:
+            affidavit_type = AffidavitType.objects.get(pk=pk)
+        except AffidavitType.DoesNotExist:
+            return Response({'error': 'Affidavit type not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(self._build_audit(affidavit_type))
+
+    def put(self, request, pk):
+        """
+        Save placeholder_mapping and optionally auto-create questions for unmapped placeholders.
+        
+        Body:
+          {
+            "placeholder_mapping": {"full_name": "full_name", ...},
+            "auto_create_questions": ["property_description", ...]  // optional
+          }
+        """
+        try:
+            affidavit_type = AffidavitType.objects.get(pk=pk)
+        except AffidavitType.DoesNotExist:
+            return Response({'error': 'Affidavit type not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        mapping = request.data.get('placeholder_mapping')
+        if mapping is not None:
+            if not isinstance(mapping, dict):
+                return Response({'error': 'placeholder_mapping must be a dict'}, status=status.HTTP_400_BAD_REQUEST)
+            affidavit_type.placeholder_mapping = mapping
+
+        # Auto-create questions for specified unmapped placeholders
+        auto_create = request.data.get('auto_create_questions', [])
+        created_questions = []
+        if auto_create and isinstance(auto_create, list):
+            existing_ids = {q.get('id', '') for q in (affidavit_type.intake_schema or [])}
+            schema = list(affidavit_type.intake_schema or [])
+
+            for placeholder_id in auto_create:
+                if not isinstance(placeholder_id, str) or not placeholder_id.strip():
+                    continue
+                pid = placeholder_id.strip()
+                if pid in existing_ids or pid in self.AUTO_COMPUTED:
+                    continue
+
+                # Generate a sensible label from the placeholder id
+                label = ' '.join(word.capitalize() for word in pid.split('_'))
+                new_q = {
+                    'id': pid,
+                    'label': label,
+                    'type': 'text',
+                    'required': True,
+                    'placeholder': '',
+                    'help_text': f'Enter your {label.lower()}.',
+                }
+                schema.append(new_q)
+                existing_ids.add(pid)
+                created_questions.append(pid)
+
+                # Also add to mapping
+                if isinstance(affidavit_type.placeholder_mapping, dict):
+                    affidavit_type.placeholder_mapping[pid] = pid
+
+            if created_questions:
+                affidavit_type.intake_schema = schema
+
+        affidavit_type.save(update_fields=['placeholder_mapping', 'intake_schema', 'updated_at'])
+
+        audit = self._build_audit(affidavit_type)
+        audit['created_questions'] = created_questions
+        return Response(audit)
+
+
+class TemplateLivePreviewView(APIView):
+    """
+    Template Fill Preview: Accept sample answers and return the filled template HTML (deterministic).
+    POST /admin/affidavit-types/<pk>/template-preview/
+    Body: { "sample_answers": { "full_name": "John Smith", ... } }
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, pk):
+        from .services.ai_service import pre_fill_template
+
+        try:
+            affidavit_type = AffidavitType.objects.get(pk=pk)
+        except AffidavitType.DoesNotExist:
+            return Response({'error': 'Affidavit type not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        template = affidavit_type.template_html or ''
+        if not template:
+            return Response({'error': 'No template HTML found for this type'}, status=status.HTTP_400_BAD_REQUEST)
+
+        sample_answers = request.data.get('sample_answers', {})
+        if not isinstance(sample_answers, dict):
+            return Response({'error': 'sample_answers must be a dict'}, status=status.HTTP_400_BAD_REQUEST)
+
+        filled_html = pre_fill_template(
+            template_html=template,
+            answers_json=sample_answers,
+            placeholder_mapping=affidavit_type.placeholder_mapping or {},
+            intake_schema=affidavit_type.intake_schema or [],
+        )
+
+        # Count what got replaced vs what's still pending
+        import re
+        remaining = re.findall(r'\{\{(\w+)\}\}', filled_html)
+
+        return Response({
+            'filled_html': filled_html,
+            'remaining_placeholders': list(dict.fromkeys(remaining)),
+            'total_placeholders': len(re.findall(r'\{\{(\w+)\}\}', template)),
+            'filled_count': len(re.findall(r'\{\{(\w+)\}\}', template)) - len(set(remaining)),
+        })
+
+
+class AIDraftPreviewView(APIView):
+    """
+    AI Draft Preview: Run the full draft_affidavit flow with sample answers.
+    Returns the actual AI-generated affidavit (same as production flow).
+    POST /admin/affidavit-types/<pk>/ai-draft-preview/
+    Body: { "sample_answers": { "full_name": "John Smith", ... } }
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, pk):
+        from .services.ai_service import draft_affidavit
+        import time
+
+        try:
+            affidavit_type = AffidavitType.objects.get(pk=pk)
+        except AffidavitType.DoesNotExist:
+            return Response({'error': 'Affidavit type not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        sample_answers = request.data.get('sample_answers', {})
+        if not isinstance(sample_answers, dict):
+            return Response({'error': 'sample_answers must be a dict'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate we have enough data to draft
+        if not sample_answers:
+            return Response({'error': 'sample_answers cannot be empty'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            start_time = time.time()
+            
+            # Run the full AI drafting flow (same as production)
+            draft_result = draft_affidavit(
+                answers_json=sample_answers,
+                policy_json=affidavit_type.policy_json or {},
+                affidavit_type_name=affidavit_type.name,
+                scenario_library=affidavit_type.scenario_library or [],
+                template_html=affidavit_type.template_html or '',
+                disallowed_phrases=affidavit_type.disallowed_phrases or [],
+                placeholder_mapping=affidavit_type.placeholder_mapping or {},
+                intake_schema=affidavit_type.intake_schema or [],
+                affidavit_type_id=affidavit_type.id,
+            )
+            
+            elapsed_time = time.time() - start_time
+
+            if not draft_result.get('success'):
+                return Response({
+                    'error': draft_result.get('error', 'Draft generation failed'),
+                    'elapsed_time': elapsed_time,
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            return Response({
+                'draft_html': draft_result.get('draft_html', ''),
+                'warnings': draft_result.get('warnings', []),
+                'model_used': draft_result.get('model_used', 'unknown'),
+                'elapsed_time': elapsed_time,
+                'prompt_tokens': draft_result.get('prompt_tokens', 0),
+                'completion_tokens': draft_result.get('completion_tokens', 0),
+                'total_tokens': draft_result.get('total_tokens', 0),
+            })
+
+        except Exception as e:
+            logger.error(f"AI draft preview failed: {e}")
+            return Response({
+                'error': f'Draft generation error: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class FieldSuggestionsView(APIView):
+    """
+    Smart field suggestions for template editor.
+    
+    GET /admin/affidavit-types/<pk>/field-suggestions/
+    Query params:
+      - selected_text: text user selected
+      - context_before: text before selection (up to 200 chars)
+      - context_after: text after selection (up to 200 chars)
+    
+    Returns:
+      {
+        "ai_suggestions": [...],           // AI-powered suggestions based on context
+        "unused_universal_fields": [...],  // UNIVERSAL_FIELDS not yet in schema
+        "unused_common_fields": [...],     // Common FIELD_DEFAULTS not yet in schema
+        "existing_fields": [...]            // Already in schema
+      }
+    """
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, pk):
+        from .services.policy_generator_service import FIELD_DEFAULTS, UNIVERSAL_FIELDS, FIELD_ALIASES
+        from .services.ai_service import get_openai_client
+        
+        try:
+            affidavit_type = AffidavitType.objects.get(pk=pk)
+        except AffidavitType.DoesNotExist:
+            return Response({'error': 'Affidavit type not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        existing_ids = {q.get('id', '').lower() for q in (affidavit_type.intake_schema or [])}
+        
+        # AI-powered suggestions if context provided
+        ai_suggestions = []
+        selected_text = request.query_params.get('selected_text', '').strip()
+        context_before = request.query_params.get('context_before', '').strip()
+        context_after = request.query_params.get('context_after', '').strip()
+        
+        if selected_text and (context_before or context_after):
+            # Build available fields context
+            available_fields = []
+            for field_id, defaults in FIELD_DEFAULTS.items():
+                if field_id not in existing_ids:
+                    available_fields.append(f"- {field_id}: {defaults.get('label', field_id)}")
+            
+            available_fields_text = "\n".join(available_fields[:30]) if available_fields else "No predefined fields available"
+            
+            prompt = f"""Analyze this template text and suggest the most appropriate field to replace the selected text.
+
+CONTEXT BEFORE: {context_before[-200:]}
+SELECTED TEXT: "{selected_text}"
+CONTEXT AFTER: {context_after[:200]}
+
+AVAILABLE PREDEFINED FIELDS:
+{available_fields_text}
+
+INSTRUCTIONS:
+1. Suggest the BEST field_id from available fields, OR create a new one if none fit
+2. Consider the semantic meaning and context
+3. Return ONLY JSON with top 3 suggestions:
+
+[
+  {{
+    "field_id": "property_address",
+    "confidence": 0.95,
+    "label": "Property Address",
+    "type": "text",
+    "reason": "Context indicates physical location details"
+  }},
+  ...
+]"""
+
+            try:
+                client = get_openai_client()
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=500,
+                )
+                
+                import json
+                suggestions_text = response.choices[0].message.content.strip()
+                # Extract JSON from markdown code blocks if present
+                if '```json' in suggestions_text:
+                    suggestions_text = suggestions_text.split('```json')[1].split('```')[0].strip()
+                elif '```' in suggestions_text:
+                    suggestions_text = suggestions_text.split('```')[1].split('```')[0].strip()
+                
+                ai_suggestions = json.loads(suggestions_text)
+                
+                # Enrich with help_text from FIELD_DEFAULTS if available
+                for sug in ai_suggestions:
+                    field_id = sug.get('field_id', '')
+                    canonical = FIELD_ALIASES.get(field_id, field_id)
+                    if canonical in FIELD_DEFAULTS:
+                        defaults = FIELD_DEFAULTS[canonical]
+                        sug['help_text'] = defaults.get('help_text', '')
+                        if not sug.get('type'):
+                            sug['type'] = defaults.get('type', 'text')
+                    sug['category'] = 'ai_suggested'
+                    
+            except Exception as e:
+                logger.warning(f"AI suggestion failed: {e}")
+                # Fallback to basic suggestion
+                suggested_id = selected_text.lower().replace(' ', '_').replace('-', '_')
+                suggested_id = ''.join(c for c in suggested_id if c.isalnum() or c == '_')
+                if suggested_id and not suggested_id[0].isdigit():
+                    ai_suggestions = [{
+                        'field_id': suggested_id,
+                        'confidence': 0.5,
+                        'label': selected_text.title(),
+                        'type': 'text',
+                        'reason': 'Basic text-based suggestion',
+                        'category': 'ai_suggested',
+                    }]
+        
+        # Universal fields not yet added
+        unused_universal = []
+        for uf in UNIVERSAL_FIELDS:
+            if uf['id'].lower() not in existing_ids:
+                unused_universal.append({
+                    'id': uf['id'],
+                    'label': uf['label'],
+                    'type': uf['type'],
+                    'help_text': uf.get('help_text', ''),
+                    'category': 'universal',
+                })
+        
+        # Common fields from FIELD_DEFAULTS not yet added
+        unused_common = []
+        for field_id, defaults in FIELD_DEFAULTS.items():
+            if field_id not in existing_ids:
+                unused_common.append({
+                    'id': field_id,
+                    'label': defaults.get('label', field_id.replace('_', ' ').title()),
+                    'type': defaults.get('type', 'text'),
+                    'help_text': defaults.get('help_text', ''),
+                    'category': 'common',
+                })
+        
+        # Existing fields
+        existing_fields = [
+            {
+                'id': q.get('id', ''),
+                'label': q.get('label', ''),
+                'type': q.get('type', 'text'),
+            }
+            for q in (affidavit_type.intake_schema or [])
+        ]
+        
+        return Response({
+            'ai_suggestions': ai_suggestions,
+            'unused_universal_fields': unused_universal,
+            'unused_common_fields': unused_common[:20],  # Limit to top 20
+            'existing_fields': existing_fields,
+        })
+
+    def post(self, request, pk):
+        """
+        Generate a single field config from a natural language description.
+        Uses template_documents as AI reference context.
+
+        POST body: { "description": "applicant's full name", "context_html": "..." }
+        Returns:   { "field_id", "label", "type", "help_text", "placeholder", "reason" }
+        """
+        import re as _re
+        import json as _json
+        from .services.ai_service import get_openai_client
+
+        try:
+            affidavit_type = AffidavitType.objects.get(pk=pk)
+        except AffidavitType.DoesNotExist:
+            return Response({'error': 'Affidavit type not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        description = request.data.get('description', '').strip()
+        context_html = request.data.get('context_html', '').strip()
+        full_template = request.data.get('full_template', '').strip()
+
+        if not description:
+            return Response({'error': 'description is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        existing_ids = {q.get('id', '').lower() for q in (affidavit_type.intake_schema or [])}
+
+        # Build context from uploaded template_documents (up to 3 docs, 2000 chars each)
+        template_docs = affidavit_type.template_documents or []
+        docs_context = ''
+        if template_docs:
+            snippets = []
+            for doc in template_docs[:3]:
+                html = doc.get('html_content', '')
+                if html:
+                    text = _re.sub(r'<[^>]+>', ' ', html)
+                    text = _re.sub(r'\s+', ' ', text).strip()[:2000]
+                    snippets.append(f"=== {doc.get('filename', 'Document')} ===\n{text}")
+            docs_context = '\n\n'.join(snippets)
+
+        existing_context = ', '.join(sorted(existing_ids)) if existing_ids else 'none'
+
+        if '[INSERTION_POINT]' not in context_html and '[REPLACE_START]' not in context_html:
+            context_html += ' [INSERTION_POINT]'
+
+        # Strip HTML tags from full_template for contradiction check
+        full_template_text = _re.sub(r'<[^>]+>', ' ', full_template)
+        full_template_text = _re.sub(r'\s+', ' ', full_template_text).strip()[:4000]
+
+        prompt = f"""You are an expert legal document drafter assisting in creating dynamic affidavit templates.
+
+Your goal is to suggest a smart field definition that seamlessly integrates into the existing sentence structure, WITHOUT creating any logical contradictions.
+
+FIELD REQUEST: "{description}"
+{"" if not context_html else "TEMPLATE SNIPPET (The text around the insertion point):\n" + context_html[:1000]}
+{"" if not full_template_text else "FULL TEMPLATE (read this to detect contradictions anywhere in the document):\n" + full_template_text}
+{"" if not docs_context else "REFERENCE DOCUMENTS (Style guide/Context):\n" + docs_context}
+EXISTING FIELD IDs (do not reuse): {existing_context}
+
+UNDERSTANDING THE MARKERS:
+- '[INSERTION_POINT]' = the exact cursor position. The field will be INSERTED here. You must supply prefix/suffix so the sentence reads correctly.
+- '[REPLACE_START]...[REPLACE_END]' = the user SELECTED this text to give you context about WHERE the field should go. See REPLACE rules below.
+
+⚠️  LOGICAL CONTRADICTION CHECK — READ THIS FIRST:
+Before generating anything, scan the ENTIRE template snippet for negation phrases near the insertion point:
+- Phrases like: "I have no", "I do not have", "I don't have", "no other", "none", "nothing", "not any", "save for", "except for" that refer to the SAME concept as the requested field.
+- If such a phrase EXISTS near the marker, blindly adding the field would create a contradiction.
+  Example of BAD output: snippet says "I have no other property" and field {{other_property}} is inserted immediately after → the document now says "I have no other property [value]" which makes no sense.
+- When a contradiction is detected, you MUST restructure the affected sentence in prefix/suffix so the contradiction is removed:
+  - Remove or neutralise the negating phrase by incorporating it into the prefix/suffix.
+  - Example fix: change "...I have no other property. Except for [INSERTION_POINT]..." so that prefix="Other property owned: " and suffix=".", which removes the contradiction.
+  - Or, if the selected text itself IS the negating phrase ([REPLACE_START]I have no other property[REPLACE_END]), replace the whole phrase with "{{other_property_description}}".
+- Set "contradiction_resolved" to true and briefly explain in "reason" what you changed.
+
+CRITICAL INSTRUCTIONS:
+1. Read the FULL template snippet including surrounding context. Run the contradiction check above first.
+2. Determine whether this is a REPLACE (markers exist) or INSERT operation.
+3. For REPLACE — TWO CASES:
+   a. SHORT selection (a single value, name, date, number — a few words): The selection is exactly what becomes the field. Replace just that value; prefix/suffix are usually empty because the sentence already flows.
+      Example: "[REPLACE_START]John Smith[REPLACE_END] of 15 Queen St" → field_id="full_name", prefix="", suffix="" ✅
+   b. LONG selection (a full sentence, clause, or list item — like "That there is no dispute in the ownership of the Land"):
+      The user selected the whole sentence to give you CONTEXT, NOT to delete the entire sentence.
+      You MUST keep the static legal language and only make the VARIABLE PART a placeholder.
+      Put the static text before the variable part in prefix, and static text after it in suffix.
+      Example: "[REPLACE_START]That there is no dispute in the ownership of the Land[REPLACE_END]" with request "land description" →
+        field_id="land_description", prefix="That there is no dispute in the ownership of ", suffix="" ✅
+      NEVER produce prefix="" suffix="" when the selection is a full sentence — that would delete all the legal text. ❌
+4. For INSERT:
+   - Generate 'prefix' and 'suffix' so the field fits grammatically AND logically.
+   - The resulting sentence must make complete logical sense — no self-contradictions.
+5. Respect the tone and style of the REFERENCE DOCUMENTS if provided.
+6. Return ONLY valid JSON — no markdown, no extra text.
+
+Response Format:
+{{
+  "field_id": "snake_case_id",
+  "label": "Human Readable Label",
+  "type": "text|textarea|date|email|phone|number|select",
+  "help_text": "Brief instruction for the user",
+  "placeholder": "Example value",
+  "prefix": "Text before the field (resolves any contradiction if needed)",
+  "suffix": "Text after the field",
+  "contradiction_resolved": false,
+  "reason": "Explanation of choice and any contradiction resolution"
+}}
+
+Rules:
+- field_id: lowercase snake_case, unique.
+- type: choose specific types (date, phone, number) over generic text where possible.
+- prefix/suffix: MUST ensure grammatical AND logical correctness.
+  - If the previous word has no trailing space, start prefix with a space.
+  - If the next word assumes a separator, include it in suffix.
+  - For REPLACE operations: prefer empty strings unless needed to fix grammar/logic.
+"""
+
+        try:
+            client = get_openai_client()
+            response = client.chat.completions.create(
+                model='gpt-4o',
+                messages=[{'role': 'user', 'content': prompt}],
+                temperature=0.2,
+                max_tokens=600,
+            )
+            result_text = response.choices[0].message.content.strip()
+            if '```json' in result_text:
+                result_text = result_text.split('```json')[1].split('```')[0].strip()
+            elif '```' in result_text:
+                result_text = result_text.split('```')[1].split('```')[0].strip()
+
+            field_config = _json.loads(result_text)
+
+            # Ensure uniqueness
+            base_id = field_config.get('field_id', 'new_field')
+            field_id = base_id
+            counter = 1
+            while field_id in existing_ids:
+                field_id = f'{base_id}_{counter}'
+                counter += 1
+            field_config['field_id'] = field_id
+
+            return Response(field_config)
+
+        except Exception as e:
+            logger.warning(f'AI field generation failed: {e}')
+            # Fallback: derive from description
+            fallback_id = _re.sub(r'[^a-z0-9_]', '', description.lower().replace(' ', '_'))[:40]
+            if not fallback_id or fallback_id[0].isdigit():
+                fallback_id = 'field_' + fallback_id
+            base_id = fallback_id
+            counter = 1
+            while fallback_id in existing_ids:
+                fallback_id = f'{base_id}_{counter}'
+                counter += 1
+            return Response({
+                'field_id': fallback_id,
+                'label': description.title(),
+                'type': 'text',
+                'help_text': f'Please enter {description.lower()}',
+                'placeholder': '',
+                'reason': 'AI generation failed; derived from description',
+            })
+
+
+class AtomicFieldInsertionView(APIView):
+    """
+    Template-First Field Creation: Atomically insert placeholder into template + create question + update mapping.
+    
+    POST /admin/affidavit-types/<pk>/insert-field/
+    Body:
+      {
+        "mode": "replace" | "insert",  // replace text or insert at position
+        "field_id": "ownership_proof_number",
+        "field_config": {
+          "label": "Ownership Proof Number",
+          "type": "text",
+          "required": true,
+          "help_text": "...",
+          "placeholder": "..."
+        },
+        // For replace mode:
+        "target_text": "John Smith",  // exact text to replace
+        // For insert mode:
+        "insert_position": 123,  // character offset in template_html
+        "insert_context": "before" | "after" | "replace"  // how to insert relative to position
+      }
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, pk):
+        import re
+        from .services.policy_generator_service import FIELD_DEFAULTS, FIELD_ALIASES
+
+        try:
+            affidavit_type = AffidavitType.objects.get(pk=pk)
+        except AffidavitType.DoesNotExist:
+            return Response({'error': 'Affidavit type not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        mode = request.data.get('mode', 'insert')
+        field_id = request.data.get('field_id', '').strip().lower()
+        field_config = request.data.get('field_config', {})
+
+        # Validate field_id format
+        if not field_id or not re.match(r'^[a-z][a-z0-9_]*$', field_id):
+            return Response({
+                'error': 'field_id must be lowercase snake_case (letters, numbers, underscores)'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check if field_id already exists in intake_schema
+        existing_ids = {q.get('id', '').lower() for q in (affidavit_type.intake_schema or [])}
+        if field_id in existing_ids:
+            return Response({
+                'error': f'Field "{field_id}" already exists in intake schema'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Check if placeholder already exists in template
+        template = affidavit_type.template_html or ''
+        existing_placeholders = set(re.findall(r'\{\{(\w+)\}\}', template))
+        if field_id in existing_placeholders:
+            return Response({
+                'error': f'Placeholder {{{{field_id}}}} already exists in template'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Build placeholder
+        placeholder_text = f'{{{{{field_id}}}}}'
+
+        # Modify template based on mode
+        new_template = template
+        if mode == 'replace':
+            target_text = request.data.get('target_text', '')
+            if not target_text:
+                return Response({'error': 'target_text required for replace mode'}, status=status.HTTP_400_BAD_REQUEST)
+            if target_text not in template:
+                return Response({'error': f'target_text "{target_text}" not found in template'}, status=status.HTTP_400_BAD_REQUEST)
+            # Replace first occurrence only
+            new_template = template.replace(target_text, placeholder_text, 1)
+        elif mode == 'insert':
+            insert_position = request.data.get('insert_position')
+            if insert_position is None:
+                return Response({'error': 'insert_position required for insert mode'}, status=status.HTTP_400_BAD_REQUEST)
+            if not (0 <= insert_position <= len(template)):
+                return Response({'error': 'insert_position out of range'}, status=status.HTTP_400_BAD_REQUEST)
+            new_template = template[:insert_position] + placeholder_text + template[insert_position:]
+        else:
+            return Response({'error': 'mode must be "replace" or "insert"'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Build question from field_config + smart defaults
+        canonical_id = FIELD_ALIASES.get(field_id, field_id)
+        defaults = FIELD_DEFAULTS.get(canonical_id, {})
+
+        new_question = {
+            'id': field_id,
+            'label': field_config.get('label') or defaults.get('label') or field_id.replace('_', ' ').title(),
+            'type': field_config.get('type') or defaults.get('type', 'text'),
+            'required': field_config.get('required', True),
+            'placeholder': field_config.get('placeholder') or defaults.get('placeholder', ''),
+            'help_text': field_config.get('help_text') or defaults.get('help_text', f"Enter your {field_config.get('label', field_id).lower()}."),
+        }
+
+        # Add validation if provided
+        if field_config.get('validation'):
+            new_question['validation'] = field_config['validation']
+        elif defaults.get('validation'):
+            new_question['validation'] = defaults['validation']
+
+        # Append to intake_schema
+        schema = list(affidavit_type.intake_schema or [])
+        new_question['order'] = len(schema) + 1
+        schema.append(new_question)
+
+        # Update placeholder_mapping
+        mapping = dict(affidavit_type.placeholder_mapping or {})
+        mapping[field_id] = field_id
+
+        # Atomic save
+        affidavit_type.template_html = new_template
+        affidavit_type.intake_schema = schema
+        affidavit_type.placeholder_mapping = mapping
+        affidavit_type.increment_policy_version()
+        affidavit_type.save()
+
+        return Response({
+            'success': True,
+            'field_id': field_id,
+            'placeholder': placeholder_text,
+            'question': new_question,
+            'template_updated': True,
+            'mapping_updated': True,
         })
 
 
@@ -2741,6 +3784,40 @@ class AdminAllPaymentLogsView(generics.ListAPIView):
         return PaymentLog.objects.all()
 
 
+class AdminGenerateSlotsView(APIView):
+    """
+    Superuser-only endpoint to manually generate/refresh availability slots
+    for a specific commissioner. Use this as a fallback when the Celery Beat
+    cron job did not run.
+    """
+    permission_classes = [IsAuthenticated, IsSuperUser]
+
+    def post(self, request, pk):
+        from .services.slot_service import generate_slots_for_commissioner
+
+        commissioner = get_object_or_404(User, pk=pk, role=User.Role.COMMISSIONER)
+
+        # Allow caller to specify how many days ahead to generate (default 14, max 60)
+        try:
+            days = int(request.data.get('days', 14))
+            days = max(1, min(days, 60))
+        except (TypeError, ValueError):
+            days = 14
+
+        slots_created = generate_slots_for_commissioner(commissioner, days=days, cleanup=True)
+
+        return Response({
+            'success': True,
+            'message': (
+                f'Generated {slots_created} slot(s) for '
+                f'{commissioner.get_full_name() or commissioner.username} '
+                f'({days}-day window).'
+            ),
+            'slots_created': slots_created,
+            'commissioner_id': pk,
+        }, status=status.HTTP_200_OK)
+
+
 # =============================================================================
 # Commissioner Slot Views
 # =============================================================================
@@ -2887,10 +3964,214 @@ class BookSlotView(APIView):
             }
         )
         
+        # Send notifications to user and commissioner
+        from .services.notification_service import send_appointment_booked_notifications
+        try:
+            send_appointment_booked_notifications(request_obj, slot)
+        except Exception as e:
+            logger.warning(f"Failed to send appointment booked notifications: {e}")
+        
         return Response({
             'success': True,
             'message': 'Appointment booked successfully',
             'slot': CommissionerSlotSerializer(slot).data
+        })
+
+
+# =============================================================================
+# Commissioner Appointment Decision Views
+# =============================================================================
+
+class CommissionerAcceptSlotView(APIView):
+    """
+    Commissioner accepts a booked appointment.
+    Sends confirmation notification to user.
+    """
+    permission_classes = [IsCommissioner]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        slot = get_object_or_404(
+            CommissionerSlot, 
+            pk=pk, 
+            commissioner=request.user,
+            is_booked=True
+        )
+        
+        if slot.appointment_status == CommissionerSlot.AppointmentStatus.ACCEPTED:
+            return Response(
+                {'error': 'Appointment already accepted'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if slot.appointment_status in [
+            CommissionerSlot.AppointmentStatus.REJECTED,
+            CommissionerSlot.AppointmentStatus.CANCELLED_BY_COMMISSIONER,
+            CommissionerSlot.AppointmentStatus.CANCELLED_BY_USER
+        ]:
+            return Response(
+                {'error': 'Cannot accept a cancelled or rejected appointment'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Accept the appointment
+        slot.accept()
+        
+        # Log event
+        if slot.request:
+            RequestEvent.objects.create(
+                request=slot.request,
+                action=RequestEvent.Action.COMMISSIONER_CHANGED,
+                actor=request.user,
+                actor_role=request.user.role,
+                details={
+                    'action': 'appointment_accepted',
+                    'slot_id': slot.id,
+                    'slot_time': slot.start_time.isoformat()
+                }
+            )
+            
+            # Send notification to user
+            from .services.notification_service import send_appointment_accepted_notification
+            try:
+                send_appointment_accepted_notification(slot.request, slot)
+            except Exception as e:
+                logger.warning(f"Failed to send appointment accepted notification: {e}")
+        
+        return Response({
+            'success': True,
+            'message': 'Appointment accepted',
+            'slot': CommissionerSlotSerializer(slot).data
+        })
+
+
+class CommissionerRejectSlotView(APIView):
+    """
+    Commissioner rejects a booked appointment.
+    Releases the slot and notifies user to rebook.
+    """
+    permission_classes = [IsCommissioner]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        slot = get_object_or_404(
+            CommissionerSlot, 
+            pk=pk, 
+            commissioner=request.user,
+            is_booked=True
+        )
+        
+        if slot.appointment_status in [
+            CommissionerSlot.AppointmentStatus.REJECTED,
+            CommissionerSlot.AppointmentStatus.CANCELLED_BY_COMMISSIONER,
+            CommissionerSlot.AppointmentStatus.CANCELLED_BY_USER
+        ]:
+            return Response(
+                {'error': 'Appointment already cancelled or rejected'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        reason = request.data.get('reason', '')
+        request_obj = slot.request
+        
+        # Reject the appointment (releases slot and clears request link)
+        slot.reject(reason)
+        
+        # Clear commissioner from request and revert status
+        if request_obj:
+            request_obj.commissioner = None
+            if request_obj.status == Request.Status.NEEDS_REVIEW:
+                request_obj.status = Request.Status.DRAFT_READY
+            request_obj.save()
+            
+            # Log event
+            RequestEvent.objects.create(
+                request=request_obj,
+                action=RequestEvent.Action.COMMISSIONER_CHANGED,
+                actor=request.user,
+                actor_role=request.user.role,
+                details={
+                    'action': 'appointment_rejected',
+                    'slot_id': slot.id,
+                    'reason': reason
+                }
+            )
+            
+            # Send notification to user
+            from .services.notification_service import send_appointment_rejected_notification
+            try:
+                send_appointment_rejected_notification(request_obj)
+            except Exception as e:
+                logger.warning(f"Failed to send appointment rejected notification: {e}")
+        
+        return Response({
+            'success': True,
+            'message': 'Appointment rejected. User has been notified to select a new slot.'
+        })
+
+
+class CommissionerCancelSlotView(APIView):
+    """
+    Commissioner cancels a previously accepted appointment.
+    Releases the slot and notifies user to rebook.
+    """
+    permission_classes = [IsCommissioner]
+
+    @transaction.atomic
+    def post(self, request, pk):
+        slot = get_object_or_404(
+            CommissionerSlot, 
+            pk=pk, 
+            commissioner=request.user,
+            is_booked=True
+        )
+        
+        if slot.appointment_status in [
+            CommissionerSlot.AppointmentStatus.REJECTED,
+            CommissionerSlot.AppointmentStatus.CANCELLED_BY_COMMISSIONER,
+            CommissionerSlot.AppointmentStatus.CANCELLED_BY_USER
+        ]:
+            return Response(
+                {'error': 'Appointment already cancelled or rejected'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        reason = request.data.get('reason', '')
+        request_obj = slot.request
+        
+        # Cancel the appointment
+        slot.cancel_by_commissioner(reason)
+        
+        # Clear commissioner from request and revert status
+        if request_obj:
+            request_obj.commissioner = None
+            if request_obj.status == Request.Status.NEEDS_REVIEW:
+                request_obj.status = Request.Status.DRAFT_READY
+            request_obj.save()
+            
+            # Log event
+            RequestEvent.objects.create(
+                request=request_obj,
+                action=RequestEvent.Action.COMMISSIONER_CHANGED,
+                actor=request.user,
+                actor_role=request.user.role,
+                details={
+                    'action': 'appointment_cancelled_by_commissioner',
+                    'slot_id': slot.id,
+                    'reason': reason
+                }
+            )
+            
+            # Send notification to user
+            from .services.notification_service import send_appointment_cancelled_by_commissioner_notification
+            try:
+                send_appointment_cancelled_by_commissioner_notification(request_obj)
+            except Exception as e:
+                logger.warning(f"Failed to send appointment cancelled notification: {e}")
+        
+        return Response({
+            'success': True,
+            'message': 'Appointment cancelled. User has been notified to reschedule.'
         })
 
 
@@ -2989,6 +4270,112 @@ class AdminAffidavitTypeDuplicateView(APIView):
         
         serializer = AffidavitTypeAdminSerializer(new_type)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class RefineTemplateView(APIView):
+    """
+    AI-powered template refinement endpoint.
+    Admin describes what to make dynamic; AI adds {{placeholder}} tokens,
+    optionally learning from real saved affidavit drafts in DB.
+
+    POST /admin/types/<pk>/refine-template/
+    Body: { "instruction": "...", "current_template": "..." }
+    """
+
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, pk):
+        affidavit_type = get_object_or_404(AffidavitType, pk=pk)
+
+        instruction = request.data.get('instruction', '').strip()
+        current_template = (
+            request.data.get('current_template', '').strip()
+            or affidavit_type.template_html
+            or ''
+        )
+
+        if not instruction:
+            return Response(
+                {'error': 'Instruction is required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not current_template:
+            return Response(
+                {'error': 'No template to refine. Please create a template first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result = refine_template_section(
+            current_template=current_template,
+            instruction=instruction,
+            affidavit_type_id=pk,
+        )
+
+        http_status = status.HTTP_200_OK if result.get('success') else status.HTTP_500_INTERNAL_SERVER_ERROR
+        return Response(result, status=http_status)
+
+
+class RefineInstructionView(APIView):
+    """
+    AI-powered prompt refinement for template refinement instructions.
+    Takes a rough user instruction and returns a clear, specific one.
+
+    POST /admin/types/<pk>/refine-instruction/
+    Body: { "raw_instruction": "...", "current_template": "..." }
+    """
+
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, pk):
+        affidavit_type = get_object_or_404(AffidavitType, pk=pk)
+
+        raw_instruction = request.data.get('raw_instruction', '').strip()
+        current_template = (
+            request.data.get('current_template', '').strip()
+            or affidavit_type.template_html
+            or ''
+        )
+
+        if not raw_instruction:
+            return Response(
+                {'error': 'Instruction is required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result = refine_user_instruction(
+            raw_instruction=raw_instruction,
+            current_template=current_template,
+        )
+
+        http_status = status.HTTP_200_OK if result.get('success') else status.HTTP_500_INTERNAL_SERVER_ERROR
+        return Response(result, status=http_status)
+
+
+class ValidateAffidavitConfigView(APIView):
+    """
+    Validate template ↔ intake_schema mapping completeness for an affidavit type.
+    Returns errors (unmapped placeholders) and warnings (orphaned questions).
+
+    GET /admin/affidavit-types/<pk>/validate-config/
+    """
+
+    permission_classes = [IsAdminUser]
+
+    def get(self, request, pk):
+        from .services.policy_generator_service import validate_template_mapping
+
+        affidavit_type = get_object_or_404(AffidavitType, pk=pk)
+
+        report = validate_template_mapping(
+            template_html=affidavit_type.template_html or '',
+            intake_schema=affidavit_type.intake_schema or [],
+            placeholder_mapping=affidavit_type.placeholder_mapping or {},
+        )
+        report['affidavit_type_id'] = affidavit_type.id
+        report['affidavit_type_name'] = affidavit_type.name
+
+        return Response(report)
 
 
 # =============================================================================
@@ -3189,7 +4576,10 @@ class AdminPolicyTaskStatusView(APIView):
         from rest_framework import serializers
         from .services.policy_generator_service import (
             convert_detected_fields_to_intake_schema,
-            build_policy_json_from_generation
+            build_policy_json_from_generation,
+            auto_generate_placeholder_mapping,
+            build_scenarios_from_identified,
+            validate_template_mapping,
         )
         
         task = AsyncResult(task_id)
@@ -3255,10 +4645,51 @@ class AdminPolicyTaskStatusView(APIView):
                             **affidavit_type.policy_json,
                             **policy_json
                         }
+
+                    # Store scenario_branches in policy_json for drafter use
+                    scenario_branches = result.get('scenario_branches', {})
+                    if scenario_branches:
+                        affidavit_type.policy_json = {
+                            **(affidavit_type.policy_json or {}),
+                            'scenario_branches': scenario_branches,
+                        }
+                        result['scenario_branches_stored'] = len(scenario_branches)
                     
+                    # Auto-generate placeholder_mapping from template + final schema
+                    final_schema = affidavit_type.intake_schema or []
+                    generated_mapping = auto_generate_placeholder_mapping(
+                        affidavit_type.template_html or '',
+                        final_schema,
+                    )
+                    if generated_mapping:
+                        existing_mapping = affidavit_type.placeholder_mapping or {}
+                        # Merge: keep existing manual overrides, fill in new auto-mappings
+                        for ph, qid in generated_mapping.items():
+                            if ph not in existing_mapping:
+                                existing_mapping[ph] = qid
+                        affidavit_type.placeholder_mapping = existing_mapping
+                        result['auto_mapped_placeholders'] = len(generated_mapping)
+
+                    # Merge AI-identified scenarios into scenario_library
+                    identified = result.get('identified_scenarios', [])
+                    if identified:
+                        affidavit_type.scenario_library = build_scenarios_from_identified(
+                            identified,
+                            affidavit_type.scenario_library or [],
+                        )
+                        result['scenarios_added'] = len(identified)
+
                     affidavit_type.increment_policy_version()
                     affidavit_type.save()
                     result['saved'] = True
+
+                    # Post-save validation report
+                    validation_report = validate_template_mapping(
+                        template_html=affidavit_type.template_html or '',
+                        intake_schema=affidavit_type.intake_schema or [],
+                        placeholder_mapping=affidavit_type.placeholder_mapping or {},
+                    )
+                    result['config_validation'] = validation_report
                 except AffidavitType.DoesNotExist:
                     result['saved'] = False
                     result['save_error'] = 'Affidavit type not found'

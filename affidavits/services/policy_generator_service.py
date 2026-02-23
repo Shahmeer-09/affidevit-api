@@ -128,15 +128,71 @@ TT_FIELD_RULES = {
         },
         'type': 'date'  # Will be converted to date picker
     },
-    # Declaration date - cannot be in future
+    # Declaration date (single combined field) - NO date constraint, user chooses freely
     'declaration_date': {
         'patterns': ['declaration_date', 'sworn_date', 'dated', 'date_declared', 'affirmed_date'],
-        'validation': {
-            'max_date': 'today',
-            'date_constraint': 'past_or_today',
-            'message': 'Declaration date cannot be in the future'
-        },
+        'validation': {},  # No past/future constraint — declaration date is the user's choice
         'type': 'date'
+    },
+    # --- Declaration date parts (declared_at section: City / Day / Month / Year) ---
+    # These MUST use the declaration_ prefix so the system knows NOT to apply date constraints.
+    # Users are free to enter any date when making/signing their declaration.
+    'declaration_city': {
+        'patterns': ['declaration_city'],
+        'validation': {
+            'pattern': r"^[a-zA-Z\s\-'\.]+$",
+            'input_mode': 'text_only',
+            'message': 'City can only contain letters'
+        },
+        'type': 'text',
+        'placeholder': 'Port of Spain',
+    },
+    'declaration_day': {
+        'patterns': ['declaration_day'],
+        'validation': {
+            'pattern': r'^([1-9]|[12]\d|3[01])$',
+            'input_mode': 'numeric',
+            'min': 1,
+            'max': 31,
+            'message': 'Enter a valid day (1-31)'
+        },
+        'type': 'number',
+        'placeholder': '4',
+    },
+    'declaration_month': {
+        'patterns': ['declaration_month'],
+        'validation': {
+            'pattern': r'^(January|February|March|April|May|June|July|August|September|October|November|December)$',
+            'input_mode': 'text_only',
+            'message': 'Please select a valid month'
+        },
+        'type': 'select',
+        'placeholder': 'Select month',
+        'options': [
+            {'value': 'January', 'label': 'January'},
+            {'value': 'February', 'label': 'February'},
+            {'value': 'March', 'label': 'March'},
+            {'value': 'April', 'label': 'April'},
+            {'value': 'May', 'label': 'May'},
+            {'value': 'June', 'label': 'June'},
+            {'value': 'July', 'label': 'July'},
+            {'value': 'August', 'label': 'August'},
+            {'value': 'September', 'label': 'September'},
+            {'value': 'October', 'label': 'October'},
+            {'value': 'November', 'label': 'November'},
+            {'value': 'December', 'label': 'December'}
+        ],
+    },
+    'declaration_year': {
+        'patterns': ['declaration_year'],
+        'validation': {
+            'pattern': r'^\d{4}$',
+            'input_mode': 'numeric',
+            'min': 1900,
+            'message': 'Enter a valid 4-digit year'
+        },
+        'type': 'number',
+        'placeholder': '2026',
     },
     # Event dates - typically past dates
     'event_date': {
@@ -171,9 +227,9 @@ TT_FIELD_RULES = {
         'type': 'text',
         'placeholder': 'Port of Spain'
     },
-    # Month names - with future date check for declaration contexts
+    # Month names - generic non-declaration month fields (e.g. event month)
     'month': {
-        'patterns': ['month', 'month_name', 'declaration_month'],
+        'patterns': ['month', 'month_name'],  # declaration_month handled by its own rule above
         'validation': {
             'pattern': r'^(January|February|March|April|May|June|July|August|September|October|November|December)$',
             'input_mode': 'text_only',
@@ -197,9 +253,9 @@ TT_FIELD_RULES = {
             {'value': 'December', 'label': 'December'}
         ]
     },
-    # Year - numeric only, prevent future years for declarations
+    # Year - generic non-declaration year fields (declaration_year handled by its own rule above)
     'year': {
-        'patterns': ['year', 'year_of', 'declaration_year'],
+        'patterns': ['year', 'year_of'],
         'validation': {
             'pattern': r'^\d{4}$',
             'input_mode': 'numeric',
@@ -211,9 +267,9 @@ TT_FIELD_RULES = {
         'type': 'number',
         'placeholder': '2026'
     },
-    # Day - numeric only, with future date check for declaration contexts
+    # Day - generic non-declaration day fields (declaration_day handled by its own rule above)
     'day': {
-        'patterns': ['day', 'day_of', 'declaration_day'],
+        'patterns': ['day', 'day_of'],
         'validation': {
             'pattern': r'^([1-9]|[12]\d|3[01])$',
             'input_mode': 'numeric',
@@ -374,8 +430,16 @@ When detecting fields, apply these SMART VALIDATIONS for Trinidad & Tobago:
 - Example template: "I, {{full_name}}, age {{calculated_age}} years, of {{address}}..."
 - Example field: {"id": "date_of_birth", "label": "Date of Birth", "type": "date", "help_text": "Your age will be calculated automatically"}
 
-**DATE FIELDS:**
-- Declaration date: MUST have max_date: "today" (cannot be in future)
+**DECLARATION DATE PARTS — CRITICAL NAMING (use declaration_ prefix, NO date constraints):**
+- When the document has a "Declared at [City] this [Day] of [Month], [Year]" section:
+  - City where declared → ID: "declaration_city"
+  - Day of declaration  → ID: "declaration_day"
+  - Month of declaration→ ID: "declaration_month"
+  - Year of declaration → ID: "declaration_year"
+- DO NOT set max_date, min_date, date_constraint, or check_future_date on these fields
+- Declaration dates are the user's FREE CHOICE — they can be past, present, or future
+
+**EVENT / PERSONAL DATE FIELDS (these DO get past constraints):**
 - Event/incident dates: MUST have max_date: "today" (past events only)
 - Date of Birth: MUST have max_date: "today" and date_constraint: "past_only"
 - Set date_constraint: "past_only" or "past_or_today" appropriately
@@ -416,13 +480,77 @@ For each detected_field, include a "validation" object:
 
 === END TRINIDAD & TOBAGO RULES ===
 
-**IMPORTANT - GENERATE ALL FIELDS AS SIMPLE, FLAT LIST:**
-- Create one field for EACH piece of information that appears in ANY of the example documents
-- Do NOT use conditional logic (show_if) - create ALL fields as regular required/optional fields
-- Users will fill in the fields that apply to their situation
-- Empty/unused fields will be handled gracefully by the AI drafter
-- This ensures we capture ALL possible information needs across all document variations
-- The more fields you detect, the better - don't skip any information that varies between documents
+**IMPORTANT - SCENARIO-AWARE CONDITIONAL FIELDS:**
+When the example documents reveal MULTIPLE distinct scenarios (e.g. "self-owner" vs "tenant",
+"individual" vs "company", "with children" vs "without children"), generate:
+
+1. A **scenario selector** — a `select` field that lets the user pick their situation.
+   - id: use a descriptive name like "ownership_type", "applicant_category", etc.
+   - type: "select"
+   - options: one option per detected scenario
+
+2. **Scenario-specific fields** — fields that only apply to one scenario.
+   - Add a `show_if` object: `{"field": "<selector_id>", "value": "<option_value>"}`
+   - These fields will only appear when the user selects the matching scenario.
+   - Mark scenario-specific required fields as `"required": true` — the system
+     will automatically skip validation for hidden fields.
+
+3. **Common fields** — fields that appear across ALL scenarios.
+   - These have NO `show_if` and are always visible.
+
+Example of a detected_field with show_if:
+{
+    "id": "landlord_name",
+    "label": "Landlord's Full Name",
+    "type": "text",
+    "required": true,
+    "placeholder": "Jane Doe",
+    "help_text": "Enter the full name of your landlord",
+    "show_if": {"field": "ownership_type", "value": "tenant"}
+}
+
+4. In `identified_scenarios`, list every scenario you detected.
+5. In `scenario_branches`, provide a mapping from each scenario to its
+   relevant template sections/paragraphs so the drafter knows which parts to include:
+{
+    "scenario_branches": {
+        "self_owner": {
+            "description": "Declarant owns the property themselves",
+            "template_sections": ["ownership declaration paragraph"],
+            "key_fields": ["property_description", "title_deed_number"]
+        },
+        "tenant": {
+            "description": "Declarant is renting the property",
+            "template_sections": ["tenancy declaration paragraph"],
+            "key_fields": ["landlord_name", "lease_start_date", "monthly_rent"]
+        }
+    }
+}
+
+**Rules for show_if:**
+- Only use `show_if` when there are CLEAR distinct scenarios in the examples
+- The selector field itself must NEVER have show_if
+- Keep common fields without show_if (name, DOB, address, electoral_id, etc.)
+- A field can only depend on ONE selector — no nested conditionals
+
+**CRITICAL - USE CANONICAL (STANDARD) FIELD IDs:**
+When naming fields, ALWAYS use these standard canonical IDs instead of inventing new ones:
+- For any name field: use "full_name" (NOT "name", "deponent_name", "applicant_name", etc.)
+- For any address: use "address" (NOT "residential_address", "home_address", "current_address")
+- For any ID card/number: use "electoral_id" (NOT "national_id", "id_number", "identification_number")
+- For date of birth: use "date_of_birth" (NOT "dob", "birth_date")
+- For phone: use "phone_number" (NOT "phone", "telephone", "mobile")
+- For occupation: use "occupation" (NOT "profession", "job")
+- For city/town: use "city" (NOT "town", "village", "municipality")
+This ensures consistent mapping between template placeholders and intake questions.
+
+**CROSS-DOCUMENT GENERALIZATION:**
+When analyzing MULTIPLE example documents:
+- Extract fields that are COMMON across all documents first (these are the core fields)
+- Then extract fields specific to individual document variations
+- A field that appears in ALL examples is more important than one in just one example
+- Prefer GENERAL field names over document-specific ones (e.g., "property_description" not "lot_number_and_plan")
+- The template should be a GENERALIZED version that works for ALL the examples, not a copy of one specific example
 
 **CRITICAL - EVERY FIELD MUST HAVE LABEL, HELP TEXT, AND PLACEHOLDER:**
 - Each detected_field MUST include:
@@ -545,7 +673,14 @@ Respond ONLY with a valid JSON object in this exact structure:
     "analysis_notes": "Brief notes about the affidavit type structure and identified scenarios",
     "format_warnings": ["Any deviations from standard format noted in examples"],
     "field_conversions": ["age -> date_of_birth (age will be calculated from DOB)"],
-    "identified_scenarios": ["List of all unique scenarios detected across the example documents"]
+    "identified_scenarios": ["List of all unique scenarios detected across the example documents"],
+    "scenario_branches": {
+        "scenario_id": {
+            "description": "What this scenario covers",
+            "template_sections": ["Which paragraphs/sections apply to this scenario"],
+            "key_fields": ["field_ids that are unique to this scenario"]
+        }
+    }
 }"""
 
 
@@ -553,7 +688,8 @@ def generate_policy_from_examples(
     html_examples: List[str],
     affidavit_type_name: str,
     additional_context: str = "",
-    existing_questions: List[Dict] = None
+    existing_questions: List[Dict] = None,
+    affidavit_type_id: int = None,
 ) -> Dict:
     """
     Analyze example affidavit documents and generate policy configuration.
@@ -616,11 +752,22 @@ IMPORTANT:
 - Do not duplicate fields - match by id, label, or similar purpose
 """
 
+        # Inject reviewer feedback for policy/template
+        policy_feedback_section = ""
+        if affidavit_type_id:
+            try:
+                from .feedback_service import get_policy_feedback
+                policy_feedback_section = get_policy_feedback(affidavit_type_id)
+                if policy_feedback_section:
+                    logger.info(f"Injected {len(policy_feedback_section)} chars of policy feedback")
+            except Exception as e:
+                logger.warning(f"Failed to load policy feedback: {e}")
+
         user_prompt = f"""Analyze these example affidavit documents for: "{affidavit_type_name}"
 {f"Additional context: {additional_context}" if additional_context else ""}
 {existing_questions_context}
 {examples_text}
-
+{policy_feedback_section}
 Generate the policy configuration JSON as specified.
 Remember: Only include NEW fields in detected_fields that are not already covered by existing questions."""
 
@@ -653,6 +800,7 @@ Remember: Only include NEW fields in detected_fields that are not already covere
             'analysis_notes': result.get('analysis_notes', ''),
             'scenario_mapping': result.get('scenario_mapping', {}),
             'identified_scenarios': result.get('identified_scenarios', []),
+            'scenario_branches': result.get('scenario_branches', {}),
             'prompt_tokens': response.usage.prompt_tokens if response.usage else 0,
             'completion_tokens': response.usage.completion_tokens if response.usage else 0,
             'error': None
@@ -820,8 +968,11 @@ Provide the updated policy JSON:"""
 def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> List[Dict]:
     """
     Convert AI-detected fields to the intake_schema format used by the system.
-    Applies smart Trinidad & Tobago specific validation rules automatically.
-    Converts age fields to date_of_birth with calendar picker.
+    
+    Pipeline:
+      1. Reconcile & normalize (alias resolution, dedup, enrich with defaults)
+      2. Ensure universal fields are present (full_name, DOB, address, electoral_id)
+      3. Apply smart T&T validation rules & age→DOB conversion
     
     Args:
         detected_fields: Fields detected by generate_policy_from_examples
@@ -829,6 +980,15 @@ def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> Lis
     Returns:
         List of intake_schema question objects with validation
     """
+    # --- Step 1: Normalize & deduplicate ---
+    normalized = reconcile_and_normalize_fields(detected_fields)
+    logger.info(f"[FIELD_PIPELINE] After normalize: {len(detected_fields or [])} → {len(normalized)} fields")
+
+    # --- Step 2: Ensure universal fields ---
+    normalized = ensure_universal_fields(normalized)
+    logger.info(f"[FIELD_PIPELINE] After universal inject: {len(normalized)} fields")
+
+    # --- Step 3: Original T&T validation + age→DOB conversion ---
     intake_schema = []
     has_dob_field = False  # Track if we already have a DOB field
     
@@ -844,13 +1004,13 @@ def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> Lis
     }
     
     # First pass: check if DOB already exists
-    for field in detected_fields:
+    for field in normalized:
         field_id = field.get('id', '').lower()
         if _matches_field_pattern(field_id, TT_FIELD_RULES.get('date_of_birth', {}).get('patterns', [])):
             has_dob_field = True
             break
     
-    for field in detected_fields:
+    for field in normalized:
         field_id = field.get('id', '').lower()
         field_label = field.get('label', field.get('id', ''))
         
@@ -890,6 +1050,10 @@ def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> Lis
             'help_text': field.get('help_text', ''),
             'type_locked': True  # Prevent frontend from overriding backend type
         }
+
+        # Preserve show_if conditional logic from AI-detected fields
+        if field.get('show_if'):
+            question['show_if'] = field['show_if']
         
         # Start with any validation from the AI
         validation = field.get('validation', {})
@@ -917,20 +1081,53 @@ def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> Lis
 def apply_smart_validation(field_id: str, field_label: str, existing_validation: Dict, question: Dict) -> Dict:
     """
     Apply smart Trinidad & Tobago specific validation based on field detection.
-    
+
+    IMPORTANT — declaration date parts (declaration_city, declaration_day, declaration_month,
+    declaration_year) are handled with an early-return guard that:
+      - Applies only their own format/input_mode rules
+      - Strips ANY date constraints (max_date, date_constraint, check_future_date, etc.)
+    This ensures users can freely enter any date when making their declaration.
+
     Args:
         field_id: The field ID (snake_case)
         field_label: Human readable label
         existing_validation: Any validation already set by AI
         question: The question dict (may be modified for type changes)
-    
+
     Returns:
-        Enhanced validation dict
+        Enhanced validation dict (declaration fields never get date constraints)
     """
     validation = existing_validation.copy() if existing_validation else {}
     field_lower = field_id.lower()
     label_lower = field_label.lower()
-    
+
+    # ── Declaration date parts: early-return guard ────────────────────────────
+    # These fields use the declaration_ prefix specifically so we can detect them
+    # here and skip the generic city/day/month/year rules (which would add
+    # check_future_date or max_year_current via substring matching).
+    DECLARATION_PARTS = {'declaration_city', 'declaration_day', 'declaration_month', 'declaration_year'}
+    if field_lower in DECLARATION_PARTS:
+        rule = TT_FIELD_RULES.get(field_lower, {})
+        rule_validation = rule.get('validation', {})
+        # Merge only format/input rules (existing takes precedence)
+        for key, value in rule_validation.items():
+            if key not in validation:
+                validation[key] = value
+        # Apply type / placeholder / options
+        if 'type' in rule and not question.get('type_locked', False):
+            if question.get('type', 'text') == 'text':
+                question['type'] = rule['type']
+        if not question.get('placeholder') and rule.get('placeholder'):
+            question['placeholder'] = rule['placeholder']
+        if rule.get('options'):
+            question['options'] = rule['options']
+        # Strip any date constraints — declaration dates are free choice
+        for k in ('max_date', 'min_date', 'date_constraint', 'check_future_date', 'max_year_current'):
+            validation.pop(k, None)
+        logger.debug(f"[SMART_VALIDATION] '{field_id}' is a declaration part — date constraints excluded")
+        return validation
+    # ── End declaration guard ─────────────────────────────────────────────────
+
     # Check each rule set
     for rule_key, rules in TT_FIELD_RULES.items():
         patterns = rules.get('patterns', [])
@@ -1085,66 +1282,195 @@ def build_policy_json_from_generation(generation_result: Dict) -> Dict:
 # Helpers: enforce label/help_text/placeholder defaults for detected_fields
 # ---------------------------------------------------------------------------
 
-FIELD_DEFAULTS = {
-    'full_name': {
-        'label': 'Full Name',
+# ---------------------------------------------------------------------------
+# FIELD_ALIASES: maps variant IDs to a canonical ID for deduplication
+# ---------------------------------------------------------------------------
+FIELD_ALIASES = {
+    # name variants → full_name
+    'name': 'full_name', 'deponent_name': 'full_name', 'applicant_name': 'full_name',
+    'declarant_name': 'full_name', 'your_name': 'full_name', 'person_name': 'full_name',
+    'first_name': 'full_name', 'surname': 'full_name',
+    # address variants → address
+    'residential_address': 'address', 'home_address': 'address',
+    'current_address': 'address', 'street_address': 'address',
+    'mailing_address': 'address',
+    # ID variants → electoral_id
+    'national_id': 'electoral_id', 'id_number': 'electoral_id',
+    'identification_number': 'electoral_id', 'id_card': 'electoral_id',
+    'eic': 'electoral_id', 'eic_number': 'electoral_id',
+    # DOB variants → date_of_birth
+    'dob': 'date_of_birth', 'birth_date': 'date_of_birth', 'birthdate': 'date_of_birth',
+    # age variants (will be converted to DOB)
+    'age': 'date_of_birth', 'years_old': 'date_of_birth', 'current_age': 'date_of_birth',
+    # phone variants → phone_number
+    'phone': 'phone_number', 'telephone': 'phone_number', 'mobile': 'phone_number',
+    'contact_number': 'phone_number', 'cell': 'phone_number',
+    # occupation variants → occupation
+    'profession': 'occupation', 'job': 'occupation', 'employment': 'occupation',
+    # city/town variants → city
+    'town': 'city', 'village': 'city', 'municipality': 'city', 'location': 'city',
+    # --- declaration date part variants → declaration_* ---
+    # These are used for the "Declared at [City] this [Day] day of [Month] [Year]" block
+    'declaration_at_city': 'declaration_city', 'declared_at_city': 'declaration_city',
+    'signing_city': 'declaration_city', 'sworn_city': 'declaration_city',
+    'sworn_day': 'declaration_day', 'signing_day': 'declaration_day',
+    'declared_day': 'declaration_day', 'date_day': 'declaration_day',
+    'sworn_month': 'declaration_month', 'signing_month': 'declaration_month',
+    'declared_month': 'declaration_month', 'date_month': 'declaration_month',
+    'sworn_year': 'declaration_year', 'signing_year': 'declaration_year',
+    'declared_year': 'declaration_year', 'date_year': 'declaration_year',
+}
+
+# ---------------------------------------------------------------------------
+# UNIVERSAL_FIELDS: fields that should appear in EVERY T&T affidavit
+# They are injected if missing after AI field detection.
+# ---------------------------------------------------------------------------
+UNIVERSAL_FIELDS = [
+    {
+        'id': 'full_name', 'label': 'Full Name', 'type': 'text', 'required': True,
         'placeholder': 'John Michael Smith',
-        'help_text': 'Enter your full legal name as on your ID.'
+        'help_text': 'Enter your full legal name as on your ID.',
+        'type_locked': True,
+        'validation': {'input_mode': 'text_only', 'min_length': 2, 'max_length': 100,
+                        'message': 'Name can only contain letters, spaces, hyphens, and apostrophes'},
+    },
+    {
+        'id': 'date_of_birth', 'label': 'Date of Birth', 'type': 'date', 'required': True,
+        'placeholder': '1990-06-14',
+        'help_text': 'Select your date of birth; your age is calculated automatically.',
+        'type_locked': True,
+        'validation': {'max_date': 'today', 'date_constraint': 'past_only',
+                        'message': 'Date of birth cannot be in the future'},
+    },
+    {
+        'id': 'address', 'label': 'Current Address', 'type': 'textarea', 'required': True,
+        'placeholder': '15 Queen Street, Port of Spain',
+        'help_text': 'Enter your current residential address in Trinidad & Tobago.',
+        'type_locked': True,
+        'validation': {'min_length': 5, 'max_length': 200,
+                        'message': 'Please enter a valid address'},
+    },
+    {
+        'id': 'electoral_id', 'label': 'Electoral ID Number', 'type': 'text', 'required': True,
+        'placeholder': '19741104044',
+        'help_text': 'Your 11-digit Trinidad & Tobago Electoral ID (format: YYYYMMDDXXX).',
+        'type_locked': True,
+        'validation': {'pattern': r'^\d{11}$', 'input_mode': 'numeric',
+                        'min_length': 11, 'max_length': 11,
+                        'message': 'Enter valid Electoral ID (exactly 11 digits)'},
+    },
+]
+
+# ---------------------------------------------------------------------------
+# FIELD_DEFAULTS: proper label/help_text/placeholder for known fields
+# ---------------------------------------------------------------------------
+FIELD_DEFAULTS = {
+    # --- core identity ---
+    'full_name': {
+        'label': 'Full Name', 'placeholder': 'John Michael Smith',
+        'help_text': 'Enter your full legal name as on your ID.', 'type': 'text',
     },
     'date_of_birth': {
-        'label': 'Date of Birth',
-        'placeholder': '1990-06-14',
-        'help_text': 'Select your date of birth; your age is calculated automatically.'
+        'label': 'Date of Birth', 'placeholder': '1990-06-14',
+        'help_text': 'Select your date of birth; your age is calculated automatically.', 'type': 'date',
     },
     'address': {
-        'label': 'Residential Address',
-        'placeholder': '15 Queen Street, Port of Spain',
-        'help_text': 'Enter your current residential address in Trinidad & Tobago.'
-    },
-    'phone': {
-        'label': 'Phone Number',
-        'placeholder': '868-123-4567',
-        'help_text': 'Enter a Trinidad & Tobago phone number (868-XXX-XXXX).'
-    },
-    'email': {
-        'label': 'Email Address',
-        'placeholder': 'your.email@example.com',
-        'help_text': 'Enter your email to receive updates.'
+        'label': 'Current Address', 'placeholder': '15 Queen Street, Port of Spain',
+        'help_text': 'Enter your current residential address in Trinidad & Tobago.', 'type': 'textarea',
     },
     'electoral_id': {
-        'label': 'Electoral ID (11 digits)',
-        'placeholder': '19741104044',
-        'help_text': '11 digits in YYYYMMDDXXX format (first 8 = date of birth).'
+        'label': 'Electoral ID (11 digits)', 'placeholder': '19741104044',
+        'help_text': '11 digits in YYYYMMDDXXX format (first 8 = date of birth).', 'type': 'text',
     },
     'national_id': {
-        'label': 'National ID (11 digits)',
-        'placeholder': '19741104044',
-        'help_text': '11 digits in YYYYMMDDXXX format (first 8 = date of birth).'
+        'label': 'National ID (11 digits)', 'placeholder': '19741104044',
+        'help_text': '11 digits in YYYYMMDDXXX format (first 8 = date of birth).', 'type': 'text',
     },
+    'occupation': {
+        'label': 'Occupation', 'placeholder': 'Teacher',
+        'help_text': 'Enter your current occupation or profession.', 'type': 'text',
+    },
+    'city': {
+        'label': 'City / Town', 'placeholder': 'Port of Spain',
+        'help_text': 'Enter your city or town in Trinidad & Tobago.', 'type': 'text',
+    },
+    # --- contact ---
+    'phone_number': {
+        'label': 'Phone Number', 'placeholder': '868-123-4567',
+        'help_text': 'Enter a Trinidad & Tobago phone number (868-XXX-XXXX).', 'type': 'text',
+    },
+    'email': {
+        'label': 'Email Address', 'placeholder': 'your.email@example.com',
+        'help_text': 'Enter your email to receive updates.', 'type': 'email',
+    },
+    # --- ID documents ---
     'passport': {
-        'label': 'Passport Number',
-        'placeholder': 'TB1234567',
-        'help_text': '2 letters + 7 digits (e.g., TB1234567).'
+        'label': 'Passport Number', 'placeholder': 'TB1234567',
+        'help_text': '2 letters + 7 digits (e.g., TB1234567).', 'type': 'text',
     },
     'drivers_permit': {
-        'label': "Driver's Permit Number",
-        'placeholder': 'DL123456',
-        'help_text': "Enter the number from your driver's permit."
+        'label': "Driver's Permit Number", 'placeholder': 'DL123456',
+        'help_text': "Enter the number from your driver's permit.", 'type': 'text',
     },
-    'declaration_month': {
-        'label': 'Declaration Month',
-        'placeholder': 'February',
-        'help_text': 'Select the month of declaration.'
+    # --- declaration date parts (no date validation — user-chosen date) ---
+    'declaration_city': {
+        'label': 'Declaration City', 'placeholder': 'Port of Spain',
+        'help_text': 'City where the declaration is being made.', 'type': 'text',
     },
     'declaration_day': {
-        'label': 'Declaration Day',
-        'placeholder': '14',
-        'help_text': 'Enter the day of the month (1–31).'
+        'label': 'Declaration Day', 'placeholder': '14',
+        'help_text': 'Day of the month this declaration is made (1–31).', 'type': 'number',
+    },
+    'declaration_month': {
+        'label': 'Declaration Month', 'placeholder': 'February',
+        'help_text': 'Month this declaration is made.', 'type': 'select',
     },
     'declaration_year': {
-        'label': 'Declaration Year',
-        'placeholder': '2026',
-        'help_text': 'Enter the 4-digit year.'
+        'label': 'Declaration Year', 'placeholder': '2026',
+        'help_text': 'Year this declaration is made (4-digit).', 'type': 'number',
+    },
+    # --- property / land ---
+    'property_description': {
+        'label': 'Property Description', 'placeholder': 'Lot 14, LP No. 52, Chaguanas',
+        'help_text': 'Describe the property including lot number, plan number, and area.', 'type': 'textarea',
+    },
+    'land_ownership_details': {
+        'label': 'Land Ownership Details', 'placeholder': 'Deed of Conveyance registered as...',
+        'help_text': 'Enter details about how you acquired or own the land.', 'type': 'textarea',
+    },
+    'years_residing': {
+        'label': 'Years Residing', 'placeholder': '15',
+        'help_text': 'How many years have you lived at this address?', 'type': 'number',
+    },
+    'additional_property_details': {
+        'label': 'Additional Property Details', 'placeholder': 'Bounded on the north by...',
+        'help_text': 'Any extra property details (boundaries, dimensions, etc.).', 'type': 'textarea',
+    },
+    'ownership_disclaimer': {
+        'label': 'Ownership Disclaimer', 'placeholder': 'I am the sole owner...',
+        'help_text': 'Statement about your ownership status.', 'type': 'textarea',
+    },
+    # --- relationships / witnesses ---
+    'witness_name': {
+        'label': 'Witness Name', 'placeholder': 'Jane Marie Williams',
+        'help_text': 'Full legal name of the witness.', 'type': 'text',
+    },
+    'relationship': {
+        'label': 'Relationship to Deponent', 'placeholder': 'Mother',
+        'help_text': 'Relationship between you and the other party (if applicable).', 'type': 'text',
+    },
+    # --- incident / event ---
+    'incident_date': {
+        'label': 'Date of Incident', 'placeholder': '2025-01-15',
+        'help_text': 'When did the incident or event occur?', 'type': 'date',
+    },
+    'incident_description': {
+        'label': 'Incident Description', 'placeholder': 'On the said date, I was...',
+        'help_text': 'Describe the incident in detail.', 'type': 'textarea',
+    },
+    'reason': {
+        'label': 'Reason / Purpose', 'placeholder': 'To establish ownership of...',
+        'help_text': 'Why is this affidavit being made?', 'type': 'textarea',
     },
 }
 
@@ -1153,10 +1479,26 @@ def _title_from_id(field_id: str) -> str:
     return ' '.join(part.capitalize() for part in field_id.split('_')) if field_id else ''
 
 
+_DECLARATION_IDS = {k for k in FIELD_DEFAULTS if k.startswith('declaration_')}
+
+
 def _apply_field_defaults(detected_fields: List[Dict]) -> List[Dict]:
     updated = []
     for field in detected_fields or []:
         field_id = field.get('id', '').strip()
+
+        # Label-based declaration ID fix: if label says "Declaration Day" but id is "day",
+        # promote id → "declaration_day" so it matches the template placeholder.
+        if field_id and not field_id.startswith('declaration_'):
+            label_lower = field.get('label', '').lower()
+            if 'declaration' in label_lower:
+                suffix = label_lower.replace('declaration', '').strip().replace(' ', '_').strip('_')
+                proposed = f'declaration_{suffix}'
+                if proposed in _DECLARATION_IDS:
+                    field['id'] = proposed
+                    field['field_name'] = proposed
+                    field_id = proposed
+
         defaults = FIELD_DEFAULTS.get(field_id, {})
 
         # Label
@@ -1176,6 +1518,392 @@ def _apply_field_defaults(detected_fields: List[Dict]) -> List[Dict]:
                 # Generic fallback
                 field['help_text'] = f"Enter your {field.get('label', field_id).lower()}."
 
+        # Type override from defaults (only if field has generic 'text' type)
+        if field.get('type', 'text') == 'text' and defaults.get('type') and defaults['type'] != 'text':
+            if not field.get('type_locked'):
+                field['type'] = defaults['type']
+
         updated.append(field)
 
     return updated
+
+
+def reconcile_and_normalize_fields(detected_fields: List[Dict]) -> List[Dict]:
+    """
+    Normalize AI-detected fields:
+      1. Canonical ID via FIELD_ALIASES (e.g., 'name' → 'full_name')
+      2. Dedup by canonical ID (first occurrence wins, merge labels)
+      3. Enrich with FIELD_DEFAULTS
+    """
+    seen: Dict[str, Dict] = {}  # canonical_id → best field dict
+    order = []  # preserve insertion order
+
+    for field in detected_fields or []:
+        raw_id = field.get('id', '').strip().lower().replace(' ', '_').replace('-', '_')
+        if not raw_id:
+            continue
+
+        # Resolve canonical ID via alias table
+        canonical = FIELD_ALIASES.get(raw_id, raw_id)
+
+        # Label-based declaration ID promotion:
+        # If AI gave id="day" / label="Declaration Day", promote to "declaration_day".
+        # This fixes the case where the alias table doesn't have the exact variant.
+        if not canonical.startswith('declaration_'):
+            label_lower = field.get('label', '').lower()
+            if 'declaration' in label_lower:
+                # Derive suffix from the label: "declaration day" → "day" → "declaration_day"
+                suffix = label_lower.replace('declaration', '').strip().replace(' ', '_').strip('_')
+                proposed = f'declaration_{suffix}'
+                if proposed in _DECLARATION_IDS:
+                    canonical = proposed
+
+        if canonical in seen:
+            # Merge: keep richer label / help_text
+            existing = seen[canonical]
+            if not existing.get('help_text') and field.get('help_text'):
+                existing['help_text'] = field['help_text']
+            if not existing.get('placeholder') and field.get('placeholder'):
+                existing['placeholder'] = field['placeholder']
+            # Merge validation keys
+            ev = existing.get('validation', {})
+            fv = field.get('validation', {})
+            for k, v in fv.items():
+                if k not in ev:
+                    ev[k] = v
+            if ev:
+                existing['validation'] = ev
+        else:
+            field['id'] = canonical          # rename to canonical
+            field['field_name'] = canonical  # keep template placeholder in sync
+            # Pull defaults
+            defaults = FIELD_DEFAULTS.get(canonical, {})
+            if not field.get('label'):
+                field['label'] = defaults.get('label') or _title_from_id(canonical)
+            if not field.get('placeholder'):
+                field['placeholder'] = defaults.get('placeholder') or ''
+            if not field.get('help_text'):
+                field['help_text'] = defaults.get('help_text') or f"Enter your {field.get('label', canonical).lower()}."
+            # Type from defaults if still generic text
+            if field.get('type', 'text') == 'text' and defaults.get('type') and defaults['type'] != 'text':
+                if not field.get('type_locked'):
+                    field['type'] = defaults['type']
+
+            # Preserve show_if — update the parent field reference to use
+            # canonical ID if the parent was also aliased
+            if field.get('show_if'):
+                parent_ref = field['show_if'].get('field', '')
+                parent_canonical = FIELD_ALIASES.get(
+                    parent_ref.lower().replace(' ', '_').replace('-', '_'),
+                    parent_ref,
+                )
+                field['show_if']['field'] = parent_canonical
+
+            seen[canonical] = field
+            order.append(canonical)
+
+    return [seen[cid] for cid in order]
+
+
+def ensure_universal_fields(fields: List[Dict]) -> List[Dict]:
+    """
+    Inject UNIVERSAL_FIELDS that are missing from the detected list.
+    Universal fields are placed at the top of the list for consistent UX.
+    """
+    existing_ids = {f.get('id', '').lower() for f in fields}
+
+    inject = []
+    for uf in UNIVERSAL_FIELDS:
+        if uf['id'].lower() not in existing_ids:
+            inject.append(uf.copy())
+            logger.info(f"[ENSURE_UNIVERSAL] Injected missing universal field: {uf['id']}")
+
+    # Universal fields first, then rest
+    if inject:
+        return inject + fields
+    return fields
+
+
+def auto_generate_placeholder_mapping(
+    template_html: str,
+    intake_schema: List[Dict],
+) -> Dict[str, str]:
+    """
+    Deterministically build a placeholder_mapping from template_html + intake_schema.
+    For each {{placeholder}} in the template, tries to match to a question by:
+      1. Exact ID match
+      2. Alias resolution  (FIELD_ALIASES)
+      3. Fuzzy label match (placeholder words ⊂ label words)
+    """
+    if not template_html:
+        return {}
+
+    placeholders = list(dict.fromkeys(re.findall(r'\{\{(\w+)\}\}', template_html)))
+    q_by_id = {}
+    q_by_alias = {}
+    for q in intake_schema or []:
+        qid = q.get('id', '')
+        q_by_id[qid.lower()] = qid
+        # Also register canonical alias → qid
+        canonical = FIELD_ALIASES.get(qid.lower(), qid.lower())
+        q_by_alias[canonical] = qid
+
+    # Auto-computed placeholders that never need a question
+    auto_computed = {'calculated_age', 'current_date', 'current_year', 'current_month', 'current_day'}
+
+    mapping = {}
+    for ph in placeholders:
+        ph_lower = ph.lower()
+        if ph_lower in auto_computed:
+            continue
+
+        # 1. Exact match
+        if ph_lower in q_by_id:
+            mapping[ph] = q_by_id[ph_lower]
+            continue
+
+        # 2. Alias resolution
+        canonical = FIELD_ALIASES.get(ph_lower, ph_lower)
+        if canonical in q_by_id:
+            mapping[ph] = q_by_id[canonical]
+            continue
+        if canonical in q_by_alias:
+            mapping[ph] = q_by_alias[canonical]
+            continue
+
+        # 3. Fuzzy: placeholder words ⊂ question label words
+        ph_words = set(ph_lower.split('_'))
+        for q in intake_schema or []:
+            label_words = set(q.get('label', '').lower().replace('-', ' ').split())
+            if ph_words and ph_words.issubset(label_words):
+                mapping[ph] = q.get('id', '')
+                break
+
+    logger.info(f"[AUTO_MAPPING] Generated mapping for {len(mapping)}/{len(placeholders)} placeholders")
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# P0: Validate template ↔ intake_schema mapping completeness
+# ---------------------------------------------------------------------------
+
+def validate_template_mapping(
+    template_html: str,
+    intake_schema: List[Dict],
+    placeholder_mapping: Dict[str, str],
+) -> Dict:
+    """
+    Validate that every {{placeholder}} in the template has a matching intake
+    question and that no intake questions are orphaned (unused by any placeholder).
+
+    Returns a report dict:
+    {
+        'valid': bool,
+        'errors': [{'type': 'unmapped_placeholder', 'placeholder': str, 'message': str}, ...],
+        'warnings': [{'type': 'orphaned_question', 'question_id': str, 'label': str, 'message': str}, ...],
+        'info': {'total_placeholders': int, 'mapped': int, 'auto_computed': int, 'unmapped': int, 'orphaned': int},
+    }
+    """
+    AUTO_COMPUTED = {'calculated_age', 'current_date', 'current_year', 'current_month', 'current_day'}
+    # Questions that feed an auto-computed field — exempt from orphan flagging
+    # when their derived auto placeholder appears in the template.
+    AUTO_COMPUTED_SOURCES = {'calculated_age': 'date_of_birth'}
+
+    placeholders = list(dict.fromkeys(re.findall(r'\{\{(\w+)\}\}', template_html or '')))
+    q_ids = {q.get('id', '') for q in (intake_schema or [])}
+    mapping = placeholder_mapping or {}
+
+    errors: List[Dict] = []
+    warnings: List[Dict] = []
+
+    mapped_question_ids: set = set()
+    mapped_count = 0
+    auto_count = 0
+    unmapped_count = 0
+
+    for ph in placeholders:
+        ph_lower = ph.lower()
+        if ph_lower in AUTO_COMPUTED or ph in AUTO_COMPUTED:
+            auto_count += 1
+            continue
+
+        # Resolve via explicit mapping → same-name question → alias
+        resolved_qid = mapping.get(ph, '')
+        if not resolved_qid and ph in q_ids:
+            resolved_qid = ph
+        if not resolved_qid:
+            canonical = FIELD_ALIASES.get(ph_lower, ph_lower)
+            if canonical in q_ids:
+                resolved_qid = canonical
+
+        if resolved_qid and resolved_qid in q_ids:
+            mapped_count += 1
+            mapped_question_ids.add(resolved_qid)
+        else:
+            unmapped_count += 1
+            errors.append({
+                'type': 'unmapped_placeholder',
+                'placeholder': ph,
+                'message': f'Template placeholder "{{{{{ph}}}}}" has no matching intake question.',
+            })
+
+    # Orphaned questions (exist in intake_schema but unused by any placeholder)
+    orphaned = []
+    for q in (intake_schema or []):
+        qid = q.get('id', '')
+        if qid and qid not in mapped_question_ids:
+            # Also check if any placeholder directly matches this qid
+            if qid not in placeholders and qid not in {mapping.get(p) for p in placeholders}:
+                # Exempt source questions whose auto-computed derivative is used in the template
+                is_auto_source = any(
+                    auto_ph in placeholders and source_qid == qid
+                    for auto_ph, source_qid in AUTO_COMPUTED_SOURCES.items()
+                )
+                if not is_auto_source:
+                    orphaned.append(qid)
+                    warnings.append({
+                        'type': 'orphaned_question',
+                        'question_id': qid,
+                        'label': q.get('label', ''),
+                        'message': f'Intake question "{qid}" ({q.get("label", "")}) is not used by any template placeholder.',
+                    })
+
+    return {
+        'valid': len(errors) == 0,
+        'errors': errors,
+        'warnings': warnings,
+        'info': {
+            'total_placeholders': len(placeholders),
+            'mapped': mapped_count,
+            'auto_computed': auto_count,
+            'unmapped': unmapped_count,
+            'orphaned': len(orphaned),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# P1: Sync placeholder_mapping when questions are added/removed/renamed
+# ---------------------------------------------------------------------------
+
+def sync_mapping_after_question_change(
+    template_html: str,
+    old_schema: List[Dict],
+    new_schema: List[Dict],
+    placeholder_mapping: Dict[str, str],
+) -> Dict[str, str]:
+    """
+    After an admin edits intake_schema, reconcile placeholder_mapping:
+
+    1. Remove mappings that point to deleted question IDs.
+    2. If a deleted question ID appears as a placeholder in the template and
+       there is a new question with a matching alias, re-map automatically.
+    3. Auto-map any NEW questions to matching template placeholders.
+
+    Returns updated placeholder_mapping (never mutates the original).
+    """
+    mapping = dict(placeholder_mapping or {})
+    old_ids = {q.get('id', '') for q in (old_schema or [])}
+    new_ids = {q.get('id', '') for q in (new_schema or [])}
+
+    deleted_ids = old_ids - new_ids
+    added_ids = new_ids - old_ids
+
+    # Step 1: purge mappings that point to deleted questions
+    stale_keys = [ph for ph, qid in mapping.items() if qid in deleted_ids]
+    for key in stale_keys:
+        del mapping[key]
+        logger.info(f"[SYNC_MAPPING] Removed stale mapping: {key} → (deleted question)")
+
+    # Step 2: for deleted question keys, try to re-resolve via alias to a new question
+    placeholders = list(dict.fromkeys(re.findall(r'\{\{(\w+)\}\}', template_html or '')))
+    for ph in placeholders:
+        if ph in mapping:
+            continue  # already mapped
+        ph_lower = ph.lower()
+        # Try alias resolution first
+        canonical = FIELD_ALIASES.get(ph_lower, ph_lower)
+        if canonical in new_ids:
+            mapping[ph] = canonical
+            logger.info(f"[SYNC_MAPPING] Re-mapped {ph} → {canonical} via alias")
+            continue
+        # Try exact match
+        if ph in new_ids:
+            mapping[ph] = ph
+            logger.info(f"[SYNC_MAPPING] Auto-mapped {ph} → {ph} (exact)")
+            continue
+
+    # Step 3: auto-map added questions to matching template placeholders
+    for qid in added_ids:
+        qid_lower = qid.lower()
+        for ph in placeholders:
+            if ph in mapping:
+                continue
+            ph_lower = ph.lower()
+            if ph_lower == qid_lower:
+                mapping[ph] = qid
+                logger.info(f"[SYNC_MAPPING] Auto-mapped new question {qid} → placeholder {ph}")
+                break
+            canonical = FIELD_ALIASES.get(ph_lower, ph_lower)
+            if canonical == qid_lower:
+                mapping[ph] = qid
+                logger.info(f"[SYNC_MAPPING] Auto-mapped new question {qid} → placeholder {ph} (alias)")
+                break
+
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# P4: Convert AI-generated identified_scenarios to structured scenario_library
+# ---------------------------------------------------------------------------
+
+def build_scenarios_from_identified(
+    identified_scenarios: List[str],
+    existing_library: List[Dict],
+) -> List[Dict]:
+    """
+    Convert the flat list of scenario names returned by the AI policy generator
+    into structured scenario_library entries that `detect_scenario()` can use.
+
+    For each scenario string the AI identified:
+      - Derive an ID (snake_case)
+      - Extract keywords from the scenario name
+      - Skip if a scenario with the same ID already exists
+
+    Returns a NEW list with existing entries preserved + new ones appended.
+    """
+    if not identified_scenarios:
+        return existing_library or []
+
+    library = list(existing_library or [])
+    existing_ids = {s.get('id', '').lower() for s in library}
+
+    for scenario_name in identified_scenarios:
+        if not isinstance(scenario_name, str) or not scenario_name.strip():
+            continue
+
+        # Derive a stable ID
+        scenario_id = re.sub(r'[^a-z0-9]+', '_', scenario_name.lower()).strip('_')
+        if not scenario_id or scenario_id in existing_ids:
+            continue
+
+        # Extract keywords from the scenario description (words >= 3 chars)
+        words = re.findall(r'[a-z]{3,}', scenario_name.lower())
+        # Remove very common words
+        stop_words = {'the', 'and', 'for', 'with', 'that', 'this', 'from', 'are', 'was', 'has', 'have', 'not'}
+        keywords = [w for w in words if w not in stop_words]
+
+        entry = {
+            'id': scenario_id,
+            'name': scenario_name.strip(),
+            'keywords': keywords,
+            'patterns': [],
+            'keyword_threshold': max(1, len(keywords) // 2),
+            'drafting_instructions': '',
+            '_auto_generated': True,
+        }
+        library.append(entry)
+        existing_ids.add(scenario_id)
+        logger.info(f"[SCENARIO_BUILDER] Created scenario entry '{scenario_id}' with {len(keywords)} keywords")
+
+    return library

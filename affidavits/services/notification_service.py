@@ -3,6 +3,7 @@ Affidavit Express - Notification Service
 
 Email notification service for request status updates.
 Uses HTML templates for professional emails with plain text fallbacks.
+Also includes unified dispatcher for multi-channel notifications (email + SMS/WhatsApp).
 """
 
 import logging
@@ -10,6 +11,13 @@ from django.conf import settings
 from django.core.mail import send_mail, EmailMultiAlternatives
 from django.template.loader import render_to_string
 from django.utils.html import strip_tags
+
+from ..constants.notification_messages import (
+    APPOINTMENT_MESSAGES,
+    REQUEST_STATUS_MESSAGES,
+    COMMISSIONER_BALANCE_MESSAGES,
+    EMAIL_SUBJECTS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -488,4 +496,267 @@ def send_welcome_email(
         logger.error(f"Failed to send welcome email to {email}: {result.get('error')}")
         
     return result
+
+
+# ============================================================================
+# UNIFIED NOTIFICATION DISPATCHER FUNCTIONS
+# ============================================================================
+
+def send_appointment_booked_notifications(request_obj, slot_obj) -> dict:
+    """
+    Send notifications to both user and commissioner when appointment is booked.
+    
+    Args:
+        request_obj: Request model instance
+        slot_obj: CommissionerSlot model instance
+        
+    Returns:
+        dict: {'user': result, 'commissioner': result}
+    """
+    from .twilio_service import TwilioService
+    
+    results = {'user': None, 'commissioner': None}
+    
+    user = request_obj.user
+    commissioner = slot_obj.commissioner
+    
+    # Format slot datetime
+    slot_date = slot_obj.start_time.strftime('%B %d, %Y')
+    slot_time = slot_obj.start_time.strftime('%I:%M %p')
+    
+    # Notify user
+    if user.phone_number:
+        user_message = APPOINTMENT_MESSAGES["BOOKED_USER"].format(
+            commissioner_name=commissioner.get_full_name() or commissioner.username,
+            slot_date=slot_date,
+            slot_time=slot_time,
+            request_code=request_obj.request_code
+        )
+        results['user'] = TwilioService.send_notification_message(
+            user.phone_number, user_message
+        )
+        logger.info(f"Sent appointment booked notification to user {user.username}")
+    
+    # Notify commissioner
+    if commissioner.phone_number:
+        commissioner_message = APPOINTMENT_MESSAGES["BOOKED_COMMISSIONER"].format(
+            user_name=user.get_full_name() or user.username,
+            slot_date=slot_date,
+            slot_time=slot_time,
+            affidavit_type=request_obj.affidavit_type.name,
+            request_code=request_obj.request_code
+        )
+        results['commissioner'] = TwilioService.send_notification_message(
+            commissioner.phone_number, commissioner_message
+        )
+        logger.info(f"Sent appointment booked notification to commissioner {commissioner.username}")
+    
+    return results
+
+
+def send_appointment_accepted_notification(request_obj, slot_obj) -> dict:
+    """
+    Send notification to user when commissioner accepts appointment.
+    """
+    from .twilio_service import TwilioService
+    
+    user = request_obj.user
+    commissioner = slot_obj.commissioner
+    
+    slot_date = slot_obj.start_time.strftime('%B %d, %Y')
+    slot_time = slot_obj.start_time.strftime('%I:%M %p')
+    
+    if not user.phone_number:
+        return {'success': False, 'error': 'User has no phone number'}
+    
+    message = APPOINTMENT_MESSAGES["ACCEPTED_USER"].format(
+        request_code=request_obj.request_code,
+        commissioner_name=commissioner.get_full_name() or commissioner.username,
+        slot_date=slot_date,
+        slot_time=slot_time
+    )
+    
+    result = TwilioService.send_notification_message(user.phone_number, message)
+    logger.info(f"Sent appointment accepted notification to user {user.username}")
+    return result
+
+
+def send_appointment_rejected_notification(request_obj) -> dict:
+    """
+    Send notification to user when commissioner rejects appointment.
+    """
+    from .twilio_service import TwilioService
+    
+    user = request_obj.user
+    
+    if not user.phone_number:
+        return {'success': False, 'error': 'User has no phone number'}
+    
+    message = APPOINTMENT_MESSAGES["REJECTED_USER"].format(
+        request_code=request_obj.request_code
+    )
+    
+    result = TwilioService.send_notification_message(user.phone_number, message)
+    logger.info(f"Sent appointment rejected notification to user {user.username}")
+    return result
+
+
+def send_appointment_cancelled_by_commissioner_notification(request_obj) -> dict:
+    """
+    Send notification to user when commissioner cancels appointment.
+    """
+    from .twilio_service import TwilioService
+    
+    user = request_obj.user
+    
+    if not user.phone_number:
+        return {'success': False, 'error': 'User has no phone number'}
+    
+    message = APPOINTMENT_MESSAGES["CANCELLED_BY_COMMISSIONER_USER"].format(
+        request_code=request_obj.request_code
+    )
+    
+    result = TwilioService.send_notification_message(user.phone_number, message)
+    logger.info(f"Sent appointment cancelled notification to user {user.username}")
+    return result
+
+
+def send_user_withdrawn_notification(request_obj, slot_obj, commissioner) -> dict:
+    """
+    Send notification to commissioner when user withdraws appointment.
+    """
+    from .twilio_service import TwilioService
+    
+    user = request_obj.user
+    
+    if not commissioner.phone_number:
+        return {'success': False, 'error': 'Commissioner has no phone number'}
+    
+    slot_date = slot_obj.start_time.strftime('%B %d, %Y') if slot_obj else 'N/A'
+    slot_time = slot_obj.start_time.strftime('%I:%M %p') if slot_obj else 'N/A'
+    
+    message = APPOINTMENT_MESSAGES["WITHDRAWN_COMMISSIONER"].format(
+        user_name=user.get_full_name() or user.username,
+        request_code=request_obj.request_code,
+        slot_date=slot_date,
+        slot_time=slot_time
+    )
+    
+    result = TwilioService.send_notification_message(commissioner.phone_number, message)
+    logger.info(f"Sent user withdrawn notification to commissioner {commissioner.username}")
+    return result
+
+
+def send_request_approved_sms(request_obj) -> dict:
+    """
+    Send SMS/WhatsApp notification to user when request is approved.
+    """
+    from .twilio_service import TwilioService
+    
+    user = request_obj.user
+    
+    if not user.phone_number:
+        return {'success': False, 'error': 'User has no phone number'}
+    
+    message = REQUEST_STATUS_MESSAGES["APPROVED_USER"].format(
+        request_code=request_obj.request_code
+    )
+    
+    result = TwilioService.send_notification_message(user.phone_number, message)
+    logger.info(f"Sent approval SMS notification to user {user.username}")
+    return result
+
+
+def send_request_rejected_notification(request_obj, reason: str) -> dict:
+    """
+    Send notification to user when request is rejected.
+    """
+    from .twilio_service import TwilioService
+    
+    user = request_obj.user
+    
+    if not user.phone_number:
+        return {'success': False, 'error': 'User has no phone number'}
+    
+    message = REQUEST_STATUS_MESSAGES["REJECTED_USER"].format(
+        request_code=request_obj.request_code,
+        rejection_reason=reason[:100] if reason else 'Not specified'
+    )
+    
+    result = TwilioService.send_notification_message(user.phone_number, message)
+    logger.info(f"Sent rejection notification to user {user.username}")
+    return result
+
+
+def send_commissioner_payout_added_message(commissioner, amount, request_code) -> str:
+    """
+    Generate message for commissioner about payout added to pending balance.
+    Returns the message string (for use in API response).
+    """
+    message = COMMISSIONER_BALANCE_MESSAGES["PAYOUT_ADDED"].format(
+        amount=amount,
+        request_code=request_code
+    )
+    return message
+
+
+def send_request_in_review_notification(request_obj) -> dict:
+    """
+    Send notification to user when request enters review.
+    """
+    from .twilio_service import TwilioService
+    
+    user = request_obj.user
+    
+    if not user.phone_number:
+        return {'success': False, 'error': 'User has no phone number'}
+    
+    message = REQUEST_STATUS_MESSAGES["ENTERED_REVIEW_USER"].format(
+        request_code=request_obj.request_code
+    )
+    
+    result = TwilioService.send_notification_message(user.phone_number, message)
+    logger.info(f"Sent in-review notification to user {user.username}")
+    return result
+
+
+def send_review_queue_notification_to_reviewers(request_obj) -> dict:
+    """
+    Send notification to all active reviewers when a request enters review queue.
+    """
+    from .twilio_service import TwilioService
+    from ..models import User
+
+    reviewers = User.objects.filter(
+        role=User.Role.REVIEWER,
+        is_active=True,
+    ).exclude(phone_number__isnull=True).exclude(phone_number='')
+
+    message = REQUEST_STATUS_MESSAGES["ENTERED_REVIEW_REVIEWER"].format(
+        request_code=request_obj.request_code,
+        affidavit_type=request_obj.affidavit_type.name,
+    )
+
+    sent_count = 0
+    failed_reviewers = []
+
+    for reviewer in reviewers:
+        result = TwilioService.send_notification_message(reviewer.phone_number, message)
+        if result.get('success'):
+            sent_count += 1
+        else:
+            failed_reviewers.append(reviewer.username)
+
+    logger.info(
+        "Sent review-queue notifications for %s to %s reviewers (failed=%s)",
+        request_obj.request_code,
+        sent_count,
+        len(failed_reviewers),
+    )
+
+    return {
+        'success': sent_count > 0,
+        'sent_count': sent_count,
+        'failed_reviewers': failed_reviewers,
+    }
 

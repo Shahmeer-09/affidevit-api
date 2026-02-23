@@ -180,11 +180,10 @@ class User(AbstractUser):
         db_index=True
     )
     phone_number = models.CharField(
-        max_length=20, 
+        max_length=50, 
         blank=True, 
         null=True,
-        unique=True,
-        help_text="Phone number must be unique"
+        help_text="Phone number"
     )
     is_phone_verified = models.BooleanField(
         default=False,
@@ -495,6 +494,13 @@ class AffidavitType(models.Model):
     #     "message": "You cannot have lived somewhere longer than your age."
     #   }
     # ]
+    
+    # Placeholder-to-question mapping (Template-First Intake Builder)
+    placeholder_mapping = models.JSONField(
+        default=dict,
+        help_text="Maps template {{placeholders}} to intake_schema question IDs. "
+                  "Example: {\"full_name\": \"full_name\", \"address\": \"residential_address\"}"
+    )
     
     # Legacy field for backward compatibility
     is_instant_mode = models.BooleanField(
@@ -1063,7 +1069,7 @@ class ReviewerEdit(models.Model):
 
 
 class ReviewerFeedback(models.Model):
-    """Minimal reviewer feedback notes for improving future prompts (offline learning loop)."""
+    """Reviewer feedback notes for improving future AI prompts (learning loop)."""
 
     class Category(models.TextChoices):
         GRAMMAR = 'grammar', 'Grammar/Spelling'
@@ -1073,6 +1079,11 @@ class ReviewerFeedback(models.Model):
         FORMATTING = 'formatting', 'Formatting Issue'
         INAPPROPRIATE = 'inappropriate', 'Inappropriate Content'
         OTHER = 'other', 'Other'
+
+    class FeedbackTarget(models.TextChoices):
+        DRAFTER = 'drafter', 'AI Drafter'
+        POLICY = 'policy', 'Policy/Template Generator'
+        BOTH = 'both', 'Both'
 
     request = models.ForeignKey(
         Request,
@@ -1085,13 +1096,54 @@ class ReviewerFeedback(models.Model):
         related_name='feedback_given',
         limit_choices_to={'role': User.Role.REVIEWER}
     )
+    affidavit_type = models.ForeignKey(
+        AffidavitType,
+        on_delete=models.CASCADE,
+        related_name='reviewer_feedback',
+        null=True,
+        blank=True,
+        help_text='Auto-populated from request for filtering feedback by type'
+    )
     category = models.CharField(
         max_length=30,
         choices=Category.choices,
         default=Category.OTHER
     )
+    feedback_target = models.CharField(
+        max_length=20,
+        choices=FeedbackTarget.choices,
+        default=FeedbackTarget.DRAFTER,
+        help_text='Which AI system this feedback should improve'
+    )
     message = models.TextField(
-        help_text='Minimal, actionable feedback (keep short and specific)'
+        blank=True,
+        default='',
+        help_text='Manually written feedback note (optional when original/revised snippets are provided)'
+    )
+    # Auto-populated from reviewer edit diff
+    original_snippet = models.TextField(
+        blank=True,
+        default='',
+        help_text='The original AI-generated text that was changed'
+    )
+    revised_snippet = models.TextField(
+        blank=True,
+        default='',
+        help_text='The reviewer-corrected replacement text'
+    )
+    summary = models.CharField(
+        max_length=300,
+        blank=True,
+        null=True,
+        help_text='AI-generated one-liner lesson distilled from the correction (e.g. use present perfect tense)'
+    )
+    is_active = models.BooleanField(
+        default=True,
+        help_text='Inactive feedback is excluded from AI prompts'
+    )
+    times_seen = models.PositiveIntegerField(
+        default=0,
+        help_text='How many times this feedback has been injected into prompts'
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -1375,6 +1427,14 @@ class CommissionerSlot(models.Model):
     Represents a 30-minute availability slot for a commissioner.
     Unique per commissioner per start_time.
     """
+    
+    class AppointmentStatus(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        ACCEPTED = 'accepted', 'Accepted'
+        REJECTED = 'rejected', 'Rejected'
+        CANCELLED_BY_COMMISSIONER = 'cancelled_by_commissioner', 'Cancelled by Commissioner'
+        CANCELLED_BY_USER = 'cancelled_by_user', 'Cancelled by User'
+    
     commissioner = models.ForeignKey(
         User, 
         on_delete=models.CASCADE, 
@@ -1391,6 +1451,16 @@ class CommissionerSlot(models.Model):
     start_time = models.DateTimeField(db_index=True)
     is_booked = models.BooleanField(default=False)
     
+    # Appointment decision fields
+    appointment_status = models.CharField(
+        max_length=30,
+        choices=AppointmentStatus.choices,
+        default=AppointmentStatus.PENDING,
+        blank=True
+    )
+    decision_at = models.DateTimeField(null=True, blank=True)
+    decision_reason = models.TextField(blank=True, default='')
+    
     class Meta:
         db_table = 'commissioner_slots'
         verbose_name = 'Commissioner Slot'
@@ -1405,3 +1475,39 @@ class CommissionerSlot(models.Model):
     def __str__(self):
         status = "Booked" if self.is_booked else "Available"
         return f"{self.commissioner.username} - {self.start_time} ({status})"
+    
+    def accept(self):
+        """Commissioner accepts the appointment."""
+        from django.utils import timezone
+        self.appointment_status = self.AppointmentStatus.ACCEPTED
+        self.decision_at = timezone.now()
+        self.save(update_fields=['appointment_status', 'decision_at'])
+    
+    def reject(self, reason=''):
+        """Commissioner rejects the appointment."""
+        from django.utils import timezone
+        self.appointment_status = self.AppointmentStatus.REJECTED
+        self.decision_at = timezone.now()
+        self.decision_reason = reason
+        self.is_booked = False
+        self.request = None
+        self.save(update_fields=['appointment_status', 'decision_at', 'decision_reason', 'is_booked', 'request'])
+    
+    def cancel_by_commissioner(self, reason=''):
+        """Commissioner cancels a previously accepted appointment."""
+        from django.utils import timezone
+        self.appointment_status = self.AppointmentStatus.CANCELLED_BY_COMMISSIONER
+        self.decision_at = timezone.now()
+        self.decision_reason = reason
+        self.is_booked = False
+        self.request = None
+        self.save(update_fields=['appointment_status', 'decision_at', 'decision_reason', 'is_booked', 'request'])
+    
+    def cancel_by_user(self):
+        """User cancels the appointment."""
+        from django.utils import timezone
+        self.appointment_status = self.AppointmentStatus.CANCELLED_BY_USER
+        self.decision_at = timezone.now()
+        self.is_booked = False
+        self.request = None
+        self.save(update_fields=['appointment_status', 'decision_at', 'is_booked', 'request'])

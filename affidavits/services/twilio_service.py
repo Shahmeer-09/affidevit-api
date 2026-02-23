@@ -218,6 +218,78 @@ For security, we recommend changing your password immediately."""
             return {'success': False, 'channel': None, 'error': str(second_error)}
 
     @staticmethod
+    def send_notification_message(phone_number: str, message_body: str) -> dict:
+        """
+        Send a generic notification message via WhatsApp/SMS.
+        
+        Args:
+            phone_number: Phone number with country code (e.g., +923086989618)
+            message_body: The message content to send
+            
+        Returns:
+            dict: {'success': bool, 'channel': 'whatsapp'|'sms'|None, 'error': str|None}
+        """
+        client = TwilioService.get_client()
+        if not client:
+            return {'success': False, 'channel': None, 'error': 'Twilio client not configured'}
+        
+        use_test = os.getenv('TWILIO_USE_TEST_CREDENTIALS', 'false').lower() == 'true'
+        preferred = (os.getenv('TWILIO_PREFERRED_CHANNEL') or 'whatsapp').strip().lower()
+        
+        whatsapp_number = TwilioService._normalize_phone(
+            os.getenv('TWILIO_WHATSAPP_NUMBER', '+14155238886')
+        )
+        sms_number = '+15005550006' if use_test else os.getenv('TWILIO_SMS_NUMBER')
+
+        if (os.getenv('TWILIO_DEV_MODE') or '').strip().lower() == 'true':
+            logger.info(
+                f"[TWILIO_DEV_MODE] NOTIFICATION to={phone_number} preferred={preferred} body={message_body[:100]}..."
+            )
+            return {
+                'success': True,
+                'channel': 'dev_mode',
+                'error': None,
+                'sid': 'dev_mode_mock_sid',
+            }
+
+        def _try_whatsapp() -> dict:
+            whatsapp_from = TwilioService._whatsapp_address(whatsapp_number)
+            whatsapp_to = TwilioService._whatsapp_address(phone_number)
+            logger.info(f"Sending notification to {phone_number} via WhatsApp...")
+            message = client.messages.create(
+                from_=whatsapp_from,
+                body=message_body,
+                to=whatsapp_to
+            )
+            logger.info(f"WhatsApp notification sent to {phone_number}, SID: {message.sid}")
+            return {'success': True, 'channel': 'whatsapp', 'error': None, 'sid': message.sid}
+
+        def _try_sms() -> dict:
+            if not sms_number:
+                return {'success': False, 'channel': 'sms', 'error': 'SMS number not configured'}
+            logger.info(f"Sending notification to {phone_number} via SMS...")
+            message = client.messages.create(
+                from_=sms_number,
+                body=message_body,
+                to=phone_number
+            )
+            logger.info(f"SMS notification sent to {phone_number}, SID: {message.sid}")
+            return {'success': True, 'channel': 'sms', 'error': None, 'sid': message.sid}
+
+        first, second = (_try_sms, _try_whatsapp) if preferred == 'sms' else (_try_whatsapp, _try_sms)
+
+        try:
+            return first()
+        except Exception as first_error:
+            logger.warning(f"Primary channel '{preferred}' failed for {phone_number}: {first_error}")
+
+        try:
+            return second()
+        except Exception as second_error:
+            logger.error(f"Both channels failed for {phone_number}: {second_error}")
+            return {'success': False, 'channel': None, 'error': str(second_error)}
+
+    @staticmethod
     def send_verification_token(phone_number):
         """
         Legacy method using Twilio Verify API.

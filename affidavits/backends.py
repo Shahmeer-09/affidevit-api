@@ -19,7 +19,15 @@ class EmailBackend(ModelBackend):
         
         try:
             # Treat 'username' parameter as email
-            user = User.objects.get(email__iexact=username)
+            # Use filter+first to avoid MultipleObjectsReturned when duplicate emails exist;
+            # prefer the active user, then the most recently joined
+            user = (
+                User.objects.filter(email__iexact=username)
+                .order_by('-is_active', '-date_joined')
+                .first()
+            )
+            if user is None:
+                raise User.DoesNotExist
         except User.DoesNotExist:
             # Run the default password hasher once to reduce timing attacks
             User().set_password(password)

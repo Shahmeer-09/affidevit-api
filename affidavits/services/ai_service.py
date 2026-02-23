@@ -65,6 +65,51 @@ def get_openai_client():
     return openai_client
 
 
+# ---------------------------------------------------------------------------
+# Helper: filter out answers for conditionally-hidden fields (show_if)
+# ---------------------------------------------------------------------------
+
+def _is_field_visible(field: dict, answers: dict, schema: list) -> bool:
+    """Return True if a field should be shown given current answers."""
+    show_if = field.get('show_if')
+    if not show_if:
+        return True
+
+    parent_id = show_if.get('field', '')
+    required_value = show_if.get('value')
+
+    parent_answer = answers.get(parent_id)
+    if parent_answer is None:
+        for q in schema:
+            qid = q.get('id') or q.get('field_name', '')
+            if qid == parent_id or q.get('field_name') == parent_id:
+                parent_answer = answers.get(qid)
+                break
+
+    if not required_value or required_value == '':
+        return parent_answer is not None and parent_answer != '' and parent_answer is not False
+
+    if isinstance(parent_answer, list):
+        check = required_value if isinstance(required_value, list) else [required_value]
+        return any(v in parent_answer for v in check)
+
+    if isinstance(required_value, list):
+        return parent_answer in required_value
+
+    return parent_answer == required_value
+
+
+def _filter_visible_answers(answers: dict, intake_schema: list) -> dict:
+    """Return a copy of answers containing only keys for visible fields."""
+    visible_ids = set()
+    for field in intake_schema:
+        fid = field.get('id') or field.get('field_name', '')
+        if _is_field_visible(field, answers, intake_schema):
+            visible_ids.add(fid)
+    # Always keep internal keys (e.g. _calculated_age)
+    return {k: v for k, v in answers.items() if k in visible_ids or k.startswith('_')}
+
+
 def detect_scenario(answers_json: dict, scenario_library: List[dict]) -> Tuple[List[str], bool]:
     """
     Detect which scenarios match the user's answers.
@@ -259,13 +304,94 @@ def get_base_instruction() -> str:
         return get_default_draft_system_prompt()
 
 
+def pre_fill_template(
+    template_html: str,
+    answers_json: dict,
+    placeholder_mapping: Dict[str, str] = None,
+    intake_schema: List[dict] = None,
+) -> str:
+    """
+    Mechanically replace {{placeholders}} in the template with actual user answers.
+    
+    Resolution order for each placeholder:
+      1. Explicit mapping  (placeholder_mapping[placeholder] -> question_id -> answer)
+      2. Direct match      (answers_json[placeholder])
+      3. Field-name match  (intake_schema field_name -> id -> answer)
+    
+    Placeholders that can't be resolved are left as-is so AI can still attempt them.
+    
+    Args:
+        template_html: HTML template with {{placeholder}} tokens
+        answers_json: User's intake form answers keyed by question id
+        placeholder_mapping: Optional dict mapping placeholder -> question_id
+        intake_schema: Optional intake schema list for field_name lookups
+    
+    Returns:
+        Template with as many placeholders replaced as possible
+    """
+    import re
+    if not template_html:
+        return template_html
+
+    mapping = placeholder_mapping or {}
+
+    # Build a reverse lookup: field_name -> question_id from intake_schema
+    field_name_to_id = {}
+    if intake_schema:
+        for q in intake_schema:
+            fname = q.get('field_name', '')
+            qid = q.get('id', '')
+            if fname and fname != qid:
+                field_name_to_id[fname] = qid
+
+    def _resolve(placeholder: str) -> Optional[str]:
+        # 1. Explicit mapping
+        mapped_qid = mapping.get(placeholder, '')
+        if mapped_qid:
+            val = answers_json.get(mapped_qid)
+            if val not in (None, ''):
+                return str(val)
+
+        # 2. Direct match
+        val = answers_json.get(placeholder)
+        if val not in (None, ''):
+            return str(val)
+
+        # 3. Field-name reverse lookup
+        qid = field_name_to_id.get(placeholder, '')
+        if qid:
+            val = answers_json.get(qid)
+            if val not in (None, ''):
+                return str(val)
+
+        return None
+
+    placeholders = re.findall(r'\{\{(\w+)\}\}', template_html)
+    filled = template_html
+    replaced_count = 0
+
+    for ph in dict.fromkeys(placeholders):  # unique, ordered
+        resolved = _resolve(ph)
+        if resolved is not None:
+            filled = filled.replace('{{' + ph + '}}', resolved)
+            replaced_count += 1
+
+    logger.info(
+        f"[PRE_FILL] Replaced {replaced_count}/{len(set(placeholders))} placeholders"
+    )
+    return filled
+
+
 def draft_affidavit(
     answers_json: dict,
     policy_json: dict,
     affidavit_type_name: str,
     scenario_library: List[dict] = None,
     template_html: str = '',
-    disallowed_phrases: List[str] = None
+    disallowed_phrases: List[str] = None,
+    placeholder_mapping: Dict[str, str] = None,
+    intake_schema: List[dict] = None,
+    affidavit_type_id: int = None,
 ) -> dict:
     """
     Generate an affidavit draft using GPT-4o-mini.
@@ -299,6 +425,11 @@ def draft_affidavit(
         
         # STEP 0: Translate non-English content to English
         answers_json = translate_to_english(answers_json)
+
+        # STEP 0.5: Strip answers for fields hidden by show_if so the
+        # drafter only sees the user's visible answers.
+        if intake_schema:
+            answers_json = _filter_visible_answers(answers_json, intake_schema)
         
         # Get base instruction from database
         base_instruction = get_base_instruction()
@@ -327,6 +458,22 @@ def draft_affidavit(
         logger.info("=" * 80)
         # ===== END DEBUG LOGGING =====
         
+        # STEP 1: Pre-fill template mechanically — stored as debug reference only.
+        # The AI receives the ORIGINAL template (with {{placeholder}} tokens) so its
+        # context-aware rephrasing instructions can fire properly.  If we pre-fill first,
+        # raw user input like "land is near uphill POS" gets pasted verbatim and the AI
+        # then blindly reproduces it ("...situate at land is near uphill POS...") because
+        # it is told to "follow the template exactly as-is".
+        if template:
+            prefilled_template = pre_fill_template(
+                template_html=template,
+                answers_json=answers_json,
+                placeholder_mapping=placeholder_mapping,
+                intake_schema=intake_schema,
+            )
+            logger.info(f"[DRAFT_AFFIDAVIT] Pre-fill reference (first 300): {prefilled_template[:300]}")
+            # `template` is intentionally NOT reassigned — AI sees original {{placeholders}}
+        
         # Detect scenarios from user answers
         lib = scenario_library or policy_json.get('scenario_library', [])
         scenario_tags, is_new_scenario = detect_scenario(answers_json, lib)
@@ -346,7 +493,88 @@ def draft_affidavit(
                     instructions = scenario.get('drafting_instructions', '')
                     if instructions:
                         scenario_context += f"**Scenario Instructions:** {instructions}\n"
+
+        # Inject scenario_branches guidance so the drafter knows which
+        # template sections / paragraphs to include for the matched scenario.
+        scenario_branches = policy_json.get('scenario_branches', {})
+        if scenario_branches:
+            # Figure out which branch the user selected by scanning answers
+            # against the intake_schema selector fields (fields without show_if
+            # that are of type select and whose id appears as a key in branches).
+            matched_branch = None
+            for branch_key, branch_info in scenario_branches.items():
+                key_fields = branch_info.get('key_fields', [])
+                # Check if any selector answer value matches this branch
+                for q in (intake_schema or []):
+                    qid = q.get('id', '')
+                    if q.get('type') == 'select' and not q.get('show_if'):
+                        user_val = answers_json.get(qid, '')
+                        if isinstance(user_val, str):
+                            # Match if the user's selection matches the branch key
+                            val_normalized = user_val.lower().replace(' ', '_').replace('-', '_')
+                            if val_normalized == branch_key or user_val == branch_key:
+                                matched_branch = branch_info
+                                break
+                if matched_branch:
+                    break
+
+            if matched_branch:
+                scenario_context += f"\n**Scenario Branch Details:**\n"
+                scenario_context += f"- Description: {matched_branch.get('description', '')}\n"
+                sections = matched_branch.get('template_sections', [])
+                if sections:
+                    scenario_context += f"- Relevant template sections: {', '.join(sections)}\n"
+                scenario_context += (
+                    "- ONLY include template paragraphs/sections relevant to this scenario.\n"
+                    "- OMIT paragraphs that belong to other scenarios.\n"
+                )
+                logger.info(f"[DRAFT_AFFIDAVIT] Matched scenario branch: {matched_branch.get('description', 'N/A')}")
         
+        # Build field context from intake_schema: help_text + placeholder + user value
+        field_context = ""
+        if intake_schema:
+            field_hints = []
+            for q in intake_schema:
+                qid = q.get('id', q.get('field_name', ''))
+                help_text = (q.get('help_text') or '').strip()
+                placeholder = (q.get('placeholder') or '').strip()
+                field_value = answers_json.get(qid, '')
+                if not field_value:
+                    continue
+                hint_lines = [f"• {{{{{qid}}}}}: User entered → \"{field_value}\""]
+                if help_text:
+                    hint_lines.append(f"  ↳ Field asks for: {help_text}")
+                if placeholder:
+                    hint_lines.append(f"  ↳ Complete answer looks like: \"{placeholder}\"")
+                if help_text or placeholder:
+                    hint_lines.append(
+                        "  ↳ ACTION: Do NOT use the raw input verbatim. "
+                        "Read the field meaning + example above, then EXPAND the user's answer "
+                        "into a complete, grammatically correct legal phrase that fits the template sentence."
+                    )
+                field_hints.append("\n".join(hint_lines))
+
+            if field_hints:
+                field_context = (
+                    "╔══════════════════════════════════════════════════════════════╗\n"
+                    "║  STEP 1 — FIELD MEANINGS (PROCESS THIS BEFORE THE TEMPLATE)  ║\n"
+                    "╚══════════════════════════════════════════════════════════════╝\n"
+                    "Each field below shows:\n"
+                    "  • What the user typed (raw — may be short/incomplete/informal)\n"
+                    "  • What the field ACTUALLY asks for (from help text)\n"
+                    "  • What a COMPLETE answer looks like (from example/placeholder)\n\n"
+                    "YOUR RULE FOR EVERY PLACEHOLDER:\n"
+                    "  1. Look up the field in this list.\n"
+                    "  2. Read the template sentence surrounding the placeholder.\n"
+                    "  3. Use the field meaning + example to EXPAND the user's raw input into a\n"
+                    "     full legal phrase — do NOT paste raw input verbatim.\n"
+                    "  4. If the user gave just a name or single word, use the example format\n"
+                    "     to complete the thought (e.g. 'my wife' + 'responsible for taxes' →\n"
+                    "     'my wife, who is responsible for the payment of taxes on the said land').\n\n"
+                    + "\n\n".join(field_hints)
+                    + "\n"
+                )
+
         # Build the user prompt - now requesting HTML output
         template_section = ""
         template_format_instructions = ""
@@ -360,14 +588,23 @@ def draft_affidavit(
 - **FOLLOW THE TEMPLATE EXACTLY AS IS.**
 - Do not change, remove, or reorder any static text.
 - Do not add headers like "AFFIDAVIT" or subtitles if not in the template.
--if there are any numbering for lists follow them as is dont ignore or add bullets 
 - Start the document EXACTLY as the template starts (e.g., "REPUBLIC OF TRINIDAD AND TOBAGO:")
 - For the commissioner/attestation section, use the EXACT format from the template.
 - DO NOT modernize or "improve" the commissioner section format.
 - Replace ONLY the {{placeholder}} values with actual data.
 - Preserve all static text, legal language, and formatting exactly as shown.
-- **CRITICAL: If the template uses "That I am...", "That I have...", "That this..." paragraph format for statements, preserve that format - do NOT convert them to numbered lists (1. 2. 3.) or ordered lists (<ol>).**
 - **STRICTLY FOLLOW THE TEMPLATE'S SPACING AND STRUCTURE.**
+
+**HEADING & BOLD FORMATTING (CRITICAL):**
+- Any standalone line that is a document title or heading (e.g. "STATUTORY DECLARATION", "REPUBLIC OF TRINIDAD AND TOBAGO", "SCHEDULE") MUST be wrapped in <strong> tags.
+- If the template already has <strong> or <b> tags, preserve them exactly.
+- Do NOT apply bold to regular paragraph text — only to clear headings/titles.
+
+**NUMBERED AND BULLETED LISTS (CRITICAL):**
+- If the template contains items prefixed with numbers (1. 2. 3.) or letters (a. b. c.), render them using <ol><li>...</li></ol> HTML tags.
+- If the template contains bullet items (-, •), render them using <ul><li>...</li></ol> HTML tags.
+- If the template uses "That I am...", "That I have...", "That this..." paragraph style (NOT numbered), preserve that paragraph format — do NOT convert those paragraphs to a numbered list.
+- Never drop or merge list items — every numbered/bulleted item in the template must appear as its own <li>.
 """
         
         # Check if we have a calculated age from DOB validation
@@ -381,62 +618,84 @@ Use this calculated age ({calculated_age}) in the affidavit, NOT any age the use
 Do NOT include the date of birth in the affidavit - only include the age.
 """
         
-        user_prompt = f"""
-Generate a formal {affidavit_type_name} based on the following information provided by the applicant.
+        user_prompt = f"""Generate a formal {affidavit_type_name}.
 
-**OUTPUT FORMAT: Clean HTML suitable for PDF generation.**
-Use semantic HTML tags: <p>, <ol>, <li>, <strong>, <sup>, etc.
-Do NOT include <html>, <head>, or <body> tags - just the content.
+OUTPUT: Clean HTML for PDF. No <html>/<head>/<body>. Use <p>, <ol>, <li>, <strong>, <sup>.
 {calculated_age_note}
-**Applicant Information:**
+{field_context}
+╔══════════════════════════════════════════════════════════════╗
+║  STEP 2 — RAW APPLICANT ANSWERS (do NOT paste verbatim)     ║
+╚══════════════════════════════════════════════════════════════╝
+These are the user's unedited inputs. Always cross-reference with STEP 1 field meanings
+before using any value — raw input is often incomplete or informal.
 {json.dumps(answers_json, indent=2)}
-{scenario_context}
+
+╔══════════════════════════════════════════════════════════════╗
+║  STEP 3 — TEMPLATE (replace placeholders only)              ║
+╚══════════════════════════════════════════════════════════════╝
 {template_section}
 {template_format_instructions}
-**CRITICAL: INTELLIGENT TEXT INTEGRATION**
+╔══════════════════════════════════════════════════════════════╗
+║  STEP 4 — PLACEHOLDER FILLING RULES                         ║
+╚══════════════════════════════════════════════════════════════╝
+For EVERY {{{{placeholder}}}} in the template:
+  A. Find the field in STEP 1 and read its meaning + example.
+  B. Read the template sentence around the placeholder.
+  C. EXPAND the user's raw input using the field meaning + example so it:
+     - Fills the full meaning the field asks for
+     - Fits grammatically in the template sentence
+     - Is written in proper legal English
 
-User answers may be informal, fragmented, or grammatically incomplete. Your job is to:
-1. **Rephrase** user answers into proper legal language
-2. **Fix grammar and spelling** - correct typos (e.g., "motther" -> "mother")
-3. **Fix capitalization** - ensure proper nouns like names and addresses are capitalized (e.g., "shahmeer" -> "Shahmeer", "main street" -> "Main Street")
-4. **Make it flow** - integrate user's info naturally into the template
-5. **Preserve meaning** - keep all facts exactly as provided, just phrase them professionally
+GENERAL EXPANSION RULES (apply to ALL affidavit types):
+  • Short name/person answer + field asking for responsibility/role →
+    expand to "[person], who is responsible for [what the field says]"
+    e.g. user: "my wife" | field: "responsible for taxes" →
+    output: "my wife, who is responsible for the payment of taxes on the said land"
 
-EXAMPLE OF WHAT NOT TO DO:
-❌ User wrote: "house is old"
-❌ Bad template fill: "making improvements to the house is old on land..."
-✅ Correct: "making improvements to my old house on land..." OR "making improvements to the house, which is old, on land..."
+  • Raw verb phrase that would break the surrounding sentence →
+    rephrase to a legal noun/gerund phrase
+    e.g. user: "modifying my house" in "...process of {{{{X}}}} to the house..." →
+    output: "effecting modifications"
 
-EXAMPLE OF WHAT TO DO:
-User wrote: "live there 5 year" = "resided there for 5 years"
-User wrote: "car broke" = "the vehicle was damaged"
-User wrote: "work at hospital" = "employed at the hospital"
+  • Ownership answer that is a full sentence but placeholder sits after a preposition →
+    convert to a grammatical noun phrase
+    e.g. user: "my wife is the owner" in "...process of work to {{{{X}}}}, where..." →
+    output: "my wife's property" or "a property belonging to my wife"
 
-**Transform user input into professional legal language while preserving facts.**
+  • Incomplete duration → spell out in legal format
+    e.g. "3 years" → "three (3) years"
 
-**REQUIREMENTS:**
-1. {"FOLLOW THE TEMPLATE FORMAT EXACTLY AS IS - DO NOT DEVIATE." if template else "Use formal legal language appropriate for an affidavit in Trinidad and Tobago."}
-2. Include all standard affidavit sections as per the template or Trinidad and Tobago format:
-   - Header starting with "REPUBLIC OF TRINIDAD AND TOBAGO:" (NO extra title before this)
-   - "IN THE MATTER OF THE STATUTORY DECLARATION ACT"
-   - "CHAPTER 7: No 04"
-   - Declarant introduction with full name, age, address, and ID number
-   - Factual statements (rephrase user answers into complete, grammatically correct sentences)
-   - **FORMATTING OF FACTUAL STATEMENTS: If the template uses "That I am..." paragraph format, keep that format - do NOT convert to numbered lists. Only use numbered lists if the template uses them.**
-   - Declaration of truth with legal consequences acknowledgment
-   - Commissioner attestation section (simple format: "Declared at...", "Before me, Commissioner of Affidavits.")
-3. **Intelligently integrate** the user's details - don't copy-paste their raw text
-4. Ensure the document is suitable for commissioning.
-5. DO NOT add "SWORN/AFFIRMED before me at" with City/Town, Province/State fields - use the simple commissioner format.
-6. If a calculated age (_calculated_age) is provided, use THAT age in the document, not any user-entered age field.
-7. **DO NOT ADD ANY EXTRA SECTIONS OR TEXT NOT PRESENT IN THE TEMPLATE.**
+  • Fix ALL capitalisation: names, streets, cities, months → Title Case
+    e.g. "shahmeer" → "Shahmeer", "near uphill station" → "near Uphill Station"
 
-{f"**Required Sections:** {', '.join(required_sections)}" if required_sections else ""}
+  • Fix all spelling typos silently.
 
-{f"**Do NOT include these phrases:** {', '.join(phrases_to_avoid)}" if phrases_to_avoid else ""}
+  • If _calculated_age is provided, use THAT age value — ignore any user-entered age field.
+
+{scenario_context}
+
+REQUIREMENTS:
+1. {"Follow the template EXACTLY — replace only placeholders, touch nothing else." if template else "Use formal legal language for a Trinidad and Tobago affidavit."}
+2. Do NOT add sections, headers, or text not in the template.
+3. Preserve all static legal text, spacing, bold tags, and list structure exactly.
+4. Do NOT add 'SWORN/AFFIRMED before me' blocks — use the template's commissioner section.
+
+{f"Required sections: {', '.join(required_sections)}" if required_sections else ""}
+{f"Do NOT use these phrases: {', '.join(phrases_to_avoid)}" if phrases_to_avoid else ""}
 {examples_text}
-Generate the complete affidavit in HTML format:
+Generate the complete affidavit HTML:
 """
+
+        # Inject reviewer feedback from learning loop
+        if affidavit_type_id:
+            try:
+                from .feedback_service import get_drafter_feedback
+                feedback_section = get_drafter_feedback(affidavit_type_id)
+                if feedback_section:
+                    user_prompt += feedback_section
+                    logger.info(f"[DRAFT_AFFIDAVIT] Injected {len(feedback_section)} chars of reviewer feedback")
+            except Exception as e:
+                logger.warning(f"[DRAFT_AFFIDAVIT] Failed to load reviewer feedback: {e}")
         
         # ===== LOG THE FULL PROMPT =====
         logger.info("=" * 80)
@@ -575,6 +834,12 @@ def apply_validation_rules(answers_json: dict, rules: list) -> tuple:
                     today = dt_date.today()
                     age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
                     return float(age)
+                # DD-MMM-YYYY (e.g. 23-Feb-2001)
+                if re.match(r'^\d{1,2}-[A-Za-z]{3}-\d{4}$', value_str):
+                    dob = datetime.strptime(value_str, '%d-%b-%Y').date()
+                    today = dt_date.today()
+                    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+                    return float(age)
                 # DD/MM/YYYY
                 if re.match(r'^\d{1,2}/\d{1,2}/\d{4}$', value_str):
                     dob = datetime.strptime(value_str, '%d/%m/%Y').date()
@@ -613,6 +878,13 @@ def apply_validation_rules(answers_json: dict, rules: list) -> tuple:
             return None
         
         value_str = str(value_str).strip()
+        
+        # Try DD-MMM-YYYY (e.g. 23-Feb-2001) — primary format after UI change
+        if re.match(r'^\d{1,2}-[A-Za-z]{3}-\d{4}$', value_str):
+            try:
+                return datetime.strptime(value_str, '%d-%b-%Y').date()
+            except ValueError:
+                pass
         
         # Try YYYY-MM-DD
         if re.match(r'^\d{4}-\d{2}-\d{2}$', value_str):
@@ -1292,12 +1564,19 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
                                 break
                         
                         if dob_field:
-                            # Parse the DOB field
+                            # Parse the DOB field — supports DD-MMM-YYYY, YYYY-MM-DD, DD/MM/YYYY
                             parsed_dob = None
                             dob_str = str(dob_field).strip()
                             
+                            # Try DD-MMM-YYYY format (primary UI format e.g. 23-Feb-2001)
+                            if re.match(r'^\d{1,2}-[A-Za-z]{3}-\d{4}$', dob_str):
+                                try:
+                                    parsed_dob = datetime.strptime(dob_str, '%d-%b-%Y').date()
+                                except ValueError:
+                                    pass
+                            
                             # Try YYYY-MM-DD format
-                            if re.match(r'^\d{4}-\d{2}-\d{2}$', dob_str):
+                            if not parsed_dob and re.match(r'^\d{4}-\d{2}-\d{2}$', dob_str):
                                 try:
                                     parsed_dob = datetime.strptime(dob_str, '%Y-%m-%d').date()
                                 except ValueError:
@@ -1352,6 +1631,19 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
             if any(kw in field_lower for kw in ['date', 'when', 'occurred', 'incident', 'event', 'declaration', 'year']):
                 parsed_date = None
                 
+                # Try DD-MMM-YYYY pattern (e.g. 23-Feb-2001) — primary UI format
+                if not parsed_date:
+                    match = re.search(r'(\d{1,2})-(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*-(\d{4})', value_lower, re.IGNORECASE)
+                    if match:
+                        try:
+                            day = int(match.group(1))
+                            month = month_names.get(match.group(2).lower()[:3], 0)
+                            year = int(match.group(3))
+                            if month > 0:
+                                parsed_date = datetime(year, month, day).date()
+                        except (ValueError, KeyError):
+                            pass
+
                 # Try Month DD, YYYY pattern (e.g., "January 06, 2026", "January 6, 2026")
                 match = re.search(r'(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{1,2}),?\s+(\d{4})', value_lower, re.IGNORECASE)
                 if match:
@@ -1519,6 +1811,7 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
                 from datetime import datetime
                 today = datetime.now().date()
                 date_patterns = [
+                    (r'(\d{1,2})-(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*-(\d{4})', 'dmy_dash'),  # DD-MMM-YYYY (primary)
                     (r'(\d{1,2})[/-](\d{1,2})[/-](\d{4})', 'dmy'),  # DD/MM/YYYY
                     (r'(\d{4})[/-](\d{1,2})[/-](\d{1,2})', 'ymd'),  # YYYY-MM-DD
                     (r'(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{4})', 'dmy_text'),
@@ -1531,7 +1824,11 @@ January=1, February=2, March=3, April=4, May=5, June=6, July=7, August=8, Septem
                     match = re.search(pattern, field_value, re.IGNORECASE)
                     if match:
                         try:
-                            if fmt == 'dmy':
+                            if fmt == 'dmy_dash':  # DD-MMM-YYYY (e.g. 23-Feb-2001)
+                                day = int(match.group(1))
+                                month = month_names.get(match.group(2).lower()[:3], 0)
+                                year = int(match.group(3))
+                            elif fmt == 'dmy':
                                 day, month, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
                             elif fmt == 'ymd':
                                 year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
@@ -1705,16 +2002,21 @@ def qa_check(
    - If the draft says "Mother" and user said "motther", this is **PERFECT**. DO NOT FLAG.
    - If the draft says "123 Main St" and user said "123 main street", this is **PERFECT**. DO NOT FLAG.
 
-3. **DISALLOWED PHRASES - EXACT MATCHING ONLY:**
-   - You will receive a list of EXACT phrases to avoid (e.g., "I swear", "I promise")
-   - ONLY flag if the draft contains these EXACT phrases.
-   - "I am aware" is NOT the same as "I swear" - don't flag unrelated text.
+3. **DISALLOWED PHRASES - EXACT MATCH, NON-BOILERPLATE ONLY:**
+   - You will receive a list of EXACT phrases to avoid (e.g., "I swear", "I promise").
+   - ONLY flag if the draft contains these EXACT phrases in AI-authored narrative content.
+   - **CRITICAL: NEVER apply disallowed-phrase checks to standard legal boilerplate** — i.e., the statutory declaration attestation clause ("...conscientiously believing the same to be true... false in fact..."), signature blocks, standard T&T legal formulas, or any text that is clearly part of the affidavit template structure. These are fixed legal clauses required by law — the AI did not author them and they MUST stay.
+   - "I am aware" is NOT the same as "I swear" — don't flag unrelated text.
 
-4. **HALLUCINATION CHECK - LOOSE FACTUAL CHECK ONLY:**
-   - Only flag if the AI invented a NEW FACT that is completely unrelated to the user input.
-   - Example: User said "Car", Draft says "Toyota Corolla" -> This IS a hallucination (flag it).
-   - Example: User said "Car", Draft says "Vehicle" -> This is NOT a hallucination (synonym).
-   - Example: User said "bacolet st", Draft says "Bacolet Street" -> This is NOT a hallucination (formatting).
+4. **HALLUCINATION CHECK - ONLY CONCRETE INVENTED FACTS:**
+   - **THE DRAFTER ALWAYS REPHRASES USER INPUT INTO PROPER LEGAL LANGUAGE — THIS IS EXPECTED AND CORRECT.**
+   - Do NOT flag something just because it is "not clearly stated in user input" or is worded differently.
+   - ONLY flag if the AI invented a **specific concrete fact** — a proper name, a specific number, a specific date, or a specific address — that is **entirely absent from ALL user input fields** (not just unclear or paraphrased).
+   - Example: User said "Car", Draft says "Toyota Corolla" → IS a hallucination (invented specific model).
+   - Example: User said "my two flats in POS", Draft says "two flats on POS" → NOT a hallucination (rephrased).
+   - Example: User said "Car", Draft says "vehicle" → NOT a hallucination (synonym).
+   - Example: User said "bacolet st", Draft says "Bacolet Street" → NOT a hallucination (formatting).
+   - If the fact appears ANYWHERE in the user answers (even loosely), do NOT flag it as a hallucination.
 
 5. **TEMPLATE COMPLIANCE - BE SPECIFIC:**
    - Flag if the AI added headers like "AFFIDAVIT" that are not in the template.
@@ -1724,37 +2026,17 @@ def qa_check(
 **DO NOT FLAG:**
 - **ANY** spelling difference between draft and user input.
 - **ANY** capitalization difference between draft and user input.
-- **ANY** rephrasing (e.g., "live there" -> "reside at").
+- **ANY** rephrasing or legal normalisation (e.g., "live there" → "reside at", "my two flats in POS" → "two flats on POS").
+- Content that is "not clearly stated in user input" — the drafter always rephrases and infers legal language.
+- Disallowed phrases found inside standard legal boilerplate / statutory declaration clauses.
 - HTML tags.
 
 **ONLY FLAG REAL PROBLEMS:**
 - Template violations (wrong structure, extra headers).
-- Legal errors (missing attestation).
+- Legal errors (missing attestation, missing signature block).
 - Made-up facts (names/dates that don't exist in input).
 - Disallowed phrases (exact matches).
-
-   - Check if legal terminology is correct
-   - Check if declarations are properly worded
-   - Don't nitpick minor formatting preferences
-
-6. **FORMATTING - MAJOR ISSUES ONLY:**
-   - Flag inconsistent capitalization of names/places
-   - Flag broken structure or missing signature blocks
-   - Don't flag HTML tags or minor spacing
-
-**DO NOT FLAG:**
-- HTML tags (they're required for PDF generation)
-- Data that came from user input (check answers_json first)
-- Phrases that are NOT exact matches to disallowed list
-- Minor stylistic preferences
-- Vague issues like "entire document"
-
-**ONLY FLAG REAL PROBLEMS:**
-- Actually missing required sections
-- Actually incorrect legal language
-- Actually hallucinated facts not in user data
-- Actually present disallowed phrases (exact matches)
-- Actually broken formatting (not HTML structure)
+- Broken structure (missing required legal sections).
 
 Respond with JSON:
 {
@@ -1792,7 +2074,7 @@ Review this AI-generated {affidavit_type_name} draft for QUALITY:
 **AI-GENERATED DRAFT:**
 {draft_text}
 
-**USER ANSWERS (for reference - check if AI used them correctly without adding extra info):**
+**USER ANSWERS (reference only — the drafter ALWAYS rephrases these into proper legal language; that is expected and correct):**
 {json.dumps(answers_json, indent=2)}
 
 **CRITICAL: CHECK FOR CLARIFICATIONS**
@@ -1812,7 +2094,7 @@ If the USER ANSWERS above contain "PREVIOUS_CLARIFICATIONS":
 **AFFIDAVIT-SPECIFIC INSTRUCTIONS (AI must follow these):**
 {affidavit_instructions if affidavit_instructions else "No specific instructions provided"}
 
-**DISALLOWED PHRASES (AI must NOT use these EXACT phrases or close variations):**
+**DISALLOWED PHRASES (apply ONLY to AI-authored narrative content, NOT to template boilerplate or statutory clauses):**
 {json.dumps(disallowed_list) if disallowed_list else "None specified"}
 
 **CRITICAL INSTRUCTIONS FOR CHECKING:**
@@ -1821,17 +2103,21 @@ If the USER ANSWERS above contain "PREVIOUS_CLARIFICATIONS":
    - The draft uses HTML tags like <p>, <strong>, <ol>, <li> for PDF generation
    - This is CORRECT and REQUIRED - do not flag HTML tags as formatting issues
 
-2. **DISALLOWED PHRASES - EXACT MATCH ONLY:**
-   - Check if draft contains the EXACT phrases listed above
-   - Example: If list has "I swear", only flag if draft has "I swear"
-   - "I am aware" is NOT the same as "I swear" - don't flag unrelated text
-   - Be precise: word-for-word match or very close variation only
+2. **DISALLOWED PHRASES - EXACT MATCH, NON-BOILERPLATE ONLY:**
+   - Check if the AI-authored narrative content contains the EXACT phrases listed above.
+   - **DO NOT apply this check to standard legal boilerplate/template language.** Boilerplate includes: the statutory declaration attestation clause ("...conscientiously believing the same to be true and in accordance with the Statutory Declaration Act... if there is any statement in this Declaration which is false in fact..."), signature/attestation blocks, and any standard T&T legal formulas from the template. These clauses are legally required and must not be flagged.
+   - Only flag if the AI inserted a disallowed phrase into the affidavit's substantive narrative body (not in boilerplate).
+   - "I am aware" is NOT the same as "I swear" — don't flag unrelated text.
 
-3. **HALLUCINATION CHECK - CROSS-REFERENCE FIRST:**
-   - BEFORE flagging hallucination, check if the data is in USER ANSWERS above
-   - If user provided "city: Muzaffargarh", that's NOT a hallucination
-   - If user provided "declaration_location: Bacolet Street", that's NOT a hallucination
-   - ONLY flag if AI made up facts that are COMPLETELY ABSENT from user input
+3. **HALLUCINATION CHECK - ONLY ENTIRELY ABSENT CONCRETE FACTS:**
+   - **THE AI DRAFTER ALWAYS REPHRASES, REFORMATS, AND NORMALISES USER INPUT — THIS IS BY DESIGN. DO NOT FLAG THIS.**
+   - BEFORE flagging a hallucination, search ALL user answer fields for ANY mention of the fact.
+   - ONLY flag if a **specific concrete fact** (a proper name, number, date, or address) is **completely absent from every user input field**.
+   - If user provided ANY mention — even loosely worded — that's NOT a hallucination.
+   - "Not clearly stated in user input" is NOT sufficient to flag — the drafter fills in legal language from context.
+   - If user provided "city: Muzaffargarh", that's NOT a hallucination.
+   - If user provided "declaration_location: Bacolet Street", that's NOT a hallucination.
+   - ONLY flag if the AI invented facts with NO basis in any user input field.
 
 4. **BE SPECIFIC WITH LOCATIONS:**
    - Don't quote "Entire document" - that's useless for reviewers
@@ -1839,13 +2125,13 @@ If the USER ANSWERS above contain "PREVIOUS_CLARIFICATIONS":
    - Give actionable, specific feedback
 
 **YOUR TASK:**
-1. Read the user answers to know what data the user provided
-2. Read the draft and check for REAL, SIGNIFICANT issues only
-3. Cross-reference: Is flagged "hallucination" actually from user data? If yes, DON'T FLAG
-4. Check disallowed phrases: Is it an EXACT match? If no, DON'T FLAG
-5. Default to "approved" unless there are REAL problems
+1. Read the user answers to know what data the user provided.
+2. Read the draft and check for REAL, SIGNIFICANT issues only.
+3. Hallucination: Does the suspicious fact appear ANYWHERE in user answers (even loosely)? If YES → NOT a hallucination → DO NOT FLAG.
+4. Disallowed phrases: Is the match inside the statutory declaration / attestation boilerplate? If YES → DO NOT FLAG (it is required template language). Is it an exact phrase match in the narrative body? If NO → DO NOT FLAG.
+5. Default to "approved" unless there is a REAL, CONCRETE problem that would make the document legally incorrect or professionally unacceptable.
 
-Focus on QUALITY and ACCURACY. Avoid nitpicking minor issues.
+Focus on QUALITY and ACCURACY. When in doubt, APPROVE — false positives are more damaging than false negatives here.
 """
         
         response = client.chat.completions.create(
@@ -1946,7 +2232,10 @@ def process_request(request_obj) -> dict:
         affidavit_type_name=affidavit_type.name,
         scenario_library=affidavit_type.scenario_library,
         template_html=affidavit_type.template_html,
-        disallowed_phrases=affidavit_type.disallowed_phrases
+        disallowed_phrases=affidavit_type.disallowed_phrases,
+        placeholder_mapping=affidavit_type.placeholder_mapping,
+        intake_schema=affidavit_type.intake_schema,
+        affidavit_type_id=affidavit_type.id,
     )
     
     if not draft_result['success']:
@@ -2020,3 +2309,190 @@ Guidelines:
 7. Leave signature lines and date fields for completion
 
 Always maintain professional tone and legal accuracy."""
+
+
+def refine_template_section(
+    current_template: str,
+    instruction: str,
+    affidavit_type_id: int,
+    max_examples: int = 5,
+) -> dict:
+    """
+    AI-powered template refinement.
+    Admin describes what to make dynamic; AI adds {{placeholder}} tokens.
+    Learns patterns from real saved affidavit drafts stored in DB.
+    """
+    client = get_openai_client()
+    if not client:
+        return {'success': False, 'error': 'OpenAI not available'}
+
+    try:
+        import re
+        from affidavits.models import Request as AffidavitRequest
+
+        # Pull up to max_examples recent approved drafts for this type
+        drafts = AffidavitRequest.objects.filter(
+            affidavit_type_id=affidavit_type_id,
+        ).exclude(final_text='').order_by('-created_at')[:max_examples]
+
+        examples = [d.final_text[:2000] for d in drafts if d.final_text]
+
+        examples_section = ''
+        if examples:
+            examples_numbered = '\n\n---\n\n'.join(
+                f'Example {i + 1}:\n{ex}' for i, ex in enumerate(examples)
+            )
+            examples_section = f"""**REAL EXAMPLES FROM SAVED DOCUMENTS ({len(examples)} examples):**
+These are actual approved affidavits — use them to understand which parts vary across cases:
+
+{examples_numbered}
+
+---
+"""
+
+        system_prompt = """You are an expert legal template engineer.
+Your job is to make specific sections of an affidavit template dynamic by introducing {{placeholder}} tokens.
+
+RULES:
+1. Return ONLY the complete refined template HTML — no explanations, no markdown code blocks.
+2. Keep ALL existing {{placeholder}} tokens exactly as they already are.
+3. Only modify the specific part described in the instruction — leave everything else exactly the same.
+4. New placeholder IDs must use snake_case and describe the data (e.g. {{land_owner_relationship}}, {{deceased_relative_name}}).
+5. Make each placeholder as atomic as possible — one concept per placeholder.
+6. Preserve all HTML tags, bold, ordered lists, and document structure.
+7. Return valid HTML suitable for PDF generation.
+8. ⚠️  LOGICAL CONSISTENCY — CRITICAL: Before adding any placeholder, scan the ENTIRE template for sentences that logically negate or contradict the concept being made dynamic.
+   - Example violation: template has "I have no other property" (static) AND you add {{other_property}} nearby — this is a direct contradiction.
+   - If you detect this: DO NOT just insert the placeholder next to a negating sentence. Instead, RESTRUCTURE the negating sentence so it can logically hold the dynamic value.
+     e.g. Change "I have no other property. Except for [static text]" → "Other property (if any): {{other_property_description}}"
+   - Ensure ALL references to the same concept in the template are either ALL static or ALL dynamic — never a mix where one part denies and another part lists.
+9. When making a sentence dynamic, the final rendered sentence must make complete logical sense regardless of what value is filled in."""
+
+        user_prompt = f"""**CURRENT TEMPLATE:**
+{current_template}
+
+{examples_section}
+**REFINEMENT INSTRUCTION:**
+{instruction}
+
+Based on the examples (if any), identify which parts of the template text actually vary across different cases and replace them with appropriate {{{{placeholder}}}} tokens. Return the complete refined template HTML."""
+
+        response = call_openai_with_retry(
+            client,
+            model='gpt-4o',
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            max_tokens=6000,
+            temperature=0.2,
+        )
+
+        refined = response.choices[0].message.content.strip()
+
+        # Strip markdown code fences if AI added them
+        if refined.startswith('```'):
+            lines = refined.split('\n')
+            start = 1 if lines[0].startswith('```') else 0
+            end = len(lines) - 1 if lines[-1].strip() == '```' else len(lines)
+            refined = '\n'.join(lines[start:end])
+
+        # Report which placeholders are genuinely new
+        original_phs = set(re.findall(r'\{\{(\w+)\}\}', current_template))
+        new_phs = set(re.findall(r'\{\{(\w+)\}\}', refined))
+        new_field_ids = list(new_phs - original_phs)
+
+        # Generate help_text for each new field using surrounding context
+        new_fields_meta = []
+        for fid in new_field_ids:
+            # Find context around the placeholder in the refined template
+            pattern = re.compile(r'(.{0,80})\{\{' + re.escape(fid) + r'\}\}(.{0,80})', re.DOTALL)
+            ctx_match = pattern.search(refined)
+            surrounding = ''
+            if ctx_match:
+                surrounding = (ctx_match.group(1).strip() + ' [VALUE] ' + ctx_match.group(2).strip())
+            # Clean HTML from surrounding
+            surrounding = re.sub(r'<[^>]+>', ' ', surrounding).strip()
+            label = fid.replace('_', ' ').title()
+            help_text = f"Enter the {label.lower()} as it should appear in: {surrounding}" if surrounding else f"Enter the {label.lower()}"
+            new_fields_meta.append({
+                'id': fid,
+                'label': label,
+                'help_text': help_text[:200],
+            })
+
+        logger.info(f"[REFINE_TEMPLATE] type={affidavit_type_id} examples={len(examples)} new_fields={new_field_ids}")
+
+        return {
+            'success': True,
+            'refined_template': refined,
+            'new_fields': new_field_ids,
+            'new_fields_meta': new_fields_meta,
+            'examples_used': len(examples),
+        }
+
+    except Exception as e:
+        logger.error(f"[REFINE_TEMPLATE] Error: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+def refine_user_instruction(raw_instruction: str, current_template: str) -> dict:
+    """
+    AI-powered prompt refinement.
+    Takes a rough user instruction and transforms it into a clear,
+    specific instruction suitable for template refinement.
+    """
+    client = get_openai_client()
+    if not client:
+        return {'success': False, 'error': 'OpenAI not available'}
+
+    try:
+        # Extract existing placeholders from template for context
+        import re
+        existing = re.findall(r'\{\{(\w+)\}\}', current_template)
+        existing_str = ', '.join(f'{{{{{p}}}}}' for p in existing[:20]) if existing else 'None'
+
+        # Extract first 500 chars of plain text from template for context
+        plain = re.sub(r'<[^>]+>', ' ', current_template[:1000]).strip()
+        plain = re.sub(r'\s+', ' ', plain)[:500]
+
+        system_prompt = """You are a helpful assistant that improves user instructions for template refinement.
+The user wants to make parts of a legal affidavit template dynamic by adding {{placeholder}} tokens.
+Their instruction may be vague, misspelled, or unclear.
+
+Your job:
+1. Understand what they want to make dynamic
+2. Rewrite their instruction to be clear, specific, and actionable
+3. Suggest which specific text in the template should become placeholders
+4. Use proper terminology
+
+Return ONLY the improved instruction text — no explanations, no markdown, no prefixes like "Improved:".
+Keep it under 200 words."""
+
+        user_prompt = f"""**User's raw instruction:**
+{raw_instruction}
+
+**Template preview (first 500 chars):**
+{plain}
+
+**Already dynamic fields:** {existing_str}
+
+Rewrite the user's instruction to be clear and specific for the AI template refiner."""
+
+        response = call_openai_with_retry(
+            client,
+            model='gpt-4o-mini',
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            max_tokens=300,
+            temperature=0.3,
+        )
+
+        refined_instruction = response.choices[0].message.content.strip()
+        return {'success': True, 'refined_instruction': refined_instruction}
+
+    except Exception as e:
+        logger.error(f"[REFINE_INSTRUCTION] Error: {e}")
+        return {'success': False, 'error': str(e)}
