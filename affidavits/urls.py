@@ -43,6 +43,7 @@ from .views import (
     CostDashboardView, LearningSuggestionsView,
     # Admin Staff Management
     AdminCommissionerListView, AdminCommissionerDetailView,
+    AdminApproveCommissionerView, AdminManualVerifyCommissionerView,
     AdminReviewerListView, AdminReviewerDetailView,
     AdminCommissionerPaymentSummaryView, AdminCommissionerPaymentHistoryView,
     AdminMarkCommissionerPaidView, AdminAllPaymentLogsView,
@@ -177,6 +178,8 @@ urlpatterns = [
     # ==========================================================================
     path('admin/commissioners/', AdminCommissionerListView.as_view(), name='admin_commissioner_list'),
     path('admin/commissioners/<int:pk>/', AdminCommissionerDetailView.as_view(), name='admin_commissioner_detail'),
+    path('admin/commissioners/<int:pk>/approve/', AdminApproveCommissionerView.as_view(), name='admin_commissioner_approve'),
+    path('admin/commissioners/<int:pk>/manual-verify/', AdminManualVerifyCommissionerView.as_view(), name='admin_commissioner_manual_verify'),
     path('admin/commissioners/<int:pk>/payment-summary/', AdminCommissionerPaymentSummaryView.as_view(), name='admin_commissioner_payment_summary'),
     path('admin/commissioners/<int:pk>/payment-history/', AdminCommissionerPaymentHistoryView.as_view(), name='admin_commissioner_payment_history'),
     path('admin/commissioners/<int:pk>/mark-paid/', AdminMarkCommissionerPaidView.as_view(), name='admin_commissioner_mark_paid'),

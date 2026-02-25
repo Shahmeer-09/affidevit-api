@@ -45,6 +45,10 @@
 </div>
 {% endif %}
 
+<div style="text-align: center; margin: 30px 0;">
+    <a href="{{ site_url }}/request/{{ request_id }}" class="cta-button">View &amp; Download Your Affidavit</a>
+</div>
+
 <div class="warning-box">
     <div class="title">Keep Your Document Safe</div>
     <div class="text">Please store your original stamped document in a safe place. You may need it for official purposes.</div>
@@ -52,5 +56,5 @@
 
 <p style="color: #4b5563; margin-top: 25px;">Thank you for using Affidavit Express. We hope you had a great experience!</p>
 
-<p style="color: #6b7280; font-size: 14px;">Need another affidavit? Visit us anytime at <a href="{{ site_url }}" style="color: #2563eb;">Affidavit Express</a>.</p>
+<p style="color: #6b7280; font-size: 14px;">Need another affidavit? <a href="{{ site_url }}/request/new" style="color: #2563eb; font-weight: 600;">Start a new request</a> anytime at <a href="{{ site_url }}" style="color: #2563eb;">Affidavit Express</a>.</p>
 {% endblock %}

@@ -84,6 +84,47 @@ REQUEST_STATUS_MESSAGES = {
 }
 
 # ============================================================================
+# COMMISSIONER ACCOUNT MESSAGES
+# ============================================================================
+COMMISSIONER_ACCOUNT_MESSAGES = {
+    # Sent to commissioner when their account is approved by admin (no temp password)
+    "ACCOUNT_APPROVED": (
+        "Congratulations {commissioner_name}! Your Affidavit Express commissioner account "
+        "has been approved. You can now log in and start accepting affidavit requests. "
+        "Visit: {site_url}/login"
+    ),
+    # Sent to commissioner when approved WITH a temporary password
+    "ACCOUNT_APPROVED_WITH_PASSWORD": (
+        "Congratulations {commissioner_name}! Your Affidavit Express commissioner account "
+        "has been approved.\n\n"
+        "Temporary password: {temp_password}\n"
+        "Please log in and change it at: {reset_link}"
+    ),
+}
+
+# ============================================================================
+# USER ACCOUNT MESSAGES
+# ============================================================================
+USER_ACCOUNT_MESSAGES = {
+    # Sent to user after OTP verified and account activated (no temp password)
+    "ACCOUNT_CREATED": (
+        "Welcome to Affidavit Express, {user_name}! Your account is now active. "
+        "Start your first affidavit request at: {site_url}/affidavit-types"
+    ),
+    # Sent to user when account is created with a temporary password
+    "ACCOUNT_CREATED_WITH_PASSWORD": (
+        "Welcome to Affidavit Express, {user_name}! Your account is now active.\n\n"
+        "Temporary password: {temp_password}\n"
+        "Change it at: {reset_link}"
+    ),
+    # Sent to user when their affidavit is completed by commissioner
+    "AFFIDAVIT_COMPLETED": (
+        "Great news {user_name}! Your affidavit {request_code} has been completed and notarized "
+        "by {commissioner_name}. Log in to download your document: {site_url}/request/{request_id}"
+    ),
+}
+
+# ============================================================================
 # COMMISSIONER BALANCE MESSAGES
 # ============================================================================
 COMMISSIONER_BALANCE_MESSAGES = {
@@ -112,6 +153,7 @@ EMAIL_SUBJECTS = {
     "REQUEST_CLARIFICATION": "Clarification Needed - {request_code}",
     "REQUEST_COMPLETED": "Affidavit Completed - {request_code}",
     "REQUEST_IN_REVIEW": "Request Under Review - {request_code}",
+    "COMMISSIONER_APPROVED": "Welcome to Affidavit Express - Your Account Has Been Approved!",
 }
 
 # ============================================================================

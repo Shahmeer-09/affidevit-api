@@ -1,0 +1,51 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Welcome to Affidavit Express{% endblock %}
+
+{% block header %}
+<div class="email-header" style="background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);">
+    <h1>Welcome to Affidavit Express 👋</h1>
+    <div class="subtitle">Your account is ready — let's get started</div>
+</div>
+{% endblock %}
+
+{% block body %}
+<div class="greeting">
+    Hello {{ user_name }},
+</div>
+
+<div class="content">
+    <p>Your email has been verified and your <strong>Affidavit Express</strong> account is now active. You can start creating and managing your affidavit requests anytime.</p>
+</div>
+
+<div class="success-box">
+    <div class="title">✓ Account Verified &amp; Active</div>
+    <div class="text">You're all set. Your account is secure and ready to use.</div>
+</div>
+
+<div style="text-align: center; margin: 30px 0;">
+    <a href="{{ site_url }}/affidavit-types" class="cta-button">Create Your First Affidavit</a>
+</div>
+
+<div class="info-box">
+    <div class="label">How It Works</div>
+    <div class="value" style="font-size: 14px; color: #4b5563;">
+        <div style="margin-bottom: 12px; display: flex; align-items: flex-start;">
+            <span style="background: #2563eb; color: #fff; border-radius: 50%; width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; flex-shrink: 0; margin-right: 10px;">1</span>
+            <span>Choose the type of affidavit you need from our catalogue.</span>
+        </div>
+        <div style="margin-bottom: 12px; display: flex; align-items: flex-start;">
+            <span style="background: #2563eb; color: #fff; border-radius: 50%; width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; flex-shrink: 0; margin-right: 10px;">2</span>
+            <span>Fill in the required details — our system drafts the document for you.</span>
+        </div>
+        <div style="margin-bottom: 12px; display: flex; align-items: flex-start;">
+            <span style="background: #2563eb; color: #fff; border-radius: 50%; width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; flex-shrink: 0; margin-right: 10px;">3</span>
+            <span>A certified commissioner reviews and stamps your document — done!</span>
+        </div>
+    </div>
+</div>
+
+<p style="color: #4b5563; margin-top: 25px;">If you have any questions, visit your dashboard or contact us via the support tickets.</p>
+
+<p style="color: #6b7280; font-size: 14px;">Welcome aboard — we're glad you're here!</p>
+{% endblock %}

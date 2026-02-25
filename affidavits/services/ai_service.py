@@ -2415,11 +2415,46 @@ Based on the examples (if any), identify which parts of the template text actual
             surrounding = re.sub(r'<[^>]+>', ' ', surrounding).strip()
             label = fid.replace('_', ' ').title()
             help_text = f"Enter the {label.lower()} as it should appear in: {surrounding}" if surrounding else f"Enter the {label.lower()}"
-            new_fields_meta.append({
+
+            # Detect proper field type using TT smart validation rules
+            from affidavits.services.policy_generator_service import (
+                apply_smart_validation,
+                TT_FIELD_RULES,
+                _matches_field_pattern,
+            )
+            detected_type = 'text'
+            detected_validation = {}
+            computed_fields = None
+            placeholder_text = ''
+            question_stub = {'type': 'text'}  # mutable — smart validation may update it
+            detected_validation = apply_smart_validation(fid, label, {}, question_stub)
+            detected_type = question_stub.get('type', 'text')
+            placeholder_text = question_stub.get('placeholder', '')
+            computed_fields = question_stub.get('computed_fields')
+            if question_stub.get('help_text'):
+                help_text = question_stub['help_text']
+
+            meta_entry = {
                 'id': fid,
                 'label': label,
                 'help_text': help_text[:200],
-            })
+                'type': detected_type,
+            }
+            if detected_validation:
+                meta_entry['validation'] = detected_validation
+            if placeholder_text:
+                meta_entry['placeholder'] = placeholder_text
+            if computed_fields:
+                meta_entry['computed_fields'] = computed_fields
+            if question_stub.get('options'):
+                meta_entry['options'] = question_stub['options']
+
+            new_fields_meta.append(meta_entry)
+
+        # Post-process template: swap DOB placeholders → {{calculated_age}}
+        # when a new DOB field with computed_fields: ['age'] is detected
+        from affidavits.services.policy_generator_service import post_process_template_for_computed_fields
+        refined = post_process_template_for_computed_fields(refined, new_fields_meta)
 
         logger.info(f"[REFINE_TEMPLATE] type={affidavit_type_id} examples={len(examples)} new_fields={new_field_ids}")
 

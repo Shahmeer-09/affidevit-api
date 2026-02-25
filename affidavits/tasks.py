@@ -470,3 +470,68 @@ def generate_daily_slots():
     except Exception as exc:
         logger.exception(f"Error generating daily slots: {exc}")
         return {'success': False, 'error': str(exc)}
+
+
+# ─── Email / SMS notification tasks ──────────────────────────────────────────
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_otp_email_task(self, email, otp_code, user_name=None):
+    """Send OTP verification email asynchronously with retries."""
+    from affidavits.services.notification_service import send_otp_email
+
+    try:
+        result = send_otp_email(email=email, otp_code=otp_code, user_name=user_name)
+        if not result.get('success'):
+            raise Exception(result.get('error', 'OTP email send failed'))
+        logger.info(f"[CELERY] OTP email sent to {email}")
+        return result
+    except Exception as exc:
+        logger.warning(f"[CELERY] OTP email attempt failed for {email}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_user_welcome_notification_task(self, user_id, temp_password=None):
+    """Send user welcome email + SMS asynchronously with retries."""
+    from affidavits.models import User
+    from affidavits.services.notification_service import send_user_welcome_notification
+
+    try:
+        user = User.objects.get(id=user_id)
+        result = send_user_welcome_notification(user, temp_password=temp_password)
+        email_ok = result.get('email', {}).get('success', False)
+        sms_ok = result.get('sms', {}).get('success', False)
+        if not email_ok and not sms_ok:
+            raise Exception(f"All channels failed: {result}")
+        logger.info(f"[CELERY] Welcome notification sent for user {user_id}")
+        return result
+    except User.DoesNotExist:
+        logger.error(f"[CELERY] send_user_welcome_notification_task: User {user_id} not found")
+        return {'success': False, 'error': 'User not found'}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Welcome notification attempt failed for user {user_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_commissioner_approved_notification_task(self, commissioner_id, temp_password=None):
+    """Send commissioner approved email + SMS asynchronously with retries."""
+    from affidavits.models import User
+    from affidavits.services.notification_service import send_commissioner_approved_notification
+
+    try:
+        commissioner = User.objects.get(id=commissioner_id)
+        result = send_commissioner_approved_notification(commissioner, temp_password=temp_password)
+        email_ok = result.get('email', {}).get('success', False)
+        sms_ok = result.get('sms', {}).get('success', False)
+        if not email_ok and not sms_ok:
+            raise Exception(f"All channels failed: {result}")
+        logger.info(f"[CELERY] Commissioner approved notification sent for {commissioner_id}")
+        return result
+    except User.DoesNotExist:
+        logger.error(f"[CELERY] send_commissioner_approved_notification_task: User {commissioner_id} not found")
+        return {'success': False, 'error': 'Commissioner not found'}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Commissioner approved notification failed for {commissioner_id}: {exc}")
+        raise self.retry(exc=exc)

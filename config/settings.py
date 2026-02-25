@@ -259,8 +259,8 @@ CELERY_BEAT_SCHEDULE = {
 # EMAIL_HOST_USER=your-email@gmail.com
 # EMAIL_HOST_PASSWORD=your-app-password
 # DEFAULT_FROM_EMAIL=noreply@affidavitexpress.com
-# Use console backend by default for development so emails are printed to the server console.
-EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+# Use SMTP backend by default to actually send emails. Set EMAIL_BACKEND=console in .env to print to console instead.
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
 EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
 EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True').lower() == 'true'
@@ -270,9 +270,9 @@ EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
 DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'Affidavit Express <noreply@affidavitexpress.com>')
 EMAIL_TIMEOUT = 30  # Connection timeout in seconds
 
-# Development: console is the default. To use SMTP instead set EMAIL_BACKEND='django.core.mail.backends.smtp.EmailBackend' in your .env
-if os.getenv('EMAIL_BACKEND') == 'smtp':
-    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+# Production: SMTP is the default. To use console backend (print to console) set EMAIL_BACKEND=console in .env
+if os.getenv('EMAIL_BACKEND') == 'console':
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 
 # =============================================================================
 # Logging Configuration

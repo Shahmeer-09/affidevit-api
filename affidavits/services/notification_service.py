@@ -16,6 +16,8 @@ from ..constants.notification_messages import (
     APPOINTMENT_MESSAGES,
     REQUEST_STATUS_MESSAGES,
     COMMISSIONER_BALANCE_MESSAGES,
+    COMMISSIONER_ACCOUNT_MESSAGES,
+    USER_ACCOUNT_MESSAGES,
     EMAIL_SUBJECTS,
 )
 
@@ -134,7 +136,10 @@ Request Details:
 - Affidavit Type: {context.get('affidavit_type', 'N/A')}
 - Completed: {context.get('completed_at', 'N/A')}
 
-Thank you for using Affidavit Express!
+View and download your affidavit here:
+{context.get('site_url', '')}/request/{context.get('request_id', '')}
+
+Thank you for using Affidavit Express! Need another affidavit? Visit us anytime.
 
 Best regards,
 The Affidavit Express Team
@@ -172,9 +177,36 @@ Best regards,
 The Affidavit Express Team
 """
 
+    elif 'commissioner_approved' in template_name:
+        return f"""
+Hello {context.get('commissioner_name', 'Commissioner')},
+
+Congratulations! Your Affidavit Express commissioner account has been approved.
+
+You can now log in and start accepting affidavit requests:
+{context.get('site_url', '')}/login
+
+Welcome to the team!
+
+Best regards,
+The Affidavit Express Team
+"""
+
+    elif 'user_welcome' in template_name:
+        return f"""
+Hello {context.get('user_name', 'there')},
+
+Welcome to Affidavit Express! Your account is now active.
+
+Start your first affidavit request here:
+{context.get('site_url', '')}/affidavit-types
+
+Best regards,
+The Affidavit Express Team
+"""
+
     else:
         return f"Thank you for using Affidavit Express. Reference: {context.get('request_code', 'N/A')}"
-
 
 def send_approval_notification(request_obj) -> dict:
     """
@@ -498,9 +530,74 @@ def send_welcome_email(
     return result
 
 
-# ============================================================================
-# UNIFIED NOTIFICATION DISPATCHER FUNCTIONS
-# ============================================================================
+def send_commissioner_approved_notification(commissioner, temp_password: str = None) -> dict:
+    """
+    Send welcome email + SMS to a commissioner when an admin approves their account.
+    Includes temporary password so the commissioner can log in immediately.
+
+    Args:
+        commissioner: User model instance (role=COMMISSIONER)
+        temp_password: Temporary password set by the approval flow
+
+    Returns:
+        dict: {'email': result, 'sms': result}
+    """
+    results = {'email': None, 'sms': None}
+
+    commissioner_name = commissioner.get_full_name() or commissioner.username
+    reset_link = f"{SITE_URL}/reset-password?email={commissioner.email}" if commissioner.email else f"{SITE_URL}/reset-password"
+
+    # --- Email ---
+    if commissioner.email:
+        context = {
+            'commissioner_name': commissioner_name,
+            'email': commissioner.email,
+            'temp_password': temp_password or '',
+            'reset_link': reset_link,
+            'site_url': SITE_URL,
+        }
+        email_result = send_email_with_template(
+            subject=EMAIL_SUBJECTS["COMMISSIONER_APPROVED"],
+            template_name='commissioner_approved.html',
+            context=context,
+            recipient_email=commissioner.email,
+        )
+        results['email'] = email_result
+        if email_result['success']:
+            logger.info(f"Sent commissioner approval email to {commissioner.email}")
+        else:
+            logger.error(f"Failed to send commissioner approval email: {email_result.get('error')}")
+    else:
+        results['email'] = {'success': False, 'error': 'Commissioner has no email address'}
+
+    # --- SMS ---
+    if commissioner.phone_number:
+        from .twilio_service import TwilioService
+
+        if temp_password:
+            sms_message = COMMISSIONER_ACCOUNT_MESSAGES["ACCOUNT_APPROVED_WITH_PASSWORD"].format(
+                commissioner_name=commissioner_name,
+                temp_password=temp_password,
+                reset_link=reset_link,
+                site_url=SITE_URL,
+            )
+        else:
+            sms_message = COMMISSIONER_ACCOUNT_MESSAGES["ACCOUNT_APPROVED"].format(
+                commissioner_name=commissioner_name,
+                site_url=SITE_URL,
+            )
+        sms_result = TwilioService.send_notification_message(
+            commissioner.phone_number, sms_message
+        )
+        results['sms'] = sms_result
+        if sms_result.get('success'):
+            logger.info(f"Sent commissioner approval SMS to {commissioner.phone_number}")
+        else:
+            logger.warning(f"Failed to send commissioner approval SMS: {sms_result.get('error')}")
+    else:
+        results['sms'] = {'success': False, 'error': 'Commissioner has no phone number'}
+
+    return results
 
 def send_appointment_booked_notifications(request_obj, slot_obj) -> dict:
     """
@@ -552,6 +649,115 @@ def send_appointment_booked_notifications(request_obj, slot_obj) -> dict:
         logger.info(f"Sent appointment booked notification to commissioner {commissioner.username}")
     
     return results
+
+
+def send_user_welcome_notification(user, temp_password: str = None) -> dict:
+    """
+    Send welcome email + SMS to a newly registered user after their OTP is verified.
+    Uses welcome_account.html which shows a temp password section if provided.
+
+    Args:
+        user: User model instance (role=PUBLIC)
+        temp_password: Optional temporary password (shown in email if provided)
+
+    Returns:
+        dict: {'email': result, 'sms': result}
+    """
+    results = {'email': None, 'sms': None}
+
+    user_name = user.get_full_name() or user.first_name or user.username
+    reset_link = f"{SITE_URL}/reset-password?email={user.email}" if user.email else f"{SITE_URL}/reset-password"
+
+    # --- Email ---
+    if user.email:
+        context = {
+            'user_name': user_name,
+            'email': user.email,
+            'phone_number': user.phone_number or '',
+            'temp_password': temp_password or '',
+            'reset_link': reset_link,
+            'site_url': SITE_URL,
+        }
+        email_result = send_email_with_template(
+            subject="Welcome to Affidavit Express — Your Account is Active",
+            template_name='welcome_account.html',
+            context=context,
+            recipient_email=user.email,
+        )
+        results['email'] = email_result
+        if email_result['success']:
+            logger.info(f"Sent user welcome email to {user.email}")
+        else:
+            logger.error(f"Failed to send user welcome email: {email_result.get('error')}")
+    else:
+        results['email'] = {'success': False, 'error': 'User has no email address'}
+
+    # --- SMS ---
+    if user.phone_number:
+        from .twilio_service import TwilioService
+
+        if temp_password:
+            sms_message = USER_ACCOUNT_MESSAGES["ACCOUNT_CREATED_WITH_PASSWORD"].format(
+                user_name=user_name,
+                temp_password=temp_password,
+                reset_link=reset_link,
+                site_url=SITE_URL,
+            )
+        else:
+            sms_message = USER_ACCOUNT_MESSAGES["ACCOUNT_CREATED"].format(
+                user_name=user_name,
+                site_url=SITE_URL,
+            )
+        sms_result = TwilioService.send_notification_message(user.phone_number, sms_message)
+        results['sms'] = sms_result
+        if sms_result.get('success'):
+            logger.info(f"Sent user welcome SMS to {user.phone_number}")
+        else:
+            logger.warning(f"Failed to send user welcome SMS: {sms_result.get('error')}")
+    else:
+        results['sms'] = {'success': False, 'error': 'User has no phone number'}
+
+    return results
+
+
+def send_completion_sms(request_obj, stamp=None) -> dict:
+    """
+    Send SMS to user when their affidavit is completed by the commissioner.
+
+    Args:
+        request_obj: Request model instance
+        stamp: Stamp model instance (optional, for commissioner name)
+
+    Returns:
+        dict: {'success': bool, 'error': str or None}
+    """
+    from .twilio_service import TwilioService
+
+    user = request_obj.user
+
+    if not user.phone_number:
+        return {'success': False, 'error': 'User has no phone number'}
+
+    commissioner_name = ''
+    if stamp and stamp.commissioner:
+        commissioner_name = stamp.commissioner.get_full_name() or stamp.commissioner.username
+    elif request_obj.commissioner:
+        commissioner_name = request_obj.commissioner.get_full_name() or request_obj.commissioner.username
+
+    message = USER_ACCOUNT_MESSAGES["AFFIDAVIT_COMPLETED"].format(
+        user_name=user.get_full_name() or user.first_name or user.username,
+        request_code=request_obj.request_code,
+        commissioner_name=commissioner_name or 'your commissioner',
+        site_url=SITE_URL,
+        request_id=request_obj.id,
+    )
+
+    result = TwilioService.send_notification_message(user.phone_number, message)
+    if result.get('success'):
+        logger.info(f"Sent completion SMS to user {user.username} for {request_obj.request_code}")
+    else:
+        logger.warning(f"Failed to send completion SMS: {result.get('error')}")
+    return result
 
 
 def send_appointment_accepted_notification(request_obj, slot_obj) -> dict:

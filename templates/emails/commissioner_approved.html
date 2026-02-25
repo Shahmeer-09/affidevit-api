@@ -1,0 +1,87 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Account Approved - Affidavit Express{% endblock %}
+
+{% block header %}
+<div class="email-header" style="background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);">
+    <h1>🎉 You're Approved!</h1>
+    <div class="subtitle">Welcome to the Affidavit Express Commissioner Network</div>
+</div>
+{% endblock %}
+
+{% block body %}
+<div class="greeting">
+    Hello {{ commissioner_name }},
+</div>
+
+<div class="content">
+    <p>Congratulations! Your application to become a Commissioner of Affidavits on <strong>Affidavit Express</strong> has been reviewed and <strong>officially approved</strong>.</p>
+    <p>You are now part of a trusted network that helps people quickly and conveniently get their documents commissioned.</p>
+</div>
+
+<div class="success-box">
+    <div class="title">✓ Account Activated</div>
+    <div class="text">Your commissioner account is live. Clients can now find and book you through the platform.</div>
+</div>
+
+{% if temp_password %}
+<div class="content">
+    <p>A <strong>temporary password</strong> has been set for your account so you can log in right away. Please change it immediately after your first login.</p>
+</div>
+
+<div class="request-code">
+    <div class="label">Your Temporary Password</div>
+    <div class="code">{{ temp_password }}</div>
+</div>
+
+<div class="info-box" style="margin-bottom: 20px;">
+    <div class="label">Login Details</div>
+    <div class="value">
+        {% if email %}<p style="margin: 5px 0;"><strong>Email:</strong> {{ email }}</p>{% endif %}
+        <p style="margin: 5px 0;"><strong>Password:</strong> {{ temp_password }} <em style="color: #dc2626;">(temporary &mdash; change immediately)</em></p>
+    </div>
+</div>
+
+<div class="warning-box">
+    <div class="title">🔐 Change Your Password</div>
+    <div class="text">For security, please change your password as soon as you log in.</div>
+</div>
+
+<div style="text-align: center; margin: 20px 0;">
+    <a href="{{ reset_link }}" class="cta-button">Change Password &amp; Log In</a>
+</div>
+{% else %}
+<div style="text-align: center; margin: 30px 0;">
+    <a href="{{ site_url }}/login" class="cta-button">Log In to Your Dashboard</a>
+</div>
+{% endif %}
+
+<div class="info-box">
+    <div class="label">What Happens Next</div>
+    <div class="value" style="font-size: 14px; color: #4b5563;">
+        <div class="steps">
+            <div class="step" style="display: flex; align-items: flex-start; margin-bottom: 12px;">
+                <div class="step-number" style="background-color: #2563eb; color: #fff; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; flex-shrink: 0; margin-right: 12px;">1</div>
+                <div class="step-content">Clients submit affidavit requests and select you from the commissioner list.</div>
+            </div>
+            <div class="step" style="display: flex; align-items: flex-start; margin-bottom: 12px;">
+                <div class="step-number" style="background-color: #2563eb; color: #fff; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; flex-shrink: 0; margin-right: 12px;">2</div>
+                <div class="step-content">You review their request, meet with them, and stamp their document in your dashboard.</div>
+            </div>
+            <div class="step" style="display: flex; align-items: flex-start;">
+                <div class="step-number" style="background-color: #2563eb; color: #fff; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 600; flex-shrink: 0; margin-right: 12px;">3</div>
+                <div class="step-content">Earnings are added to your pending payout balance after each completed request.</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="warning-box">
+    <div class="title">Set Up Your Schedule</div>
+    <div class="text">Log in and add your available time slots so clients can book appointments with you right away.</div>
+</div>
+
+<p style="color: #4b5563; margin-top: 25px;">If you have any questions, our support team is always here to help via the support tickets on your dashboard.</p>
+
+<p style="color: #6b7280; font-size: 14px;">Welcome aboard &mdash; we're excited to have you on the team!</p>
+{% endblock %}

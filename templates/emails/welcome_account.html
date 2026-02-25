@@ -5,7 +5,7 @@
 {% block header %}
 <div class="email-header">
     <h1>Welcome to Affidavit Express!</h1>
-    <div class="subtitle">Your account has been created</div>
+    <div class="subtitle">Your account is now active</div>
 </div>
 {% endblock %}
 
@@ -13,12 +13,13 @@
 <div class="greeting">Hello {{ user_name|default:"there" }},</div>
 
 <div class="success-box">
-    <div class="title">🎉 Account Created Successfully</div>
-    <div class="text">Your Affidavit Express account is ready to use.</div>
+    <div class="title">✅ Account Verified &amp; Active</div>
+    <div class="text">Your Affidavit Express account is ready to use. You can now create and manage your affidavit requests.</div>
 </div>
 
+{% if temp_password %}
 <div class="content">
-    <p>We've created a temporary password for your account. For security reasons, please change it as soon as possible.</p>
+    <p>We've set a <strong>temporary password</strong> for your account. Please change it as soon as you log in.</p>
 </div>
 
 <div class="request-code">
@@ -39,36 +40,30 @@
     <p>Or copy and paste this link into your browser:</p>
     <p style="word-break: break-all; color: #2563eb; font-size: 14px;">{{ reset_link }}</p>
 </div>
+{% else %}
+<div style="text-align: center; margin: 30px 0;">
+    <a href="{{ site_url }}/affidavit-types" class="cta-button">Create Your First Affidavit</a>
+</div>
+{% endif %}
 
 <div class="info-box">
     <div class="label">Account Details</div>
     <div class="value">
-        <p style="margin: 5px 0;"><strong>Email:</strong> {{ email }}</p>
-        {% if phone_number %}
-        <p style="margin: 5px 0;"><strong>Phone:</strong> {{ phone_number }}</p>
-        {% endif %}
+        {% if email %}<p style="margin: 5px 0;"><strong>Email:</strong> {{ email }}</p>{% endif %}
+        {% if phone_number %}<p style="margin: 5px 0;"><strong>Phone:</strong> {{ phone_number }}</p>{% endif %}
+    </div>
+</div>
+
+<div class="info-box" style="margin-top: 20px;">
+    <div class="label">How It Works</div>
+    <div class="value" style="font-size: 14px; color: #4b5563;">
+        <div style="margin-bottom: 10px;"><span style="background: #2563eb; color: #fff; border-radius: 50%; width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; margin-right: 8px;">1</span> Choose your affidavit type from our catalogue.</div>
+        <div style="margin-bottom: 10px;"><span style="background: #2563eb; color: #fff; border-radius: 50%; width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; margin-right: 8px;">2</span> Fill in details &mdash; our system drafts the document for you.</div>
+        <div><span style="background: #2563eb; color: #fff; border-radius: 50%; width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; margin-right: 8px;">3</span> A certified commissioner reviews and stamps your document.</div>
     </div>
 </div>
 
 <div class="content">
-    <p><strong>What's Next?</strong></p>
-    <div class="steps">
-        <div class="step">
-            <div class="step-number">1</div>
-            <div class="step-content">Change your password using the link above</div>
-        </div>
-        <div class="step">
-            <div class="step-number">2</div>
-            <div class="step-content">Log in to your account</div>
-        </div>
-        <div class="step">
-            <div class="step-number">3</div>
-            <div class="step-content">Complete or track your affidavit requests</div>
-        </div>
-    </div>
-</div>
-
-<div class="content">
-    <p>If you have any questions, our support team is here to help.</p>
+    <p>If you have any questions, our support team is here to help via the support tickets on your dashboard.</p>
 </div>
 {% endblock %}

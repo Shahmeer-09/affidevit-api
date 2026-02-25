@@ -61,8 +61,12 @@ from .services.notification_service import (
     send_completion_notification,
     send_ticket_created_notification,
     send_ticket_reply_notification,
-    send_otp_email,
-    send_welcome_email
+    send_completion_sms,
+)
+from .tasks import (
+    send_otp_email_task,
+    send_user_welcome_notification_task,
+    send_commissioner_approved_notification_task,
 )
 from .services.twilio_service import TwilioService
 from .services.dashboard_service import (
@@ -211,17 +215,30 @@ class UserRegistrationView(generics.CreateAPIView):
         
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
-        
+
+        # Reuse an existing unverified (inactive) account so users can retry OTP
+        # without getting a 'email already exists' error or creating duplicate records.
+        email = serializer.validated_data['email']
+        existing_unverified = User.objects.filter(email__iexact=email, is_active=False).first()
+        if existing_unverified:
+            user = existing_unverified
+            # Refresh name/phone in case user corrected them on retry
+            user.first_name = serializer.validated_data.get('first_name', user.first_name)
+            user.last_name = serializer.validated_data.get('last_name', user.last_name)
+            if serializer.validated_data.get('phone_number'):
+                user.phone_number = serializer.validated_data['phone_number']
+        else:
+            user = serializer.save()
+            user.is_active = False
+
         # Generate 6-digit OTP, store on user model, keep user inactive until verified
         otp_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
         user.otp_code = otp_code
         user.otp_created_at = timezone.now()
-        user.is_active = False
         user.save()
         
-        # Send OTP via email
-        send_otp_email(
+        # Send OTP via email (async with retries)
+        send_otp_email_task.delay(
             email=user.email,
             otp_code=otp_code,
             user_name=user.first_name or user.username,
@@ -295,12 +312,13 @@ class GuestAuthView(viewsets.ViewSet):
         user.otp_created_at = timezone.now()
         user.save(update_fields=['otp_code', 'otp_created_at'])
 
-        # Send OTP via Email (always)
-        email_result = send_otp_email(
+        # Send OTP via Email (async with retries)
+        send_otp_email_task.delay(
             email=email,
             otp_code=otp_code,
             user_name=full_name
         )
+        email_result = {'success': True}  # queued via Celery
         
         # Send OTP via WhatsApp/SMS if phone number provided
         sms_result = {'success': False, 'channel': None, 'error': 'No phone number provided'}
@@ -378,6 +396,8 @@ class GuestAuthView(viewsets.ViewSet):
         
         try:
             user = User.objects.get(email__iexact=email)
+            # Track whether this is a first-time activation before we change anything
+            was_inactive = not user.is_active
             # Update existing user info if needed
             if not user.is_active:
                 user.is_active = True
@@ -429,6 +449,7 @@ class GuestAuthView(viewsets.ViewSet):
             # Generate temporary password
             temp_password = get_random_string(12)
             is_new_user = True
+            was_inactive = False  # brand-new user, not a reactivation
 
             try:
                 user = User.objects.create_user(
@@ -480,29 +501,19 @@ class GuestAuthView(viewsets.ViewSet):
             user_paid_at=None,
         )
 
-        # 5. Send Welcome Message for new users
-        if is_new_user and temp_password:
-            # Build password reset link
-            from django.conf import settings
-            site_url = getattr(settings, 'SITE_URL', 'http://localhost:3000')
-            reset_link = f"{site_url}/reset-password?email={email}"
-            
-            # Send welcome email with temp password
-            send_welcome_email(
-                email=email,
-                temp_password=temp_password,
-                reset_link=reset_link,
-                user_name=full_name,
-                phone_number=phone_number
-            )
-            
-            # Send welcome message via WhatsApp/SMS if phone number provided
-            if phone_number:
-                TwilioService.send_welcome_message(
-                    phone_number=phone_number,
-                    temp_password=temp_password,
-                    reset_link=reset_link
-                )
+        # 5. Send Welcome Message (async via Celery with retries)
+        # Use request count (just created = 1) to reliably detect a first-time guest user,
+        # instead of was_inactive — which is False if a previous task was discarded
+        # and the account was already activated.
+        is_first_request = Request.objects.filter(user=user).count() == 1
+        if is_first_request:
+            if not temp_password:
+                # was_inactive path or new external user — generate a fresh temp password
+                from django.utils.crypto import get_random_string
+                temp_password = get_random_string(12)
+                user.set_password(temp_password)
+                user.save(update_fields=['password'])
+            send_user_welcome_notification_task.delay(user.id, temp_password=temp_password)
 
         # 6. Generate Tokens
         refresh = RefreshToken.for_user(user)
@@ -575,6 +586,9 @@ class VerifyOTPView(APIView):
             user.is_active = True
             user.save()
 
+            # Send welcome email + SMS (async via Celery with retries)
+            send_user_welcome_notification_task.delay(user.id)
+
             refresh = RefreshToken.for_user(user)
             return Response({
                 'success': True,
@@ -600,7 +614,10 @@ class VerifyOTPView(APIView):
             if user.role == User.Role.PUBLIC:
                 user.is_active = True
                 user.save()
-                
+
+                # Send welcome email + SMS (async via Celery with retries)
+                send_user_welcome_notification_task.delay(user.id)
+
                 refresh = RefreshToken.for_user(user)
                 return Response({
                     'success': True,
@@ -638,17 +655,30 @@ class CommissionerRegistrationView(APIView):
 
         serializer = CommissionerRegistrationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
+
+        # Reuse an existing unverified commissioner (inactive + has otp_code) to allow OTP retry
+        email = serializer.validated_data['email']
+        existing_unverified = User.objects.filter(
+            email__iexact=email, is_active=False, role=User.Role.COMMISSIONER
+        ).exclude(otp_code='').first()
+        if existing_unverified:
+            user = existing_unverified
+            user.first_name = serializer.validated_data.get('first_name', user.first_name)
+            user.last_name = serializer.validated_data.get('last_name', user.last_name)
+            if serializer.validated_data.get('phone_number'):
+                user.phone_number = serializer.validated_data['phone_number']
+        else:
+            user = serializer.save()
+            user.is_active = False
 
         # Generate OTP for email verification; keep inactive until both OTP verified + admin approval
         otp_code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
         user.otp_code = otp_code
         user.otp_created_at = timezone.now()
-        user.is_active = False
         user.save()
 
-        # Send OTP via email
-        send_otp_email(
+        # Send OTP via email (async with retries)
+        send_otp_email_task.delay(
             email=user.email,
             otp_code=otp_code,
             user_name=user.first_name or user.username,
@@ -1843,9 +1873,16 @@ class MarkCompleteView(APIView):
         request_obj.release_lock()
         request_obj.save()
         
-        # Send completion notification to user
+        # Send completion notification to user (email + SMS)
         send_completion_notification(request_obj, stamp)
-        
+        try:
+            send_completion_sms(request_obj, stamp)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"Could not send completion SMS: {e}"
+            )
+
         # Generate payout message for commissioner
         from .services.notification_service import send_commissioner_payout_added_message
         payout_message = send_commissioner_payout_added_message(
@@ -3610,9 +3647,10 @@ class PublicCommissionerListView(generics.ListAPIView):
     permission_classes = [AllowAny]
     
     def get_queryset(self):
+        # is_featured is the sole source of truth for public visibility.
+        # Admin approving a commissioner sets both is_featured=True and is_active=True together.
         return User.objects.filter(
             role=User.Role.COMMISSIONER,
-            is_active=True,
             is_featured=True
         ).order_by('first_name', 'last_name')
 
@@ -3656,6 +3694,106 @@ class AdminCommissionerDetailView(generics.RetrieveUpdateDestroyAPIView):
     
     def get_queryset(self):
         return User.objects.filter(role=User.Role.COMMISSIONER)
+
+
+class AdminApproveCommissionerView(APIView):
+    """
+    Admin endpoint to approve or disapprove a commissioner.
+
+    POST body: { "action": "approve" | "disapprove" }
+
+    approve   → is_featured=True; is_active=True ONLY if email is verified (otp_code empty)
+    disapprove → is_featured=False, is_active=False (hidden from public + cannot log in)
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, pk):
+        commissioner = get_object_or_404(User, pk=pk, role=User.Role.COMMISSIONER)
+        action = request.data.get('action')
+
+        if action == 'approve':
+            # Only activate if OTP has been verified (otp_code is cleared on verification)
+            is_verified = not bool(commissioner.otp_code)
+            if not is_verified:
+                return Response({
+                    'detail': (
+                        f'{commissioner.get_full_name() or commissioner.username} has not completed '
+                        'email verification yet. Ask them to verify their email, or use '
+                        '"Mark Verified Manually" if you have confirmed their identity directly.'
+                    ),
+                    'is_email_verified': False,
+                    'can_manually_verify': True,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            commissioner.is_featured = True
+            commissioner.is_active = True
+
+            # Generate a temporary password so the commissioner can log in immediately
+            from django.utils.crypto import get_random_string
+            temp_password = get_random_string(12)
+            commissioner.set_password(temp_password)
+            commissioner.save(update_fields=['is_featured', 'is_active', 'password'])
+
+            # Notify commissioner via email + SMS (async via Celery with retries)
+            send_commissioner_approved_notification_task.delay(commissioner.id, temp_password=temp_password)
+
+            return Response({
+                'success': True,
+                'is_featured': True,
+                'is_active': True,
+                'message': 'Commissioner approved.'
+            })
+        elif action == 'disapprove':
+            commissioner.is_featured = False
+            commissioner.is_active = False
+            commissioner.save(update_fields=['is_featured', 'is_active'])
+            return Response({
+                'success': True,
+                'is_featured': False,
+                'is_active': False,
+                'message': 'Commissioner disapproved.'
+            })
+
+        return Response(
+            {'error': 'Invalid action. Use "approve" or "disapprove".'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+
+class AdminManualVerifyCommissionerView(APIView):
+    """
+    Admin endpoint to manually mark a commissioner as email-verified.
+    Use when the commissioner cannot complete OTP themselves but the admin
+    has confirmed their identity through another channel.
+
+    POST → clears otp_code so the commissioner can then be approved.
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, pk):
+        commissioner = get_object_or_404(User, pk=pk, role=User.Role.COMMISSIONER)
+
+        if not commissioner.otp_code:
+            return Response({
+                'detail': 'Commissioner is already verified.',
+                'is_email_verified': True,
+            })
+
+        # Clear OTP — same effect as completing the OTP flow
+        commissioner.otp_code = ''
+        commissioner.otp_created_at = None
+        commissioner.save(update_fields=['otp_code', 'otp_created_at'])
+
+        import logging
+        logging.getLogger(__name__).info(
+            f'Admin {request.user.username} manually verified commissioner {commissioner.username} (pk={pk})'
+        )
+
+        return Response({
+            'success': True,
+            'is_email_verified': True,
+            'message': f'{commissioner.get_full_name() or commissioner.username} has been marked as verified. You can now approve them.',
+        })
 
 
 class AdminReviewerListView(generics.ListCreateAPIView):
@@ -4599,6 +4737,7 @@ class AdminPolicyTaskStatusView(APIView):
             auto_generate_placeholder_mapping,
             build_scenarios_from_identified,
             validate_template_mapping,
+            post_process_template_for_computed_fields,
         )
         
         task = AsyncResult(task_id)
@@ -4676,6 +4815,14 @@ class AdminPolicyTaskStatusView(APIView):
                     
                     # Auto-generate placeholder_mapping from template + final schema
                     final_schema = affidavit_type.intake_schema or []
+
+                    # Post-process template: swap DOB placeholders → {{calculated_age}}
+                    # when the field is configured to auto-compute age
+                    affidavit_type.template_html = post_process_template_for_computed_fields(
+                        affidavit_type.template_html or '',
+                        final_schema,
+                    )
+
                     generated_mapping = auto_generate_placeholder_mapping(
                         affidavit_type.template_html or '',
                         final_schema,

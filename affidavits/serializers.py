@@ -91,9 +91,10 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
                 'password_confirm': 'Passwords do not match.'
             })
         
-        # Check for unique email (case-insensitive)
+        # Only block if an ACTIVE (verified) user already holds this email.
+        # Inactive (unverified) accounts are reused by the view so users can retry OTP.
         email = attrs.get('email')
-        if email and User.objects.filter(email__iexact=email).exists():
+        if email and User.objects.filter(email__iexact=email, is_active=True).exists():
             raise serializers.ValidationError({
                 'email': 'A user with this email already exists.'
             })
@@ -210,11 +211,22 @@ class CommissionerRegistrationSerializer(serializers.ModelSerializer):
             })
 
         # Check for unique email (case-insensitive)
+        # Allow re-registration only if the existing account is inactive AND still has an OTP
+        # (i.e. never verified). Once OTP is verified, the slot is claimed.
         email = attrs.get('email')
-        if email and User.objects.filter(email__iexact=email).exists():
-            raise serializers.ValidationError({
-                'email': 'A user with this email already exists.'
-            })
+        if email:
+            existing = User.objects.filter(email__iexact=email).first()
+            if existing:
+                if existing.is_active:
+                    raise serializers.ValidationError({
+                        'email': 'A user with this email already exists.'
+                    })
+                elif not existing.otp_code:
+                    # Inactive but OTP already verified — awaiting admin approval
+                    raise serializers.ValidationError({
+                        'email': 'Your application has already been submitted and is awaiting admin approval.'
+                    })
+                # else: inactive + has otp_code → unverified, view will reuse the record
 
         # Check for unique commission number
         commission_number = attrs.get('commission_number')
@@ -309,6 +321,7 @@ class CommissionerSerializer(serializers.ModelSerializer):
     
     full_name = serializers.SerializerMethodField()
     profile_image_url = serializers.SerializerMethodField()
+    is_email_verified = serializers.SerializerMethodField()
     
     class Meta:
         model = User
@@ -317,11 +330,16 @@ class CommissionerSerializer(serializers.ModelSerializer):
             'phone_number', 'commission_number', 'commission_expiry', 'payout_rate', 
             'organization', 'address', 'bio', 'availability',
             'pdf_preferences', 'profile_image', 'profile_image_url', 'is_featured',
+            'is_active', 'is_email_verified',
             # Bank/Payment details
             'bank_name', 'bank_branch', 'bank_account_number',
             'bank_account_name', 'payment_preference',
         ]
-        read_only_fields = ['id', 'profile_image_url']
+        read_only_fields = ['id', 'profile_image_url', 'is_email_verified']
+    
+    def get_is_email_verified(self, obj):
+        """OTP verified = otp_code is empty/blank. Still has otp_code = not yet verified."""
+        return not bool(obj.otp_code)
     
     def get_full_name(self, obj):
         return obj.get_full_name() or obj.username

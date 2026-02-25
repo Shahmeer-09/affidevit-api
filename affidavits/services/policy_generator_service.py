@@ -101,7 +101,11 @@ TT_FIELD_RULES = {
     },
     # Date of Birth - with age calculation, cannot be in future
     'date_of_birth': {
-        'patterns': ['date_of_birth', 'dob', 'birth_date', 'birthdate'],
+        'patterns': [
+            'date_of_birth', 'dob', 'birth_date', 'birthdate',
+            'birth', 'born_on', 'date_born', 'applicant_dob',
+            'date_of_birth_of', 'dob_of', 'birth_day'
+        ],
         'validation': {
             'max_date': 'today',
             'date_constraint': 'past_only',
@@ -1048,7 +1052,6 @@ def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> Lis
             'required': field.get('required', True),
             'placeholder': field.get('placeholder', ''),
             'help_text': field.get('help_text', ''),
-            'type_locked': True  # Prevent frontend from overriding backend type
         }
 
         # Preserve show_if conditional logic from AI-detected fields
@@ -1059,7 +1062,12 @@ def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> Lis
         validation = field.get('validation', {})
         
         # Apply smart T&T validation rules based on field ID/label
+        # NOTE: type_locked is NOT set yet so smart rules can fix AI type errors
+        # (e.g. date_of_birth returned as 'text' will be corrected to 'date')
         validation = apply_smart_validation(field_id, field_label, validation, question)
+        
+        # Lock type AFTER smart validation has had a chance to correct it
+        question['type_locked'] = True
         
         # Add validation if we have any rules
         if validation:
@@ -1076,6 +1084,79 @@ def convert_detected_fields_to_intake_schema(detected_fields: List[Dict]) -> Lis
         intake_schema.append(question)
     
     return intake_schema
+
+
+def post_process_template_for_computed_fields(template_html: str, intake_schema: List[Dict]) -> str:
+    """
+    Post-process AI-generated template to replace DOB placeholders with
+    {{calculated_age}} when the corresponding field has computed_fields: ['age'].
+    
+    The AI sometimes generates "born on {{date_of_birth}}" but when the DOB field
+    is configured to auto-compute age, the template should show the computed age
+    instead (e.g., "aged {{calculated_age}} years").
+    
+    Common patterns replaced:
+      - "born on {{date_of_birth}}"  →  "aged {{calculated_age}} years"
+      - "born {{date_of_birth}}"     →  "aged {{calculated_age}} years"
+      - "date of birth {{date_of_birth}}" → "aged {{calculated_age}} years"
+    
+    Standalone {{date_of_birth}} that don't match these patterns are left as-is.
+    
+    Args:
+        template_html: The AI-generated HTML template
+        intake_schema: The processed intake schema with computed_fields
+    
+    Returns:
+        Template HTML with DOB→age substitutions applied where appropriate
+    """
+    if not template_html or not intake_schema:
+        return template_html or ''
+    
+    # Find DOB fields that have computed_fields: ['age']
+    dob_field_ids = set()
+    for q in intake_schema:
+        if 'age' in (q.get('computed_fields') or []):
+            dob_field_ids.add(q.get('id', ''))
+    
+    if not dob_field_ids:
+        return template_html
+    
+    result = template_html
+    for field_id in dob_field_ids:
+        placeholder = '{{' + field_id + '}}'
+        if placeholder not in result:
+            continue
+        
+        # Replace "born on {{field_id}}" or "born {{field_id}}" patterns
+        # These are the common AI-generated phrases we want to swap
+        import re as _re
+        patterns = [
+            # "born on {{date_of_birth}}" → "aged {{calculated_age}} years"
+            (_re.compile(r'born\s+on\s+\{\{' + _re.escape(field_id) + r'\}\}', _re.IGNORECASE),
+             'aged {{calculated_age}} years'),
+            # ", born {{date_of_birth}}" → ", aged {{calculated_age}} years"
+            (_re.compile(r'born\s+\{\{' + _re.escape(field_id) + r'\}\}', _re.IGNORECASE),
+             'aged {{calculated_age}} years'),
+            # "date of birth {{date_of_birth}}" → "aged {{calculated_age}} years"
+            (_re.compile(r'date\s+of\s+birth\s+\{\{' + _re.escape(field_id) + r'\}\}', _re.IGNORECASE),
+             'aged {{calculated_age}} years'),
+            # "date of birth: {{date_of_birth}}" → "age: {{calculated_age}} years"
+            (_re.compile(r'date\s+of\s+birth\s*:\s*\{\{' + _re.escape(field_id) + r'\}\}', _re.IGNORECASE),
+             'age: {{calculated_age}} years'),
+        ]
+        
+        for pattern, replacement in patterns:
+            result, count = pattern.subn(replacement, result)
+            if count > 0:
+                logger.info(f"[TEMPLATE_POSTPROCESS] Replaced DOB placeholder '{field_id}' with calculated_age")
+                break
+        else:
+            # No phrase pattern matched — do a standalone swap
+            # This catches {{date_of_birth}} appearing on its own
+            result = result.replace(placeholder, '{{calculated_age}}')
+            logger.info(f"[TEMPLATE_POSTPROCESS] Standalone DOB placeholder '{field_id}' → calculated_age")
+    
+    return result
 
 
 def apply_smart_validation(field_id: str, field_label: str, existing_validation: Dict, question: Dict) -> Dict:
@@ -1162,6 +1243,10 @@ def apply_smart_validation(field_id: str, field_label: str, existing_validation:
             if 'convert_to' in rules:
                 validation['_conversion_suggestion'] = rules['convert_to']
             
+            # Transfer computed_fields metadata to the question for frontend logic
+            if 'computed_fields' in rules:
+                question['computed_fields'] = rules['computed_fields']
+
             break  # Use first matching rule
     
     return validation
