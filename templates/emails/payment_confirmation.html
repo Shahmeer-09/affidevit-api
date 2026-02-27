@@ -1,0 +1,65 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Payment Confirmed - Affidavit Express{% endblock %}
+
+{% block header %}
+<div class="email-header" style="background: linear-gradient(135deg, #059669 0%, #047857 100%);">
+    <h1>💳 Payment Confirmed</h1>
+    <div class="subtitle">Your affidavit request is now being processed</div>
+</div>
+{% endblock %}
+
+{% block body %}
+<div class="greeting">Hello {{ user_name }},</div>
+
+<div class="success-box">
+    <div class="title">✅ Payment Received</div>
+    <div class="text">We've received your payment. Your affidavit request is confirmed and will now be processed.</div>
+</div>
+
+<div class="request-code">
+    <div class="label">Your Reference Code</div>
+    <div class="code">{{ request_code }}</div>
+</div>
+
+<div class="info-box">
+    <div class="label">Order Summary</div>
+    <div class="value">
+        <p style="margin: 5px 0;"><strong>Affidavit Type:</strong> {{ affidavit_type }}</p>
+        <p style="margin: 5px 0;"><strong>Amount Paid:</strong> {{ amount }}</p>
+        <p style="margin: 5px 0;"><strong>Date:</strong> {{ paid_at }}</p>
+    </div>
+</div>
+
+<h3 style="color: #1f2937; margin-top: 30px;">What Happens Next?</h3>
+
+<div class="steps">
+    <div class="step">
+        <div class="step-number">1</div>
+        <div class="step-content">Our AI system will draft your affidavit document.</div>
+    </div>
+    <div class="step">
+        <div class="step-number">2</div>
+        <div class="step-content">Your document will be reviewed for accuracy and compliance.</div>
+    </div>
+    <div class="step">
+        <div class="step-number">3</div>
+        <div class="step-content">You'll receive an email once your document is ready for commissioning.</div>
+    </div>
+    <div class="step">
+        <div class="step-number">4</div>
+        <div class="step-content">Visit a commissioner with your reference code and valid ID to get it stamped.</div>
+    </div>
+</div>
+
+<div class="warning-box">
+    <div class="title">Keep Your Reference Code Safe</div>
+    <div class="text">You'll need <strong>{{ request_code }}</strong> when visiting a commissioner. Save it somewhere you can easily find it.</div>
+</div>
+
+<div style="text-align: center; margin: 30px 0;">
+    <a href="{{ site_url }}/my-requests" class="cta-button" style="cursor:pointer;" aria-label="Track your affidavit request">Track My Request</a>
+</div>
+
+<p style="color: #4b5563; margin-top: 20px;">If you have any questions, please contact us through the support tickets on your dashboard.</p>
+{% endblock %}

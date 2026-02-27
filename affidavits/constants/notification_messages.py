@@ -10,20 +10,20 @@ Use .format(**kwargs) to inject dynamic values.
 APPOINTMENT_MESSAGES = {
     # Sent to user when slot is booked
     "BOOKED_USER": (
-        "Your appointment with {commissioner_name} has been scheduled for "
+        "Your appointment with {commissioner_name} has been REQUESTED TO scheduled for "
         "{slot_date} at {slot_time}. Request code: {request_code}. "
-        "Please arrive on time with your documents."
+        "Please wait for confirmation and arrive on time with your documents."
     ),
     # Sent to commissioner when user books a slot
     "BOOKED_COMMISSIONER": (
         "New appointment scheduled: {user_name} has booked your slot on "
         "{slot_date} at {slot_time} for affidavit type '{affidavit_type}'. "
-        "Request code: {request_code}."
+        "Request code: {request_code}. Please review and confirm the appointment."
     ),
     # Sent to user when commissioner accepts appointment
     "ACCEPTED_USER": (
         "Great news! Your appointment for request {request_code} has been "
-        "confirmed by {commissioner_name}. See you on {slot_date} at {slot_time}."
+        "confirmed by {commissioner_name}. See you on {slot_date} at {slot_time}. Make sure to bring all required documents and arrive on time."
     ),
     # Sent to user when commissioner rejects appointment
     "REJECTED_USER": (
@@ -63,8 +63,8 @@ REQUEST_STATUS_MESSAGES = {
     ),
     # Sent to user on approval
     "APPROVED_USER": (
-        "Your affidavit request {request_code} has been approved! "
-        "Please check your dashboard to view and download your document."
+        "Great news! Your affidavit {request_code} has been approved by our review team. "
+        "Please log in to your dashboard to book an appointment with a commissioner."
     ),
     # Sent to user on rejection
     "REJECTED_USER": (

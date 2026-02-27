@@ -28,7 +28,7 @@ from .views import (
     MyRequestsView, DownloadPDFView, DownloadWordView, RequestStatusView,
     DevApproveView, ClarificationResponseView, ValidateRequestInputView,
     # Commissioner
-    MarkCompleteView, FrictionReportCreateView, CommissionerStampsView,
+    MarkCompleteView, CommissionerSaveDraftView, FrictionReportCreateView, CommissionerStampsView,
     CommissionerPDFPreferencesView, CommissionerAssignedRequestsView,
     # Reviewer
     ReviewQueueView, ReviewDetailView, ApproveRequestView,
@@ -131,6 +131,7 @@ urlpatterns = [
     path('commissioner/lookup/<str:code>/', RequestByCodeView.as_view(), name='commissioner_lookup'),
     path('commissioner/takeover/<str:code>/', RequestTakeoverView.as_view(), name='commissioner_takeover'),
     path('commissioner/complete/<int:pk>/', MarkCompleteView.as_view(), name='commissioner_complete'),
+    path('commissioner/save-draft/<int:pk>/', CommissionerSaveDraftView.as_view(), name='commissioner_save_draft'),
     path('commissioner/report/', FrictionReportCreateView.as_view(), name='friction_report'),
     path('commissioner/stamps/', CommissionerStampsView.as_view(), name='commissioner_stamps'),
     path('commissioner/schedule/', CommissionerBookedSlotsView.as_view(), name='commissioner_schedule'),

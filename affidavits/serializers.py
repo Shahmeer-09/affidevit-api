@@ -1305,13 +1305,14 @@ class MarkCompleteSerializer(serializers.Serializer):
     """Serializer for marking a request as completed by commissioner."""
     
     notes = serializers.CharField(required=False, allow_blank=True)
+    final_text = serializers.CharField(required=False, allow_blank=True)
     
     def validate(self, attrs):
         request_obj = self.context.get('request_obj')
         
-        if request_obj.status != Request.Status.APPROVED:
+        if request_obj.status not in [Request.Status.APPROVED, Request.Status.DRAFT_READY]:
             raise serializers.ValidationError(
-                "Only approved requests can be marked as completed."
+                "Only approved or draft-ready requests can be marked as completed."
             )
         
         if hasattr(request_obj, 'stamp'):

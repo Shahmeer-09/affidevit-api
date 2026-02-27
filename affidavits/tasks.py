@@ -157,16 +157,19 @@ def process_request_async(self, request_id: int):
         request.clarification_question = qa_result.get('clarification_question') or ''
         
         # Determine next status based on QA result and affidavit type mode
-        is_review_first = (request.affidavit_type.default_mode == 'review_first') or not request.affidavit_type.is_instant_mode
+        # An affidavit type is "instant" if default_mode is 'instant' OR legacy is_instant_mode is True
+        # It is "review first" ONLY when default_mode is explicitly 'review_first' and NOT instant
+        is_instant = request.affidavit_type.is_instant_mode or request.affidavit_type.default_mode == 'instant'
+        is_review_first = request.affidavit_type.default_mode == 'review_first' and not is_instant
         if qa_status == 'approved':
-            if request.affidavit_type.is_instant_mode and not is_review_first:
-                request.status = Request.Status.APPROVED
-                request.final_text = request.draft_text
+            if is_instant:
+                # Instant mode: skip reviewer, go straight to DRAFT_READY for commissioner
+                request.status = Request.Status.DRAFT_READY
             elif is_review_first:
                 # Review-first mode: always send to human reviewer regardless of QA
                 request.status = Request.Status.NEEDS_REVIEW
             else:
-                # Non-instant, non-review-first: draft ready for payment then commissioner
+                # Default / intake_only: draft ready for commissioner
                 request.status = Request.Status.DRAFT_READY
         elif qa_status == 'needs_clarification':
             request.status = Request.Status.NEEDS_CLARIFICATION
@@ -534,4 +537,219 @@ def send_commissioner_approved_notification_task(self, commissioner_id, temp_pas
         return {'success': False, 'error': 'Commissioner not found'}
     except Exception as exc:
         logger.warning(f"[CELERY] Commissioner approved notification failed for {commissioner_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_completion_notification_task(self, request_id):
+    """Send affidavit completion email + SMS to user."""
+    from affidavits.models import Request
+    from affidavits.services.notification_service import send_completion_notification, send_completion_sms
+
+    try:
+        request = Request.objects.select_related('affidavit_type', 'user').get(id=request_id)
+        stamp = getattr(request, 'stamp', None)
+        result = send_completion_notification(request, stamp)
+        try:
+            send_completion_sms(request, stamp)
+        except Exception as sms_exc:
+            logger.warning(f"[CELERY] Completion SMS failed for request {request_id}: {sms_exc}")
+        if not result.get('success'):
+            raise Exception(result.get('error', 'Completion notification failed'))
+        logger.info(f"[CELERY] Completion notification sent for request {request_id}")
+        return result
+    except Request.DoesNotExist:
+        logger.error(f"[CELERY] send_completion_notification_task: Request {request_id} not found")
+        return {'success': False, 'error': 'Request not found'}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Completion notification failed for request {request_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_rejection_notification_task(self, request_id, reason=''):
+    """Send rejection email + SMS to user."""
+    from affidavits.models import Request
+    from affidavits.services.notification_service import send_request_rejected_notification
+
+    try:
+        request = Request.objects.select_related('affidavit_type', 'user').get(id=request_id)
+        result = send_request_rejected_notification(request, reason)
+        logger.info(f"[CELERY] Rejection notification sent for request {request_id}")
+        return result
+    except Request.DoesNotExist:
+        logger.error(f"[CELERY] send_rejection_notification_task: Request {request_id} not found")
+        return {'success': False, 'error': 'Request not found'}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Rejection notification failed for request {request_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_payment_confirmation_task(self, request_id):
+    """Send payment confirmation email + SMS to user."""
+    from affidavits.models import Request
+    from affidavits.services.notification_service import send_payment_confirmation
+
+    try:
+        request = Request.objects.select_related('affidavit_type', 'user').get(id=request_id)
+        result = send_payment_confirmation(request)
+        email_ok = result.get('email', {}).get('success', False)
+        sms_ok = result.get('sms', {}).get('success', False)
+        if not email_ok and not sms_ok:
+            raise Exception(f"All channels failed: {result}")
+        logger.info(f"[CELERY] Payment confirmation sent for request {request_id}")
+        return result
+    except Request.DoesNotExist:
+        logger.error(f"[CELERY] send_payment_confirmation_task: Request {request_id} not found")
+        return {'success': False, 'error': 'Request not found'}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Payment confirmation failed for request {request_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_password_reset_task(self, user_id, reset_url):
+    """Send password reset email asynchronously."""
+    from affidavits.models import User
+    from affidavits.services.notification_service import send_email_with_template
+
+    try:
+        user = User.objects.get(id=user_id)
+        result = send_email_with_template(
+            subject='Reset Your Password - Affidavit Express',
+            template_name='password_reset.html',
+            context={'user_name': user.first_name or user.username, 'reset_url': reset_url},
+            recipient_email=user.email,
+        )
+        if not result.get('success'):
+            raise Exception(result.get('error', 'Password reset email failed'))
+        logger.info(f"[CELERY] Password reset email sent to {user.email}")
+        return result
+    except User.DoesNotExist:
+        logger.error(f"[CELERY] send_password_reset_task: User {user_id} not found")
+        return {'success': False, 'error': 'User not found'}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Password reset email failed for user {user_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_ticket_created_notification_task(self, ticket_id):
+    """Send support ticket created notification to user."""
+    from affidavits.models import Ticket
+    from affidavits.services.notification_service import send_ticket_created_notification
+
+    try:
+        ticket = Ticket.objects.select_related('user').get(id=ticket_id)
+        result = send_ticket_created_notification(ticket)
+        if not result.get('success'):
+            raise Exception(result.get('error', 'Ticket created notification failed'))
+        logger.info(f"[CELERY] Ticket created notification sent for #{ticket_id}")
+        return result
+    except Ticket.DoesNotExist:
+        logger.error(f"[CELERY] send_ticket_created_notification_task: Ticket {ticket_id} not found")
+        return {'success': False, 'error': 'Ticket not found'}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Ticket created notification failed for #{ticket_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_ticket_reply_notification_task(self, ticket_id, message_id):
+    """Send support ticket reply notification to user."""
+    from affidavits.models import Ticket, TicketMessage
+    from affidavits.services.notification_service import send_ticket_reply_notification
+
+    try:
+        ticket = Ticket.objects.select_related('user').get(id=ticket_id)
+        message = TicketMessage.objects.select_related('sender').get(id=message_id)
+        result = send_ticket_reply_notification(ticket, message)
+        if not result.get('success'):
+            raise Exception(result.get('error', 'Ticket reply notification failed'))
+        logger.info(f"[CELERY] Ticket reply notification sent for #{ticket_id}")
+        return result
+    except (Ticket.DoesNotExist, TicketMessage.DoesNotExist) as e:
+        logger.error(f"[CELERY] send_ticket_reply_notification_task: Object not found: {e}")
+        return {'success': False, 'error': str(e)}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Ticket reply notification failed for #{ticket_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_appointment_booked_task(self, request_id, slot_id):
+    """Send appointment booked notifications to user and commissioner."""
+    from affidavits.models import Request, CommissionerSlot
+    from affidavits.services.notification_service import send_appointment_booked_notifications
+
+    try:
+        request = Request.objects.select_related('affidavit_type', 'user').get(id=request_id)
+        slot = CommissionerSlot.objects.select_related('commissioner').get(id=slot_id)
+        result = send_appointment_booked_notifications(request, slot)
+        logger.info(f"[CELERY] Appointment booked notifications sent for request {request_id}")
+        return result
+    except (Request.DoesNotExist, CommissionerSlot.DoesNotExist) as e:
+        logger.error(f"[CELERY] send_appointment_booked_task: Object not found: {e}")
+        return {'success': False, 'error': str(e)}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Appointment booked notifications failed for request {request_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_appointment_accepted_task(self, request_id, slot_id):
+    """Send appointment accepted notification to user."""
+    from affidavits.models import Request, CommissionerSlot
+    from affidavits.services.notification_service import send_appointment_accepted_notification
+
+    try:
+        request = Request.objects.select_related('affidavit_type', 'user').get(id=request_id)
+        slot = CommissionerSlot.objects.select_related('commissioner').get(id=slot_id)
+        result = send_appointment_accepted_notification(request, slot)
+        logger.info(f"[CELERY] Appointment accepted notification sent for request {request_id}")
+        return result
+    except (Request.DoesNotExist, CommissionerSlot.DoesNotExist) as e:
+        logger.error(f"[CELERY] send_appointment_accepted_task: Object not found: {e}")
+        return {'success': False, 'error': str(e)}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Appointment accepted notification failed for request {request_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_appointment_rejected_task(self, request_id):
+    """Send appointment rejected notification to user."""
+    from affidavits.models import Request
+    from affidavits.services.notification_service import send_appointment_rejected_notification
+
+    try:
+        request = Request.objects.select_related('affidavit_type', 'user').get(id=request_id)
+        result = send_appointment_rejected_notification(request)
+        logger.info(f"[CELERY] Appointment rejected notification sent for request {request_id}")
+        return result
+    except Request.DoesNotExist:
+        logger.error(f"[CELERY] send_appointment_rejected_task: Request {request_id} not found")
+        return {'success': False, 'error': 'Request not found'}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Appointment rejected notification failed for request {request_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=30)
+def send_appointment_cancelled_task(self, request_id):
+    """Send appointment cancelled by commissioner notification to user."""
+    from affidavits.models import Request
+    from affidavits.services.notification_service import send_appointment_cancelled_by_commissioner_notification
+
+    try:
+        request = Request.objects.select_related('affidavit_type', 'user').get(id=request_id)
+        result = send_appointment_cancelled_by_commissioner_notification(request)
+        logger.info(f"[CELERY] Appointment cancelled notification sent for request {request_id}")
+        return result
+    except Request.DoesNotExist:
+        logger.error(f"[CELERY] send_appointment_cancelled_task: Request {request_id} not found")
+        return {'success': False, 'error': 'Request not found'}
+    except Exception as exc:
+        logger.warning(f"[CELERY] Appointment cancelled notification failed for request {request_id}: {exc}")
         raise self.retry(exc=exc)

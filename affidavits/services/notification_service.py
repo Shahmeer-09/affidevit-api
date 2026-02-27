@@ -26,6 +26,30 @@ logger = logging.getLogger(__name__)
 # Site URL for links in emails
 SITE_URL = getattr(settings, 'SITE_URL', 'http://localhost:3000')
 
+# Trinidad & Tobago timezone (UTC-4)
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
+
+_TT_TZ = ZoneInfo('America/Port_of_Spain')
+
+
+def _to_tt(dt):
+    """Convert a datetime to Trinidad & Tobago timezone."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        import datetime as _dt
+        dt = dt.replace(tzinfo=ZoneInfo('UTC'))
+    return dt.astimezone(_TT_TZ)
+
+
+def _fmt_tt(dt, fmt='%B %d, %Y at %I:%M %p'):
+    """Format a datetime in Trinidad & Tobago timezone (returns '' if None)."""
+    tt = _to_tt(dt)
+    return tt.strftime(fmt) if tt else ''
+
 
 def send_email_with_template(
     subject: str,
@@ -229,7 +253,7 @@ def send_approval_notification(request_obj) -> dict:
         'request_code': request_obj.request_code,
         'request_id': request_obj.id,
         'affidavit_type': request_obj.affidavit_type.name,
-        'approved_at': request_obj.approved_at.strftime('%B %d, %Y at %I:%M %p') if request_obj.approved_at else '',
+        'approved_at': _fmt_tt(request_obj.approved_at),
     }
     
     result = send_email_with_template(
@@ -302,11 +326,11 @@ def send_completion_notification(request_obj, stamp=None) -> dict:
     commissioner_name = ''
     
     if stamp:
-        completed_at = stamp.stamped_at.strftime('%B %d, %Y at %I:%M %p') if stamp.stamped_at else ''
+        completed_at = _fmt_tt(stamp.stamped_at)
         if stamp.commissioner:
             commissioner_name = stamp.commissioner.get_full_name() or stamp.commissioner.username
     elif request_obj.completed_at:
-        completed_at = request_obj.completed_at.strftime('%B %d, %Y at %I:%M %p')
+        completed_at = _fmt_tt(request_obj.completed_at)
     
     context = {
         'user_name': user.get_full_name() or user.username,
@@ -350,7 +374,7 @@ def send_submission_notification(request_obj) -> dict:
         'request_code': request_obj.request_code,
         'request_id': request_obj.id,
         'affidavit_type': request_obj.affidavit_type.name,
-        'submitted_at': request_obj.submitted_at.strftime('%B %d, %Y at %I:%M %p') if request_obj.submitted_at else '',
+        'submitted_at': _fmt_tt(request_obj.submitted_at),
     }
     
     # Use a simple message for submission confirmation
@@ -617,9 +641,9 @@ def send_appointment_booked_notifications(request_obj, slot_obj) -> dict:
     user = request_obj.user
     commissioner = slot_obj.commissioner
     
-    # Format slot datetime
-    slot_date = slot_obj.start_time.strftime('%B %d, %Y')
-    slot_time = slot_obj.start_time.strftime('%I:%M %p')
+    # Format slot datetime in Trinidad & Tobago timezone
+    slot_date = _fmt_tt(slot_obj.start_time, '%B %d, %Y')
+    slot_time = _fmt_tt(slot_obj.start_time, '%I:%M %p')
     
     # Notify user
     if user.phone_number:
@@ -769,8 +793,8 @@ def send_appointment_accepted_notification(request_obj, slot_obj) -> dict:
     user = request_obj.user
     commissioner = slot_obj.commissioner
     
-    slot_date = slot_obj.start_time.strftime('%B %d, %Y')
-    slot_time = slot_obj.start_time.strftime('%I:%M %p')
+    slot_date = _fmt_tt(slot_obj.start_time, '%B %d, %Y')
+    slot_time = _fmt_tt(slot_obj.start_time, '%I:%M %p')
     
     if not user.phone_number:
         return {'success': False, 'error': 'User has no phone number'}
@@ -838,8 +862,8 @@ def send_user_withdrawn_notification(request_obj, slot_obj, commissioner) -> dic
     if not commissioner.phone_number:
         return {'success': False, 'error': 'Commissioner has no phone number'}
     
-    slot_date = slot_obj.start_time.strftime('%B %d, %Y') if slot_obj else 'N/A'
-    slot_time = slot_obj.start_time.strftime('%I:%M %p') if slot_obj else 'N/A'
+    slot_date = _fmt_tt(slot_obj.start_time, '%B %d, %Y') if slot_obj else 'N/A'
+    slot_time = _fmt_tt(slot_obj.start_time, '%I:%M %p') if slot_obj else 'N/A'
     
     message = APPOINTMENT_MESSAGES["WITHDRAWN_COMMISSIONER"].format(
         user_name=user.get_full_name() or user.username,
@@ -875,23 +899,44 @@ def send_request_approved_sms(request_obj) -> dict:
 
 def send_request_rejected_notification(request_obj, reason: str) -> dict:
     """
-    Send notification to user when request is rejected.
+    Send rejection email + SMS to user when request is rejected by reviewer.
     """
     from .twilio_service import TwilioService
-    
+
     user = request_obj.user
-    
-    if not user.phone_number:
-        return {'success': False, 'error': 'User has no phone number'}
-    
-    message = REQUEST_STATUS_MESSAGES["REJECTED_USER"].format(
-        request_code=request_obj.request_code,
-        rejection_reason=reason[:100] if reason else 'Not specified'
-    )
-    
-    result = TwilioService.send_notification_message(user.phone_number, message)
-    logger.info(f"Sent rejection notification to user {user.username}")
-    return result
+    results = {'email': None, 'sms': None}
+
+    # Email
+    if user.email:
+        context = {
+            'user_name': user.get_full_name() or user.username,
+            'request_code': request_obj.request_code,
+            'affidavit_type': request_obj.affidavit_type.name,
+            'reason': reason or '',
+        }
+        email_result = send_email_with_template(
+            subject=f"Update on Your Affidavit Request — {request_obj.request_code}",
+            template_name='request_rejected.html',
+            context=context,
+            recipient_email=user.email,
+        )
+        results['email'] = email_result
+        if email_result['success']:
+            logger.info(f"Sent rejection email for {request_obj.request_code}")
+        else:
+            logger.error(f"Failed to send rejection email: {email_result.get('error')}")
+
+    # SMS
+    if user.phone_number:
+        message = REQUEST_STATUS_MESSAGES["REJECTED_USER"].format(
+            request_code=request_obj.request_code,
+            rejection_reason=reason[:100] if reason else 'Not specified',
+        )
+        sms_result = TwilioService.send_notification_message(user.phone_number, message)
+        results['sms'] = sms_result
+        logger.info(f"Sent rejection SMS to user {user.username}")
+
+    return results
 
 
 def send_commissioner_payout_added_message(commissioner, amount, request_code) -> str:
@@ -904,6 +949,61 @@ def send_commissioner_payout_added_message(commissioner, amount, request_code) -
         request_code=request_code
     )
     return message
+
+
+def send_payment_confirmation(request_obj) -> dict:
+    """
+    Send payment confirmation email + SMS to user after successful payment.
+
+    Args:
+        request_obj: Request model instance (with is_paid=True)
+
+    Returns:
+        dict: {'email': result, 'sms': result}
+    """
+    from .twilio_service import TwilioService
+
+    user = request_obj.user
+    results = {'email': None, 'sms': None}
+
+    paid_at = _fmt_tt(request_obj.user_paid_at)
+
+    # Email
+    if user.email:
+        context = {
+            'user_name': user.get_full_name() or user.username,
+            'request_code': request_obj.request_code,
+            'affidavit_type': request_obj.affidavit_type.name,
+            'amount': 'TTD $50.00',
+            'paid_at': paid_at,
+        }
+        email_result = send_email_with_template(
+            subject=f"Payment Confirmed — {request_obj.request_code} | Affidavit Express",
+            template_name='payment_confirmation.html',
+            context=context,
+            recipient_email=user.email,
+        )
+        results['email'] = email_result
+        if email_result['success']:
+            logger.info(f"Sent payment confirmation email for {request_obj.request_code}")
+        else:
+            logger.error(f"Failed to send payment confirmation email: {email_result.get('error')}")
+
+    # SMS
+    if user.phone_number:
+        sms_message = (
+            f"Payment confirmed for request {request_obj.request_code} "
+            f"({request_obj.affidavit_type.name}). "
+            f"We're processing your document. Track at {SITE_URL}/my-requests"
+        )
+        sms_result = TwilioService.send_notification_message(user.phone_number, sms_message)
+        results['sms'] = sms_result
+        if sms_result.get('success'):
+            logger.info(f"Sent payment confirmation SMS for {request_obj.request_code}")
+        else:
+            logger.warning(f"Failed to send payment confirmation SMS: {sms_result.get('error')}")
+
+    return results
 
 
 def send_request_in_review_notification(request_obj) -> dict:

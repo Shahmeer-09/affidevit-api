@@ -2275,13 +2275,13 @@ def process_request(request_obj) -> dict:
         request_obj.qa_flags_json = []
         request_obj.qa_passed = True
     
-    # All requests go to human review (no QA flagging - reviewer reads completely)
-    if request_obj.affidavit_type.is_instant_mode:
-        # Instant mode: auto-approve
-        request_obj.status = Request.Status.APPROVED
-        request_obj.final_text = request_obj.draft_text
+    # Determine routing based on affidavit type mode
+    is_instant = request_obj.affidavit_type.is_instant_mode or request_obj.affidavit_type.default_mode == 'instant'
+    if is_instant:
+        # Instant mode: skip reviewer, mark as DRAFT_READY for commissioner
+        request_obj.status = Request.Status.DRAFT_READY
     else:
-        # Normal mode: needs human review
+        # Normal / review-first mode: needs human review
         request_obj.status = Request.Status.NEEDS_REVIEW
     
     request_obj.save()

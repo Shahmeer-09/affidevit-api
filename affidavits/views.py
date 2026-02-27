@@ -56,17 +56,7 @@ from .authentication import (
 from .services import process_request, generate_affidavit_pdf
 from .services.ai_service import validate_inputs_before_submission, translate_to_english, draft_affidavit, refine_template_section, refine_user_instruction
 from .services.notification_service import (
-    send_approval_notification, 
-    send_clarification_notification,
-    send_completion_notification,
-    send_ticket_created_notification,
-    send_ticket_reply_notification,
-    send_completion_sms,
-)
-from .tasks import (
-    send_otp_email_task,
-    send_user_welcome_notification_task,
-    send_commissioner_approved_notification_task,
+    send_ticket_reply_notification,  # still used directly for status-change path
 )
 from .services.twilio_service import TwilioService
 from .services.dashboard_service import (
@@ -77,7 +67,20 @@ from .services.dashboard_service import (
 from .tasks import (
     process_request_async,
     generate_pdf_async,
-    send_notification_async
+    send_notification_async,
+    send_otp_email_task,
+    send_user_welcome_notification_task,
+    send_commissioner_approved_notification_task,
+    send_completion_notification_task,
+    send_rejection_notification_task,
+    send_payment_confirmation_task,
+    send_password_reset_task,
+    send_ticket_created_notification_task,
+    send_ticket_reply_notification_task,
+    send_appointment_booked_task,
+    send_appointment_accepted_task,
+    send_appointment_rejected_task,
+    send_appointment_cancelled_task,
 )
 
 
@@ -744,25 +747,8 @@ class PasswordResetRequestView(APIView):
             # Send email using HTML template
             subject = 'Reset Your Password - Affidavit Express'
             
-            html_message = render_to_string('emails/password_reset.html', {
-                'user_name': user.first_name or user.username,
-                'reset_url': reset_url,
-            })
-            
-            try:
-                send_mail(
-                    subject,
-                    '',  # Plain text message (empty since we're using html_message)
-                    settings.DEFAULT_FROM_EMAIL,
-                    [user.email],
-                    fail_silently=False,
-                    html_message=html_message,
-                )
-            except Exception as e:
-                # Log the error but don't expose it
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.error(f"Failed to send password reset email: {e}")
+            # Send password reset email (async via Celery with retries)
+            send_password_reset_task.delay(user.id, reset_url)
         
         except User.DoesNotExist:
             # Don't reveal that the user doesn't exist
@@ -1111,9 +1097,22 @@ class RequestSubmitView(APIView):
                 status=status.HTTP_402_PAYMENT_REQUIRED
             )
         
-        # Handle submission from DRAFT_READY -> NEEDS_REVIEW (after appointment booked)
-        # OR if draft already exists (prevent regeneration)
-        if request_obj.status == Request.Status.DRAFT_READY or (request_obj.draft_text and len(request_obj.draft_text) > 50):
+        # If request is DRAFT_READY and the affidavit type requires review, submit for review.
+        # Instant types stay at DRAFT_READY — user proceeds to book commissioner directly.
+        affidavit_type = request_obj.affidavit_type
+        is_instant = affidavit_type.is_instant_mode or affidavit_type.default_mode == 'instant'
+
+        if request_obj.status == Request.Status.DRAFT_READY and is_instant:
+            # Instant type is already DRAFT_READY — nothing to do, user can book commissioner
+            return Response({
+                'status': request_obj.status,
+                'request_code': request_obj.request_code,
+                'message': 'Your affidavit is ready! You can now book a commissioner appointment.'
+            })
+
+        if request_obj.status == Request.Status.DRAFT_READY or (
+            not is_instant and request_obj.draft_text and len(request_obj.draft_text) > 50
+        ):
             request_obj.status = Request.Status.NEEDS_REVIEW
             request_obj.submitted_at = timezone.now() # Update timestamp or keep original? Keeping update to show recent activity
             request_obj.save()
@@ -1356,9 +1355,13 @@ class MarkPaidView(APIView):
             details={'action': 'payment_completed', 'amount': '50.00', 'currency': 'TTD'}
         )
         
+        # Send payment confirmation email + SMS (async via Celery)
+        send_payment_confirmation_task.delay(request_obj.id)
+
         # Check affidavit type mode for post-payment routing
         affidavit_type = request_obj.affidavit_type
-        is_review_mode = (affidavit_type.default_mode == 'review_first') or not affidavit_type.is_instant_mode
+        is_instant = affidavit_type.is_instant_mode or affidavit_type.default_mode == 'instant'
+        is_review_mode = affidavit_type.default_mode == 'review_first' and not is_instant
 
         # Determine if this is the user's very first paid request.
         # First-time users always see the Thank You page and click the button to trigger AI.
@@ -1867,21 +1870,19 @@ class MarkCompleteView(APIView):
             notes=serializer.validated_data.get('notes', '')
         )
         
+        # Save commissioner's final edits to the draft text if provided
+        final_text = serializer.validated_data.get('final_text', '')
+        if final_text and final_text.strip():
+            request_obj.draft_text = final_text
+
         # Update request status
         request_obj.status = Request.Status.COMPLETED
         request_obj.completed_at = timezone.now()
         request_obj.release_lock()
         request_obj.save()
         
-        # Send completion notification to user (email + SMS)
-        send_completion_notification(request_obj, stamp)
-        try:
-            send_completion_sms(request_obj, stamp)
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(
-                f"Could not send completion SMS: {e}"
-            )
+        # Send completion notification to user (async via Celery)
+        send_completion_notification_task.delay(request_obj.id)
 
         # Generate payout message for commissioner
         from .services.notification_service import send_commissioner_payout_added_message
@@ -1894,6 +1895,47 @@ class MarkCompleteView(APIView):
             'message': 'Request marked as completed',
             'stamp': StampSerializer(stamp).data,
             'payout_message': payout_message
+        })
+
+
+class CommissionerSaveDraftView(APIView):
+    """
+    Save commissioner's edits to the affidavit draft_text without completing.
+    Allows commissioners to save work-in-progress edits.
+    """
+
+    permission_classes = [IsCommissioner]
+
+    def patch(self, request, pk):
+        request_obj = get_object_or_404(Request, pk=pk)
+
+        # Only the assigned commissioner can save edits
+        if request_obj.commissioner and request_obj.commissioner.id != request.user.id:
+            return Response(
+                {'error': 'This request is assigned to another commissioner.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        # Only allow saving on active requests (not completed)
+        if request_obj.status not in [Request.Status.APPROVED, Request.Status.DRAFT_READY]:
+            return Response(
+                {'error': 'Edits can only be saved on approved or draft-ready requests.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        draft_text = request.data.get('draft_text', '')
+        if not draft_text or not draft_text.strip():
+            return Response(
+                {'error': 'draft_text is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        request_obj.draft_text = draft_text
+        request_obj.save(update_fields=['draft_text'])
+
+        return Response({
+            'success': True,
+            'message': 'Draft saved successfully.',
         })
 
 
@@ -2150,12 +2192,8 @@ class RejectRequestView(APIView):
             }
         )
         
-        # Send rejection notification to user
-        from .services.notification_service import send_request_rejected_notification
-        try:
-            send_request_rejected_notification(request_obj, reason)
-        except Exception as e:
-            logger.warning(f"Failed to send rejection notification: {e}")
+        # Send rejection notification to user (async via Celery)
+        send_rejection_notification_task.delay(request_obj.id, reason)
         
         return Response({
             'success': True,
@@ -3375,7 +3413,8 @@ class PromoteToInstantModeView(APIView):
     def post(self, request, pk):
         aff_type = get_object_or_404(AffidavitType, pk=pk)
         aff_type.is_instant_mode = True
-        aff_type.save()
+        aff_type.default_mode = AffidavitType.DefaultMode.INSTANT
+        aff_type.save(update_fields=['is_instant_mode', 'default_mode'])
         
         return Response({
             'success': True,
@@ -4101,9 +4140,16 @@ class BookSlotView(APIView):
         # Assign commissioner to request
         request_obj.commissioner = slot.commissioner
         
-        # Update status to NEEDS_REVIEW if it was DRAFT_READY
+        # For non-instant types, move DRAFT_READY → NEEDS_REVIEW so a reviewer sees it.
+        # Instant types stay DRAFT_READY — they skip review and go straight to commissioner.
         if request_obj.status == Request.Status.DRAFT_READY:
-            request_obj.status = Request.Status.NEEDS_REVIEW
+            affidavit_type = request_obj.affidavit_type
+            is_instant = (
+                getattr(affidavit_type, 'is_instant_mode', False)
+                or getattr(affidavit_type, 'default_mode', '') == 'instant'
+            )
+            if not is_instant:
+                request_obj.status = Request.Status.NEEDS_REVIEW
             
         request_obj.save()
         
@@ -4121,12 +4167,8 @@ class BookSlotView(APIView):
             }
         )
         
-        # Send notifications to user and commissioner
-        from .services.notification_service import send_appointment_booked_notifications
-        try:
-            send_appointment_booked_notifications(request_obj, slot)
-        except Exception as e:
-            logger.warning(f"Failed to send appointment booked notifications: {e}")
+        # Send appointment booked notifications (async via Celery)
+        send_appointment_booked_task.delay(request_obj.id, slot.id)
         
         return Response({
             'success': True,
@@ -4188,12 +4230,8 @@ class CommissionerAcceptSlotView(APIView):
                 }
             )
             
-            # Send notification to user
-            from .services.notification_service import send_appointment_accepted_notification
-            try:
-                send_appointment_accepted_notification(slot.request, slot)
-            except Exception as e:
-                logger.warning(f"Failed to send appointment accepted notification: {e}")
+            # Send appointment accepted notification (async via Celery)
+            send_appointment_accepted_task.delay(slot.request.id, slot.id)
         
         return Response({
             'success': True,
@@ -4254,12 +4292,8 @@ class CommissionerRejectSlotView(APIView):
                 }
             )
             
-            # Send notification to user
-            from .services.notification_service import send_appointment_rejected_notification
-            try:
-                send_appointment_rejected_notification(request_obj)
-            except Exception as e:
-                logger.warning(f"Failed to send appointment rejected notification: {e}")
+            # Send appointment rejected notification (async via Celery)
+            send_appointment_rejected_task.delay(request_obj.id)
         
         return Response({
             'success': True,
@@ -4319,12 +4353,8 @@ class CommissionerCancelSlotView(APIView):
                 }
             )
             
-            # Send notification to user
-            from .services.notification_service import send_appointment_cancelled_by_commissioner_notification
-            try:
-                send_appointment_cancelled_by_commissioner_notification(request_obj)
-            except Exception as e:
-                logger.warning(f"Failed to send appointment cancelled notification: {e}")
+            # Send appointment cancelled notification (async via Celery)
+            send_appointment_cancelled_task.delay(request_obj.id)
         
         return Response({
             'success': True,
@@ -5306,14 +5336,10 @@ class TicketViewSet(viewsets.ModelViewSet):
         for file in files:
             TicketAttachment.objects.create(ticket=ticket, file=file)
             
-        # Send notification and mark email sent time
-        try:
-            send_ticket_created_notification(ticket)
-            ticket.last_email_sent_at = timezone.now()
-            ticket.save(update_fields=['last_email_sent_at'])
-        except Exception as e:
-            # Log error but don't fail the request
-            print(f"Failed to send ticket notification: {e}")
+        # Send ticket created notification (async via Celery)
+        ticket.last_email_sent_at = timezone.now()
+        ticket.save(update_fields=['last_email_sent_at'])
+        send_ticket_created_notification_task.delay(ticket.id)
             
     @action(detail=True, methods=['post'])
     def reply(self, request, pk=None):
@@ -5351,12 +5377,10 @@ class TicketViewSet(viewsets.ModelViewSet):
                     should_send_email = True
             
             if should_send_email:
-                try:
-                    send_ticket_reply_notification(ticket, message)
-                    ticket.last_email_sent_at = timezone.now()
-                    ticket.save(update_fields=['last_email_sent_at'])
-                except Exception as e:
-                    print(f"Failed to send ticket reply notification: {e}")
+                # Send ticket reply notification (async via Celery)
+                ticket.last_email_sent_at = timezone.now()
+                ticket.save(update_fields=['last_email_sent_at'])
+                send_ticket_reply_notification_task.delay(ticket.id, message.id)
         
         return Response(TicketMessageSerializer(message).data, status=status.HTTP_201_CREATED)
         

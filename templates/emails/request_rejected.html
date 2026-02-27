@@ -1,0 +1,61 @@
+{% extends "emails/base_email.html" %}
+
+{% block title %}Request Update - Affidavit Express{% endblock %}
+
+{% block header %}
+<div class="email-header" style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);">
+    <h1>Request Update</h1>
+    <div class="subtitle">Action required on your affidavit request</div>
+</div>
+{% endblock %}
+
+{% block body %}
+<div class="greeting">Hello {{ user_name }},</div>
+
+<div class="content">
+    <p>We've reviewed your affidavit request and unfortunately it could not be approved at this time.</p>
+</div>
+
+<div class="request-code">
+    <div class="label">Your Reference Code</div>
+    <div class="code">{{ request_code }}</div>
+</div>
+
+<div class="info-box">
+    <div class="label">Request Details</div>
+    <div class="value">
+        <p style="margin: 5px 0;"><strong>Affidavit Type:</strong> {{ affidavit_type }}</p>
+        <p style="margin: 5px 0;"><strong>Status:</strong> <span style="color: #dc2626; font-weight: 600;">Needs Revision</span></p>
+    </div>
+</div>
+
+{% if reason %}
+<div class="warning-box">
+    <div class="title">Reason for Revision</div>
+    <div class="text">{{ reason }}</div>
+</div>
+{% endif %}
+
+<h3 style="color: #1f2937; margin-top: 30px;">What You Can Do</h3>
+
+<div class="steps">
+    <div class="step">
+        <div class="step-number">1</div>
+        <div class="step-content">Log in to your account and review the feedback above.</div>
+    </div>
+    <div class="step">
+        <div class="step-number">2</div>
+        <div class="step-content">Update your information or document details as requested.</div>
+    </div>
+    <div class="step">
+        <div class="step-number">3</div>
+        <div class="step-content">Resubmit your request — it will be reviewed again promptly.</div>
+    </div>
+</div>
+
+<div style="text-align: center; margin: 30px 0;">
+    <a href="{{ site_url }}/my-requests" class="cta-button" style="cursor:pointer;" aria-label="View your affidavit request">View My Request</a>
+</div>
+
+<p style="color: #4b5563;">If you believe this decision was made in error, or you need clarification, please open a support ticket from your dashboard and our team will assist you promptly.</p>
+{% endblock %}
