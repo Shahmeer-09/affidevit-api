@@ -284,6 +284,12 @@ class User(AbstractUser):
     #   "custom_footer": "Custom footer text"
     # }
     
+    # Commissioner preference: automatically accept new appointment bookings
+    auto_accept_appointments = models.BooleanField(
+        default=False,
+        help_text="When True, new slot bookings are automatically accepted without manual review"
+    )
+
     # Commissioner availability schedule
     availability = models.JSONField(
         default=dict,
@@ -1144,6 +1150,16 @@ class ReviewerFeedback(models.Model):
     times_seen = models.PositiveIntegerField(
         default=0,
         help_text='How many times this feedback has been injected into prompts'
+    )
+    answer_fingerprint = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text='Selector-field answers snapshot for contextual matching (e.g. {"purpose": "sale", "parish": "St. George"})'
+    )
+    scenario_tags = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Scenario tags detected from the request answers at feedback creation time'
     )
     created_at = models.DateTimeField(auto_now_add=True)
 

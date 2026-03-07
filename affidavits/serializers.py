@@ -57,6 +57,8 @@ class UserSerializer(serializers.ModelSerializer):
             'bank_account_name', 'payment_preference',
             # PDF Preferences
             'pdf_preferences',
+            # Appointment preferences
+            'auto_accept_appointments',
         ]
         read_only_fields = ['id', 'role', 'profile_image_url']
     
@@ -1449,9 +1451,16 @@ class ReviewerFeedbackCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         reviewer = self.context['request'].user
         request_obj = validated_data['request']
+
+        # Compute contextual fingerprint + scenario tags
+        from .services.feedback_service import build_answer_fingerprint, _compute_fingerprint_and_tags
+        fingerprint, tags = _compute_fingerprint_and_tags(request_obj)
+
         return ReviewerFeedback.objects.create(
             reviewer=reviewer,
             affidavit_type=request_obj.affidavit_type,
+            answer_fingerprint=fingerprint,
+            scenario_tags=tags,
             **validated_data
         )
 

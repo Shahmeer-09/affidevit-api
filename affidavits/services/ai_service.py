@@ -690,7 +690,11 @@ Generate the complete affidavit HTML:
         if affidavit_type_id:
             try:
                 from .feedback_service import get_drafter_feedback
-                feedback_section = get_drafter_feedback(affidavit_type_id)
+                feedback_section = get_drafter_feedback(
+                    affidavit_type_id,
+                    answers_json=answers_json,
+                    scenario_tags=scenario_tags,
+                )
                 if feedback_section:
                     user_prompt += feedback_section
                     logger.info(f"[DRAFT_AFFIDAVIT] Injected {len(feedback_section)} chars of reviewer feedback")

@@ -3,11 +3,17 @@ Feedback Service — Learning Loop
 Retrieves and manages reviewer feedback for injection into AI prompts.
 Supports both manual feedback notes and auto-detected edit diffs.
 Auto-detected pairs get an AI-generated summary distilled as a one-liner lesson.
+
+Per-request contextual matching:
+  - build_answer_fingerprint() snapshots selector-field values from answers_json
+  - score_feedback_relevance() uses Jaccard + exact-match to score similarity
+  - get_drafter_feedback() splits results into HIGH-PRIORITY (similar requests)
+    and GENERAL (type-level corrections) for two-tier prompt injection.
 """
 import re
 import difflib
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from django.conf import settings
 from django.db.models import F
@@ -18,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 MAX_FEEDBACK_PER_PROMPT = 10
 SNIPPET_MAX_LEN = 400  # chars per snippet in prompt
+
+# Relevance score threshold — feedback scoring above this is "similar"
+SIMILAR_THRESHOLD = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +86,23 @@ def extract_sentence_diffs(
 # Save helpers
 # ---------------------------------------------------------------------------
 
+def _compute_fingerprint_and_tags(request_obj) -> Tuple[dict, list]:
+    """Compute answer_fingerprint and scenario_tags for a request."""
+    fingerprint = build_answer_fingerprint(request_obj)
+    tags = []
+    try:
+        from .ai_service import detect_scenario
+        lib = []
+        if request_obj.affidavit_type:
+            policy = request_obj.affidavit_type.policy_json or {}
+            lib = policy.get('scenario_library', [])
+        if lib and request_obj.answers_json:
+            tags, _ = detect_scenario(request_obj.answers_json, lib)
+    except Exception as exc:
+        logger.warning(f'[FEEDBACK] Could not detect scenarios: {exc}')
+    return fingerprint, tags
+
+
 def save_feedback(
     request_obj,
     reviewer,
@@ -84,7 +110,8 @@ def save_feedback(
     message: str,
     feedback_target: str = 'drafter',
 ) -> ReviewerFeedback:
-    """Create a manual feedback note entry."""
+    """Create a manual feedback note entry with contextual fingerprint."""
+    fingerprint, tags = _compute_fingerprint_and_tags(request_obj)
     return ReviewerFeedback.objects.create(
         request=request_obj,
         reviewer=reviewer,
@@ -92,6 +119,8 @@ def save_feedback(
         category=category,
         message=message,
         feedback_target=feedback_target,
+        answer_fingerprint=fingerprint,
+        scenario_tags=tags,
     )
 
 
@@ -176,7 +205,9 @@ def save_auto_feedback_pairs(
     Each pair: { original_snippet, revised_snippet, feedback_target }
     Skip entries where feedback_target == 'skip'.
     Attempts to generate an AI summary for each saved pair.
+    Automatically computes answer_fingerprint and scenario_tags from the request.
     """
+    fingerprint, tags = _compute_fingerprint_and_tags(request_obj)
     created = []
     for pair in pairs:
         target = pair.get('feedback_target', 'drafter')
@@ -199,6 +230,8 @@ def save_auto_feedback_pairs(
             revised_snippet=rev[:600],
             summary=summary,
             feedback_target=target,
+            answer_fingerprint=fingerprint,
+            scenario_tags=tags,
         )
         created.append(fb)
         logger.info(
@@ -206,6 +239,88 @@ def save_auto_feedback_pairs(
             f'target={target} has_summary={bool(summary)}'
         )
     return created
+
+
+# ---------------------------------------------------------------------------
+# Answer Fingerprint & Relevance Scoring
+# ---------------------------------------------------------------------------
+
+# Field types that act as "selectors" — their finite-choice values define
+# request similarity.  Free-text fields are excluded to avoid noise.
+_SELECTOR_TYPES = {'select', 'radio', 'checkbox', 'dropdown', 'toggle', 'boolean'}
+
+
+def build_answer_fingerprint(request_obj) -> Dict[str, object]:
+    """
+    Extract selector-field values from a request's answers_json.
+
+    Only keeps fields whose intake_schema type is a selector type (select,
+    radio, checkbox, etc.) — free-text inputs are too noisy for matching.
+    Returns a dict like {"purpose": "sale", "parish": "St. George"}.
+    """
+    answers = request_obj.answers_json or {}
+    if not answers:
+        return {}
+
+    intake_schema = []
+    if request_obj.affidavit_type:
+        intake_schema = request_obj.affidavit_type.intake_schema or []
+
+    if not intake_schema:
+        # No schema → can't determine selector fields, return empty
+        return {}
+
+    selector_ids = set()
+    for field in intake_schema:
+        ftype = (field.get('type') or '').lower()
+        fid = field.get('id') or field.get('field_name', '')
+        if ftype in _SELECTOR_TYPES and fid:
+            selector_ids.add(fid)
+
+    fingerprint = {}
+    for key, value in answers.items():
+        if key in selector_ids and value not in (None, '', [], {}):
+            fingerprint[key] = value
+
+    return fingerprint
+
+
+def score_feedback_relevance(
+    feedback_fp: Dict[str, object],
+    current_fp: Dict[str, object],
+    feedback_tags: List[str],
+    current_tags: List[str],
+) -> float:
+    """
+    Score how relevant a saved feedback record is to the current request.
+
+    Uses a weighted blend of:
+      - Jaccard similarity on fingerprint keys+values  (weight 0.6)
+      - Exact-match ratio on scenario tags              (weight 0.4)
+
+    Returns a float between 0.0 (no overlap) and 1.0 (identical).
+    """
+    fp_score = 0.0
+    tag_score = 0.0
+
+    # --- Fingerprint Jaccard ---
+    if feedback_fp and current_fp:
+        all_keys = set(feedback_fp.keys()) | set(current_fp.keys())
+        if all_keys:
+            matching = sum(
+                1 for k in all_keys
+                if str(feedback_fp.get(k, '')).lower() == str(current_fp.get(k, '')).lower()
+            )
+            fp_score = matching / len(all_keys)
+
+    # --- Scenario tag overlap ---
+    fb_set = set(feedback_tags) if feedback_tags else set()
+    cur_set = set(current_tags) if current_tags else set()
+    union = fb_set | cur_set
+    if union:
+        tag_score = len(fb_set & cur_set) / len(union)
+
+    return round(0.6 * fp_score + 0.4 * tag_score, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -226,10 +341,21 @@ def _format_entry(fb: ReviewerFeedback) -> str:
     return ''
 
 
-def get_drafter_feedback(affidavit_type_id: int, limit: int = MAX_FEEDBACK_PER_PROMPT) -> str:
+def get_drafter_feedback(
+    affidavit_type_id: int,
+    answers_json: dict = None,
+    scenario_tags: list = None,
+    limit: int = MAX_FEEDBACK_PER_PROMPT,
+) -> str:
     """
     Build a prompt section from active reviewer feedback targeted at the AI drafter.
-    Includes both auto-detected diffs and manual notes.
+
+    When answers_json / scenario_tags are provided, feedback is scored by
+    contextual relevance and split into two tiers:
+      1. HIGH-PRIORITY — corrections from similar past requests
+      2. GENERAL — type-level corrections (still useful, lower weight)
+
+    Falls back to simple recency ordering when no context is available.
     Returns empty string if no feedback exists.
     """
     entries = list(
@@ -239,28 +365,84 @@ def get_drafter_feedback(affidavit_type_id: int, limit: int = MAX_FEEDBACK_PER_P
             is_active=True,
             feedback_target__in=['drafter', 'both'],
         )
-        .order_by('-created_at')[:limit]
+        .order_by('-created_at')[:limit * 3]  # fetch extra to score & re-rank
     )
 
     if not entries:
         return ''
 
-    lines = [_format_entry(fb) for fb in entries]
-    lines = [l for l in lines if l]
+    # --- Contextual scoring (when caller provides request context) ---
+    has_context = bool(answers_json) or bool(scenario_tags)
+    similar: List[Tuple[float, ReviewerFeedback]] = []
+    general: List[ReviewerFeedback] = []
 
-    if not lines:
+    if has_context:
+        # Build a fingerprint from the *current* request's answers
+        # (We don't have the request object here, so build inline from answers + schema.)
+        # The caller passes the raw answers_json; the fingerprint on existing feedback
+        # was built at save-time from the same schema.
+        current_fp = {}
+        if answers_json:
+            # Build a minimal fingerprint from answers_json — all keys present.
+            # The saved fingerprint only has selector keys, so non-selector keys
+            # simply won't match, which is fine.
+            current_fp = {k: v for k, v in answers_json.items() if v not in (None, '', [], {})}
+        current_tags = scenario_tags or []
+
+        for fb in entries:
+            score = score_feedback_relevance(
+                feedback_fp=fb.answer_fingerprint or {},
+                current_fp=current_fp,
+                feedback_tags=fb.scenario_tags or [],
+                current_tags=current_tags,
+            )
+            if score >= SIMILAR_THRESHOLD:
+                similar.append((score, fb))
+            else:
+                general.append(fb)
+
+        # Sort similar by score desc, take top entries
+        similar.sort(key=lambda x: x[0], reverse=True)
+    else:
+        # No context — everything goes into general (backwards-compatible)
+        general = entries
+
+    # Build formatted lines for each tier
+    similar_lines = [_format_entry(fb) for _, fb in similar[:limit]]
+    similar_lines = [l for l in similar_lines if l]
+
+    remaining_slots = max(0, limit - len(similar_lines))
+    general_lines = [_format_entry(fb) for fb in general[:remaining_slots]]
+    general_lines = [l for l in general_lines if l]
+
+    if not similar_lines and not general_lines:
         return ''
 
-    entry_ids = [fb.id for fb in entries]
-    ReviewerFeedback.objects.filter(id__in=entry_ids).update(times_seen=F('times_seen') + 1)
+    # Track times_seen for all used entries
+    used_ids = [fb.id for _, fb in similar[:limit]] + [fb.id for fb in general[:remaining_slots]]
+    if used_ids:
+        ReviewerFeedback.objects.filter(id__in=used_ids).update(times_seen=F('times_seen') + 1)
 
-    return (
-        '\n\n**REVIEWER FEEDBACK (IMPORTANT — learn from past corrections):**\n'
-        'The following are real corrections made by human reviewers on previous drafts '
-        'of this affidavit type. Apply these lessons to avoid the same mistakes:\n'
-        + '\n'.join(lines)
-        + '\n'
-    )
+    # Build the prompt section
+    parts = []
+
+    if similar_lines:
+        parts.append(
+            '\n\n**REVIEWER FEEDBACK — SIMILAR PAST REQUESTS (HIGH PRIORITY):**\n'
+            'These corrections come from requests very similar to the current one. '
+            'Apply these lessons with high confidence:\n'
+            + '\n'.join(similar_lines)
+        )
+
+    if general_lines:
+        parts.append(
+            '\n\n**REVIEWER FEEDBACK — GENERAL TYPE CORRECTIONS:**\n'
+            'The following are general corrections made by human reviewers on previous drafts '
+            'of this affidavit type. Apply these lessons to avoid the same mistakes:\n'
+            + '\n'.join(general_lines)
+        )
+
+    return ''.join(parts) + '\n'
 
 
 def get_policy_feedback(affidavit_type_id: int, limit: int = MAX_FEEDBACK_PER_PROMPT) -> str:

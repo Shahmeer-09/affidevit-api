@@ -4152,6 +4152,18 @@ class BookSlotView(APIView):
                 request_obj.status = Request.Status.NEEDS_REVIEW
             
         request_obj.save()
+
+        # ── Auto-accept logic ──────────────────────────────────────────────
+        # If the commissioner has auto-accept enabled, accept the slot immediately
+        # and send the accepted notification instead of the generic booked one.
+        commissioner_user = slot.commissioner
+        if getattr(commissioner_user, 'auto_accept_appointments', False):
+            slot.appointment_status = 'accepted'
+            slot.save(update_fields=['appointment_status'])
+            send_appointment_accepted_task.delay(request_obj.id, slot.id)
+        else:
+            send_appointment_booked_task.delay(request_obj.id, slot.id)
+        # ── End auto-accept ────────────────────────────────────────────────
         
         # Log event
         RequestEvent.objects.create(
@@ -4163,12 +4175,10 @@ class BookSlotView(APIView):
                 'action': 'booked_slot',
                 'slot_id': slot.id,
                 'slot_time': slot.start_time.isoformat(),
-                'commissioner': slot.commissioner.username
+                'commissioner': slot.commissioner.username,
+                'auto_accepted': getattr(commissioner_user, 'auto_accept_appointments', False),
             }
         )
-        
-        # Send appointment booked notifications (async via Celery)
-        send_appointment_booked_task.delay(request_obj.id, slot.id)
         
         return Response({
             'success': True,

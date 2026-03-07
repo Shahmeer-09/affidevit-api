@@ -130,7 +130,7 @@ USER_ACCOUNT_MESSAGES = {
 COMMISSIONER_BALANCE_MESSAGES = {
     # Shown to commissioner after completing a request (stamp)
     "PAYOUT_ADDED": (
-        "Rs. {amount} has been added to your pending payout balance for "
+        "$. {amount} has been added to your pending payout balance for "
         "completing request {request_code}."
     ),
     # Summary message
